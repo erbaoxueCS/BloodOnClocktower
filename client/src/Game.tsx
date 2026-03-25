@@ -23,6 +23,7 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
   const [optimisticReady, setOptimisticReady] = useState<boolean | null>(null);
   const [nightPrompt, setNightPrompt] = useState<null | { stepId: string; actorSeatIndex: number; pick: 1 | 2; aliveSeatIndices: number[] }>(null);
   const [nightTargets, setNightTargets] = useState<number[]>([]);
+  const [nightLog, setNightLog] = useState<string[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
@@ -46,6 +47,9 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
         } else if (msg.type === 'night_prompt') {
           setNightPrompt(msg);
           setNightTargets([]);
+        } else if (msg.type === 'night_info') {
+          const text = String(msg.message ?? '');
+          if (text) setNightLog((prev) => [text, ...prev].slice(0, 50));
         } else if (msg.type === 'phase') {
           setRoom((r) => ({ ...r, phase: msg.phase, dayNumber: msg.dayNumber ?? r.dayNumber }));
         } else if (msg.type === 'vote_result') {
@@ -115,6 +119,16 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
 
       {room.status === 'playing' && (
         <>
+          {nightLog.length > 0 && (
+            <section style={{ marginTop: 16, padding: 12, border: '1px solid #333', borderRadius: 8 }}>
+              <h3>夜间信息</h3>
+              <ul style={{ margin: 0, paddingLeft: 18 }}>
+                {nightLog.map((t, i) => (
+                  <li key={`${i}-${t.slice(0, 12)}`}>{t}</li>
+                ))}
+              </ul>
+            </section>
+          )}
           {nightPrompt && (
             <section style={{ marginTop: 16, padding: 12, border: '1px solid #333', borderRadius: 8 }}>
               <h3>夜晚行动：{nightPrompt.stepId}</h3>

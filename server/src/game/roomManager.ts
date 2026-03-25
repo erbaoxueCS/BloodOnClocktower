@@ -29,6 +29,7 @@ export function createRoom(scriptId: string): Room {
     nightStepIndex: 0,
     pendingNightAction: null,
     protectedSeatIndex: null,
+    poisonedSeatIndex: null,
     lastExecutedSeatIndex: null,
     lastExecutedCharacterId: null,
     lastNightDeaths: [],

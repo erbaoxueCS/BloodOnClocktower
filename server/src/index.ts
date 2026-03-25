@@ -3,7 +3,7 @@ import cors from 'cors';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { createRoom, getRoom, joinRoom, getRoomView, setReady, bindConnection, unbindConnection } from './game/roomManager.js';
-import { startGame, advanceNight, getStorytellerStep, applyStorytellerDecision, randomStorytellerDecision, nominate, vote, tallyVotes, execute, startNominationPhase, submitNightAction } from './game/gameEngine.js';
+import { startGame, advanceNight, getCurrentNightStep, randomStorytellerDecision, nominate, vote, tallyVotes, execute, startNominationPhase, submitNightAction, findAliveSeatByCharacter, computeChefPairsForSeat, computeEmpathCountForSeat, formatUndertakerInfoForSeat, formatWasherLibrarianInvestigator } from './game/gameEngine.js';
 import { troubleBrewing } from './script/troubleBrewing.js';
 
 const app = express();
@@ -37,20 +37,54 @@ app.get('/api/rooms/:roomId', (req, res) => {
   res.json(getRoomView(room));
 });
 
-function runNightLoop(room: import('./game/types.js').Room): void {
+function sendNightInfo(roomId: string, seatIndex: number, message: string) {
+  sendToSeat(roomId, seatIndex, { type: 'night_info', message });
+}
+
+function runNightLoop(roomId: string, room: import('./game/types.js').Room): void {
   for (;;) {
-    // 若等待玩家行动，则暂停
     if (room.pendingNightAction) break;
-    const needStoryteller = advanceNight(room);
-    if (room.pendingNightAction) break;
-    if (needStoryteller) {
-      const decision = randomStorytellerDecision(room);
-      applyStorytellerDecision(room, decision);
+    const stepId = getCurrentNightStep(room);
+    if (!stepId) {
+      advanceNight(room);
+      if (room.phase === 'day' || room.phase === 'waiting') break;
       continue;
     }
-    // 进入白天或夜晚结束
+
+    // 信息型步骤：直接向对应玩家发送信息，并推进一步
+    if (stepId === 'chef') {
+      const seat = findAliveSeatByCharacter(room, 'chef');
+      if (seat != null) sendNightInfo(roomId, seat, `厨师：你得知相邻两名邪恶玩家的数量为 ${computeChefPairsForSeat(room, seat)}。`);
+      room.nightStepIndex++;
+      continue;
+    }
+    if (stepId === 'empath') {
+      const seat = findAliveSeatByCharacter(room, 'empath');
+      if (seat != null) sendNightInfo(roomId, seat, `共情者：你得知相邻邪恶玩家数量为 ${computeEmpathCountForSeat(room, seat)}。`);
+      room.nightStepIndex++;
+      continue;
+    }
+    if (stepId === 'undertaker') {
+      const seat = findAliveSeatByCharacter(room, 'undertaker');
+      if (seat != null) sendNightInfo(roomId, seat, formatUndertakerInfoForSeat(room, seat));
+      room.nightStepIndex++;
+      continue;
+    }
+
+    // 说书人选择型（首夜）：洗衣妇/图书管理员/调查员 —— 目前用随机替代说书人
+    if (stepId === 'washerwoman' || stepId === 'librarian' || stepId === 'investigator') {
+      const seat = findAliveSeatByCharacter(room, stepId);
+      const decision = randomStorytellerDecision(room) as any;
+      room.storytellerDecisions.set(stepId, decision);
+      if (seat != null) sendNightInfo(roomId, seat, formatWasherLibrarianInvestigator(room, stepId, decision));
+      room.nightStepIndex++;
+      continue;
+    }
+
+    // 其余步骤交给引擎推进（会在需要行动时设置 pendingNightAction）
+    advanceNight(room);
     if (room.phase === 'day' || room.phase === 'waiting') break;
-    // advanceNight 会递归推进到“暂停/结束/白天”，所以这里继续循环即可
+    if (room.pendingNightAction) break;
   }
 }
 
@@ -172,7 +206,7 @@ wss.on('connection', (ws: any, req) => {
           ws.send(JSON.stringify({ type: 'error', message: 'Cannot start game' }));
           return;
         }
-        runNightLoop(room);
+        runNightLoop(roomId, room);
         sendEvilInfo(roomId, room);
         sendNightPrompt(roomId, room);
         broadcast(roomId, { type: 'room', room: getRoomView(room) });
@@ -211,7 +245,7 @@ wss.on('connection', (ws: any, req) => {
           room.protectedSeatIndex = null;
           room.lastNightDeaths = [];
           room.lastNightRevivals = [];
-          runNightLoop(room);
+          runNightLoop(roomId, room);
           sendNightPrompt(roomId, room);
           broadcast(roomId, { type: 'room', room: getRoomView(room) });
           broadcast(roomId, { type: 'phase', phase: room.phase, dayNumber: room.dayNumber });
@@ -224,8 +258,11 @@ wss.on('connection', (ws: any, req) => {
           ws.send(JSON.stringify({ type: 'error', message: `night_action_failed:${result.error ?? 'unknown'}` }));
           return;
         }
+        if (result.info) {
+          sendToSeat(roomId, seatIndex, { type: 'night_info', message: result.info });
+        }
         // 夜晚继续推进直到下一次需要输入或天亮
-        runNightLoop(room);
+        runNightLoop(roomId, room);
         sendNightPrompt(roomId, room);
         broadcast(roomId, { type: 'room', room: getRoomView(room) });
         broadcast(roomId, { type: 'phase', phase: room.phase, dayNumber: room.dayNumber });

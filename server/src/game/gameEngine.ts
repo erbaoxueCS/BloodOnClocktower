@@ -1,5 +1,105 @@
 import type { Room, GamePhase, DaySubPhase } from './types.js';
 
+const EVIL_CHARACTER_IDS = new Set(['imp', 'poisoner', 'spy', 'baron', 'scarlet_woman']);
+
+export function isPoisoned(room: Room, seatIndex: number): boolean {
+  return room.poisonedSeatIndex === seatIndex;
+}
+
+export function findAliveSeatByCharacter(room: Room, characterId: string): number | null {
+  const p = room.players.find((x) => x.isAlive && x.characterId === characterId);
+  return p ? p.seatIndex : null;
+}
+
+export function getCharacterNameZh(room: Room, characterId: string): string {
+  return room.script.characters.find((c) => c.id === characterId)?.nameZh ?? characterId;
+}
+
+export function computeChefPairs(room: Room): number {
+  // 计算“相邻两名邪恶玩家”的数量（环形相邻）
+  const n = room.players.length;
+  let count = 0;
+  for (let i = 0; i < n; i++) {
+    const a = room.players[i];
+    const b = room.players[(i + 1) % n];
+    if (!a || !b) continue;
+    const evilA = a.characterId ? EVIL_CHARACTER_IDS.has(a.characterId) : false;
+    const evilB = b.characterId ? EVIL_CHARACTER_IDS.has(b.characterId) : false;
+    if (evilA && evilB) count++;
+  }
+  return count;
+}
+
+export function computeEmpathCount(room: Room, empathSeatIndex: number): number {
+  const n = room.players.length;
+  const left = room.players[(empathSeatIndex - 1 + n) % n];
+  const right = room.players[(empathSeatIndex + 1) % n];
+  let count = 0;
+  if (left?.isAlive && left.characterId && EVIL_CHARACTER_IDS.has(left.characterId)) count++;
+  if (right?.isAlive && right.characterId && EVIL_CHARACTER_IDS.has(right.characterId)) count++;
+  return count;
+}
+
+function randInt(min: number, max: number): number {
+  const a = Math.ceil(min);
+  const b = Math.floor(max);
+  return Math.floor(Math.random() * (b - a + 1)) + a;
+}
+
+export function computeChefPairsForSeat(room: Room, chefSeatIndex: number): number {
+  if (isPoisoned(room, chefSeatIndex)) {
+    const maxPlausible = Math.min(Math.floor(room.players.length / 2), 4);
+    return randInt(0, maxPlausible);
+  }
+  return computeChefPairs(room);
+}
+
+export function computeEmpathCountForSeat(room: Room, empathSeatIndex: number): number {
+  if (isPoisoned(room, empathSeatIndex)) return randInt(0, 2);
+  return computeEmpathCount(room, empathSeatIndex);
+}
+
+export function formatWasherLibrarianInvestigator(room: Room, stepId: string, decision: any): string {
+  // decision: { players:[a,b], characterId }
+  const players = decision?.players as number[] | undefined;
+  const characterId = decision?.characterId as string | undefined;
+  if (!players || players.length !== 2 || !characterId) return `${getCharacterNameZh(room, stepId)}：无信息`;
+  const [a, b] = players;
+  const roleZh = getCharacterNameZh(room, characterId);
+  const stepZh = getCharacterNameZh(room, stepId);
+  return `${stepZh}：在 #${a + 1} 与 #${b + 1} 中，有一位是「${roleZh}」。`;
+}
+
+export function formatUndertakerInfo(room: Room): string {
+  // 掘墓人是否中毒由调用方决定（需要 seatIndex）
+  if (room.lastExecutedSeatIndex == null || room.lastExecutedCharacterId == null) return '掘墓人：今日无人被处决。';
+  const roleZh = getCharacterNameZh(room, room.lastExecutedCharacterId);
+  return `掘墓人：今日被处决的是 #${room.lastExecutedSeatIndex + 1}，其身份为「${roleZh}」。`;
+}
+
+export function formatUndertakerInfoForSeat(room: Room, undertakerSeatIndex: number): string {
+  if (room.lastExecutedSeatIndex == null || room.lastExecutedCharacterId == null) return '掘墓人：今日无人被处决。';
+  if (isPoisoned(room, undertakerSeatIndex)) {
+    const any = room.script.characters[randInt(0, room.script.characters.length - 1)]?.id ?? 'unknown';
+    return `掘墓人：今日被处决的是 #${room.lastExecutedSeatIndex + 1}，其身份为「${getCharacterNameZh(room, any)}」。`;
+  }
+  return formatUndertakerInfo(room);
+}
+
+export function formatFortuneTellerResult(room: Room, targets: number[]): string {
+  const demonSeat = findAliveSeatByCharacter(room, 'imp');
+  const hasDemon = demonSeat != null && targets.includes(demonSeat);
+  return `占卜师：你选择了 #${targets[0] + 1} 与 #${targets[1] + 1}，结果为「${hasDemon ? '是（其中有恶魔）' : '否（其中没有恶魔）'}」。`;
+}
+
+export function formatFortuneTellerResultForSeat(room: Room, fortuneSeatIndex: number, targets: number[]): string {
+  if (isPoisoned(room, fortuneSeatIndex)) {
+    const yes = Math.random() < 0.5;
+    return `占卜师：你选择了 #${targets[0] + 1} 与 #${targets[1] + 1}，结果为「${yes ? '是（其中有恶魔）' : '否（其中没有恶魔）'}」。`;
+  }
+  return formatFortuneTellerResult(room, targets);
+}
+
 /** 根据人数生成本局角色池（暗流涌动简化：固定比例） */
 export function assignRoles(room: Room): void {
   const n = room.players.length;
@@ -68,6 +168,7 @@ export function startGame(room: Room): boolean {
   room.nightStepIndex = 0;
   room.pendingNightAction = null;
   room.protectedSeatIndex = null;
+  room.poisonedSeatIndex = null;
   room.lastExecutedSeatIndex = null;
   room.lastExecutedCharacterId = null;
   room.lastNightDeaths = [];
@@ -164,17 +265,25 @@ function runDemonKill(room: Room): void {
   if (!demon) return;
   const decision = room.storytellerDecisions.get('imp_kill') as number | undefined;
   if (decision !== undefined) {
-    const target = room.players[decision];
+    // 若恶魔中毒，杀人结果不可靠：50% 无人死亡，否则随机杀一名存活玩家（不含自己）
+    let actualTargetSeat = decision;
+    if (isPoisoned(room, demon.seatIndex)) {
+      if (Math.random() < 0.5) return;
+      const alive = room.players.filter((p) => p.isAlive && p.seatIndex !== demon.seatIndex);
+      if (alive.length === 0) return;
+      actualTargetSeat = alive[randInt(0, alive.length - 1)].seatIndex;
+    }
+    const target = room.players[actualTargetSeat];
     if (target?.isAlive && target.seatIndex !== demon.seatIndex) {
       if (room.protectedSeatIndex === target.seatIndex) return;
-      room.lastNightDeaths.push(decision);
+      room.lastNightDeaths.push(actualTargetSeat);
       target.isAlive = false;
     }
   }
 }
 
 /** 提交夜晚行动（由服务端在收到玩家输入后调用） */
-export function submitNightAction(room: Room, actorSeatIndex: number, targets: number[]): { ok: boolean; error?: string } {
+export function submitNightAction(room: Room, actorSeatIndex: number, targets: number[]): { ok: boolean; error?: string; info?: string } {
   const pending = room.pendingNightAction;
   if (!pending) return { ok: false, error: 'no_pending_action' };
   if (pending.actorSeatIndex !== actorSeatIndex) return { ok: false, error: 'not_your_turn' };
@@ -188,22 +297,31 @@ export function submitNightAction(room: Room, actorSeatIndex: number, targets: n
   }
 
   const stepId = pending.stepId;
+  let info: string | undefined;
   if (stepId === 'imp') {
     if (targets[0] === actorSeatIndex) return { ok: false, error: 'cannot_kill_self' };
     room.storytellerDecisions.set('imp_kill', targets[0]);
+    // 立即结算恶魔杀人
+    runDemonKill(room);
   } else if (stepId === 'monk') {
-    room.protectedSeatIndex = targets[0];
+    // 若僧侣中毒，其保护可能失效（这里直接失效）
+    if (!isPoisoned(room, actorSeatIndex)) room.protectedSeatIndex = targets[0];
     room.storytellerDecisions.set('monk_protect', targets[0]);
   } else if (stepId === 'poisoner') {
-    room.storytellerDecisions.set('poisoner_poison', targets[0]);
+    // 若投毒者中毒：随机投毒目标
+    const alive = room.players.filter((p) => p.isAlive);
+    const actual = isPoisoned(room, actorSeatIndex) ? alive[randInt(0, alive.length - 1)].seatIndex : targets[0];
+    room.poisonedSeatIndex = actual;
+    room.storytellerDecisions.set('poisoner_poison', actual);
   } else if (stepId === 'fortune_teller') {
     room.storytellerDecisions.set('fortune_teller_pick', targets);
+    info = formatFortuneTellerResultForSeat(room, actorSeatIndex, targets);
   }
 
   room.pendingNightAction = null;
   room.nightStepIndex++;
   advanceNight(room);
-  return { ok: true };
+  return { ok: true, info };
 }
 
 function gotoDay(room: Room): void {
@@ -294,6 +412,8 @@ export function execute(room: Room): void {
     return;
   }
   room.phase = 'night';
+  // 进入夜晚视为黄昏：清除上一夜投毒效果
+  room.poisonedSeatIndex = null;
   room.nightStepIndex = 0;
   room.lastNightDeaths = [];
   room.lastNightRevivals = [];

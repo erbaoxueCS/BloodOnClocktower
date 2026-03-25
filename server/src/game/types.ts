@@ -84,6 +84,8 @@ export interface Room {
   };
   /** 夜晚保护（如僧侣） */
   protectedSeatIndex: number | null;
+  /** 被投毒的玩家（持续到下一次黄昏/进入夜晚前） */
+  poisonedSeatIndex: number | null;
   /** 当天处决记录（供掘墓人等使用） */
   lastExecutedSeatIndex: number | null;
   lastExecutedCharacterId: string | null;
