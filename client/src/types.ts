@@ -11,6 +11,40 @@ export interface PlayerSeat {
   hasDeadVote: boolean;
 }
 
+export interface ReplayLogEntry {
+  seq: number;
+  at: number;
+  groupKey: string;
+  groupTitle: string;
+  line: string;
+}
+
+export interface YourRolePayload {
+  characterId: string;
+  characterName: string;
+  characterNameZh: string;
+  ability: string;
+}
+
+export interface ReplayIdentity {
+  seatIndex: number;
+  nickname: string;
+  characterId: string;
+  characterName: string;
+  characterZh: string;
+  ability: string;
+  alignment: string;
+  survived: boolean;
+}
+
+export interface ReplayBundle {
+  version: string;
+  winner: 'good' | 'evil';
+  winnerZh: string;
+  identities: ReplayIdentity[];
+  entries: ReplayLogEntry[];
+}
+
 export interface RoomView {
   id: string;
   scriptId: string;
@@ -25,6 +59,7 @@ export interface RoomView {
   pendingExecution: number | null;
   lastNightDeaths: number[];
   lastNightRevivals: number[];
+  publicLog?: Array<{ seq: number; at: number; line: string }>;
   minPlayers: number;
   maxPlayers: number;
 }

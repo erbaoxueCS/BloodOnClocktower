@@ -48,10 +48,30 @@ export interface PlayerSeat {
   hasDeadVote: boolean;  // 死亡玩家是否还有一票
   /** 仅服务端与 AI 知；发给客户端时脱敏 */
   characterId?: string;
+  /** 若真实角色为 drunk，则该字段为“伪装镇民角色 id”（客户端会看到它，并按它参与夜序与收信息） */
+  drunkPretendCharacterId?: string | null;
+  /** 白天一次性主动技能使用标记（例如 slayer_shot） */
+  usedDayActions?: string[];
 }
 
 /** 房间状态 */
 export type RoomStatus = 'lobby' | 'playing' | 'ended';
+
+/** 单行复盘记录（按顺序；前端可按 groupKey/groupTitle 分块展示） */
+export interface ReplayLogEntry {
+  seq: number;
+  at: number;
+  groupKey: string;
+  groupTitle: string;
+  line: string;
+}
+
+/** 公开事件日志（所有玩家可见，用于“公共大屏”展示） */
+export interface PublicLogEntry {
+  seq: number;
+  at: number;
+  line: string;
+}
 
 /** 房间（含对局状态） */
 export interface Room {
@@ -99,6 +119,16 @@ export interface Room {
   /** 连接 id -> seatIndex */
   connections: Map<string, number>;
   createdAt: number;
+  /** 全量复盘日志（服务端记录，游戏结束时一次性下发；进行中不对客户端暴露） */
+  replayLog: ReplayLogEntry[];
+  /** 公开事件日志（进行中对所有人可见） */
+  publicLog: PublicLogEntry[];
+  /** 房主控制权限密钥（仅持有者可控制进度） */
+  hostSecret: string;
+  /** 白天主动技能使用情况：seatIndex -> actionIds */
+  usedDayActionsBySeat: Map<number, Set<string>>;
+  /** 本夜「恶魔刀人」等：受害者 seatIndex -> 行凶者 seatIndex（守鸦人等用） */
+  nightKillAttackerByVictim: Map<number, number>;
 }
 
 /** 发给客户端的房间摘要（不含身份） */
@@ -116,6 +146,7 @@ export interface RoomView {
   pendingExecution: number | null;
   lastNightDeaths: number[];
   lastNightRevivals: number[];
+  publicLog: PublicLogEntry[];
   minPlayers: number;
   maxPlayers: number;
 }

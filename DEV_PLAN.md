@@ -6,6 +6,25 @@
 
 ---
 
+## 0. 版本与变更记录
+
+| 版本 | 说明 |
+|------|------|
+| **1.0.0** | 基线：大厅/房间、首夜与循环夜、白天提名投票处决、胜负判定；身份仅本人可见；**无**对局结束全量复盘 UI。 |
+| **1.0.1** | 服务端维护 `Room.replayLog`，在 `game_over` 消息中附带 `replay`（全员真实身份 + 按 `groupKey`/`groupTitle` 可分组的时间线）；前端在 `status === ended` 时展示复盘面板；修复处决后写复盘时使用「当前天」标题（避免 `phase === waiting` 时错标为夜）。 |
+| **1.0.2** | WebSocket `room` / `game_over` 对每位玩家附带 `yourRole`：`characterId`、`characterName`（英）、`characterNameZh`、`ability`（与剧本一致，当前为中文简述）；复盘 `replay.identities` 增加 `characterName`、`ability` 列供终局表展示。 |
+| **1.0.3** | 复盘/分组标题修正「第几夜」：`phase==='night'` 时用 `dayNumber+1` 作为夜次（首夜后第一次恶魔刀人所在夜为「第 2 夜」）；首夜块内补充说明「仅信息、首夜无刀」；顶栏阶段文案与之一致。 |
+| **1.0.4** | 白天提名允许**提名自己**；处决投票中**被提名者可投票**（含赞成/反对自己）；引擎侧提名要求被提名者须存活。 |
+| **1.0.5** | P0 起步：酒鬼严格伪装（客户端看到伪装镇民）；白天主动技能新增 `day_action`（以“杀手开枪”为例：**所有玩家都可宣称发动**，只有真实拥有且未中毒/醉酒且未用过才会生效）；士兵免疫恶魔夜杀（中毒/醉酒则失效）；夜晚行动面板展示能力文案。 |
+| **1.0.6** | 处女（Virgin）落地：白天提名真实处女且未中毒/醉酒、且提名者真实为镇民时，提名者立即被处决并写入复盘；可能即时触发胜负并下发 `game_over`。 |
+| **1.0.7** | 洗衣妇/图书管理员/调查员信息失真统一为 `distortWasherLibrarianInvestigatorDecision`（中毒/醉酒：约 50% 换人设、50% 换两人组合）；守鸦人：普通夜 `imp` 后增加 `ravenkeeper` 步，死亡守鸦人依 `nightKillAttackerByVictim` 获知行凶者（中毒/醉酒可假信息）；`advanceNight` 防止跳过守鸦人步；恶魔杀人时记录受害者→行凶者映射。 |
+| **1.0.8** | **P1**：在线 `runNightLoop` 对洗衣妇/图书管理员/调查员调用 `getStorytellerDecision`（`USE_AI_STORYTELLER` + `OPENAI_API_KEY` 时请求 OpenAI，`OPENAI_MODEL` 可选）；校验失败或未配置时回退随机；中毒座位摘要写入 AI 提示；`GET /api/storyteller-ai` 查询是否启用；`validateDecision` 允许恶魔目标为自己（与引擎一致）。 |
+| **1.0.9** | 进度控制从“1号玩家”解耦为**房主权限**：创建房间返回 `hostSecret`，WebSocket 连接携带 `hostSecret` 才具备控制权限（`start/next_phase/end_voting/execute` 等）。对局中新增 `Room.publicLog` 公开事件日志，前端增加“公共大屏”展示公开事件（提名、投票结果、处决、白天宣称技能与结果等）。 |
+
+后续迭代请在表中追加行，并在本文相关章节（消息协议、Room 结构）同步更新。
+
+---
+
 ## 1. 总体架构
 
 - **前端**：React + Vite（`client/`）
@@ -18,10 +37,9 @@
   - `Room` 结构保存房间与对局状态
   - 夜晚顺序表驱动夜间轮询
   - 白天提名/投票/处决与胜负判定
-- **AI 说书人（预留/脚手架）**：`server/src/ai/*`
-  - 已有适配层/决策 schema/校验逻辑骨架
-  - **当前在线流程仍主要使用“随机说书人”占位**（洗衣妇/图书管理员/调查员等），AI 模块尚未接入在线夜晚流程
-  - 计划改动：将随机占位替换为 AI 决策输出（需严格 schema 校验 + 回退策略）
+- **AI 说书人**：`server/src/ai/*`
+  - 适配层 `adapter.ts`、校验与 OpenAI 调用 `storyteller.ts`
+  - **在线夜晚**：洗衣妇/图书管理员/调查员步骤在配置 `USE_AI_STORYTELLER` + `OPENAI_API_KEY` 时走 LLM，否则回退随机；确定性规则（失真、投票、杀人结算等）仍在引擎内
 
 ---
 
@@ -57,6 +75,8 @@ npm run dev
 
 若 `5173` 被占用，Vite 会自动切换到 `5174`。
 
+**可选：启用 AI 说书人（OpenAI）**：在启动后端前设置环境变量 `USE_AI_STORYTELLER=true`、`OPENAI_API_KEY=...`，可选 `OPENAI_MODEL=gpt-4o-mini`。可用 `GET http://localhost:3001/api/storyteller-ai` 确认是否已启用。
+
 ### 2.3 访问
 
 - 前端：终端输出的 `http://localhost:5173/` 或 `5174`
@@ -82,8 +102,8 @@ npm run dev
 ### 3.3 阶段与流程
 
 - 首夜 → 白天（讨论→提名）→ 夜晚 → … 循环
-- 白天提名：每名玩家每天最多提名一次；每名玩家每天最多被提名一次；同一时间只有一个提名
-- 投票与处决：统计赞成票，达到“存活人数半数（向上取整）”则进入待处决
+- 白天提名：每名玩家每天最多提名一次；每名玩家每天最多被提名一次；同一时间只有一个提名；**可提名自己**
+- 投票与处决：统计赞成票，达到“存活人数半数（向上取整）”则进入待处决；**被提名者可参与投票（含投给自己）**
 - 胜利判定：
   - 善良：恶魔死亡
   - 邪恶：场上存活 ≤ 2
@@ -161,16 +181,18 @@ npm run dev
   - 返回剧本列表（当前仅暗流涌动）
 - `POST /api/rooms`
   - body: `{ scriptId }`
-  - 返回 `{ roomId, scriptId }`
+  - 返回 `{ roomId, scriptId, hostSecret }`（**仅创建者持有**；用于房主控制权限）
 - `POST /api/rooms/:roomId/join`
   - body: `{ nickname }`
   - 返回 `{ roomId, seatIndex, playerId, room }`
 - `GET /api/rooms/:roomId`
   - 返回 `RoomView`
+- `GET /api/storyteller-ai`
+  - 返回 `{ enabled, useAiFlag, hasApiKey }`（**不返回密钥**）—— `enabled` 为真正会走 LLM 的条件
 
 ### 5.2 WebSocket 连接
 
-- URL：`ws://localhost:3001?roomId=...&seatIndex=...`
+- URL：`ws://localhost:3001?roomId=...&seatIndex=...&hostSecret=...`（可选；带上则该连接具备房主权限）
 - 服务端会对每个连接发送：
   - `type: 'room'` + `room: RoomView` + `yourSeatIndex` + `yourCharacterId`
 
@@ -181,6 +203,8 @@ npm run dev
 - `next_phase`: `{ type:'next_phase' }`（讨论 → 提名）
 - `nominate`: `{ type:'nominate', nominatedSeat:number }`
 - `vote`: `{ type:'vote', inFavor:boolean }`
+- `end_nomination`: `{ type:'end_nomination' }`（房主：结束提名阶段→回到讨论）
+- `cancel_current_nomination`: `{ type:'cancel_current_nomination' }`（房主：取消当前提名）
 - `end_voting`: `{ type:'end_voting' }`
 - `execute`: `{ type:'execute' }`
 - `night_action`: `{ type:'night_action', targets:number[] }`
@@ -188,12 +212,13 @@ npm run dev
 
 ### 5.4 WebSocket 服务端→客户端
 
-- `room`: `{ type:'room', room:RoomView, yourSeatIndex, yourCharacterId }`
+- `room`: `{ type:'room', room:RoomView, yourSeatIndex, yourCharacterId, yourRole?:null|{ characterId, characterName, characterNameZh, ability } }`（**1.0.2+** 发牌后 `yourRole` 为完整名片；大厅为 `null`）
+  - **1.0.9+**：额外包含 `isHost:boolean`，表示本连接是否具备房主权限；`RoomView` 额外包含 `publicLog`（公开事件日志）
 - `phase`: `{ type:'phase', phase, dayNumber }`
 - `night_prompt`: `{ type:'night_prompt', stepId, actorSeatIndex, pick, aliveSeatIndices }`（只发给行动者）
 - `night_info`: `{ type:'night_info', message }`（只发给对应玩家）
 - `vote_result`: `{ type:'vote_result', passed, votesFor, votes:[{seatIndex,inFavor}] }`
-- `game_over`: `{ type:'game_over', winner:'good'|'evil', room:RoomView }`
+- `game_over`（**1.0.1+**）: `{ type:'game_over', winner, room, replay?, yourRole?, yourCharacterId?, yourSeatIndex? }` — `replay.identities` **1.0.2+** 含 `characterName`、`ability`；`yourRole` 与同坐 `room` 消息含义一致
 - `error`: `{ type:'error', message }`
 
 ---
@@ -230,9 +255,13 @@ npm run dev
 
 ### P1（AI 说书人真正接入）
 
-- 将“随机说书人决策”替换为 `server/src/ai/storyteller.ts` 的结构化决策
-- 为每个需要裁量的角色定义严格 schema（并做合法性校验与回退）
-- AI 输出只影响“说书人裁量点”，确定性规则仍由引擎实现
+- **已接入（1.0.8）**：`runNightLoop` 中洗衣妇 / 图书管理员 / 调查员步骤调用 `getStorytellerDecision()`；`validateDecision` 校验座位与善良 `characterId`；失败回退 `randomStorytellerDecision`；中毒/醉酒后的**玩家侧失真**仍由引擎 `distortWasherLibrarianInvestigatorDecision` 处理。
+- **环境变量**（服务端）：
+  - `USE_AI_STORYTELLER=true`（或 `1`）
+  - `OPENAI_API_KEY`：OpenAI API Key
+  - `OPENAI_BASE_URL`：默认 `https://coding.dashscope.aliyuncs.com`（**不要带** `/v1`，否则会变成 `/v1/v1/...`）
+  - `OPENAI_MODEL`：可选，默认 `gpt-4o-mini`
+- **仍待扩展**：更多裁量点（如间谍观板、男爵配板等）、可插拔供应商（Azure/本地模型）、异步超时与前端「说书人思考中」状态。
 
 ### P2（产品化/协作）
 

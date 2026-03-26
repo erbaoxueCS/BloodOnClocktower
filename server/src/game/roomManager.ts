@@ -38,6 +38,11 @@ export function createRoom(scriptId: string): Room {
     storytellerDecisions: new Map(),
     connections: new Map(),
     createdAt: Date.now(),
+    replayLog: [],
+    publicLog: [],
+    hostSecret: uuidv4(),
+    usedDayActionsBySeat: new Map(),
+    nightKillAttackerByVictim: new Map(),
   };
   rooms.set(room.id, room);
   return room;
@@ -56,6 +61,8 @@ export function joinRoom(roomId: string, nickname: string): { room: Room; seatIn
     isReady: false,
     isAlive: true,
     hasDeadVote: true,
+    drunkPretendCharacterId: null,
+    usedDayActions: [],
   };
   room.players.push(player);
   return { room, seatIndex };
@@ -69,7 +76,7 @@ export function getRoom(roomId: string): Room | null {
 /** 获取房间视图（脱敏，供前端） */
 export function getRoomView(room: Room, forSeatIndex?: number): RoomView {
   const players = room.players.map((p) => {
-    const { characterId, ...rest } = p;
+    const { characterId, drunkPretendCharacterId, usedDayActions, ...rest } = p;
     return rest;
   });
   return {
@@ -86,6 +93,7 @@ export function getRoomView(room: Room, forSeatIndex?: number): RoomView {
     pendingExecution: room.pendingExecution,
     lastNightDeaths: room.lastNightDeaths,
     lastNightRevivals: room.lastNightRevivals,
+    publicLog: room.publicLog,
     minPlayers: room.script.minPlayers,
     maxPlayers: room.script.maxPlayers,
   };

@@ -8,12 +8,14 @@ export default function App() {
   const [yourSeatIndex, setYourSeatIndex] = useState<number | null>(null);
   const [yourCharacterId, setYourCharacterId] = useState<string | null>(null);
   const [roomId, setRoomId] = useState<string | null>(null);
+  const [hostSecret, setHostSecret] = useState<string | null>(null);
 
-  const enterRoom = useCallback((r: RoomView, seat: number, characterId: string | null, id: string) => {
+  const enterRoom = useCallback((r: RoomView, seat: number, characterId: string | null, id: string, hs?: string | null) => {
     setRoom(r);
     setYourSeatIndex(seat);
     setYourCharacterId(characterId);
     setRoomId(id);
+    setHostSecret(hs ?? null);
   }, []);
 
   const leaveRoom = useCallback(() => {
@@ -21,6 +23,7 @@ export default function App() {
     setYourSeatIndex(null);
     setYourCharacterId(null);
     setRoomId(null);
+    setHostSecret(null);
   }, []);
 
   const updateRoom = useCallback((r: RoomView) => setRoom(r), []);
@@ -32,6 +35,7 @@ export default function App() {
         room={room}
         yourSeatIndex={yourSeatIndex}
         yourCharacterId={yourCharacterId}
+        hostSecret={hostSecret}
         onLeave={leaveRoom}
         onRoomUpdate={updateRoom}
       />

@@ -22,6 +22,7 @@ export const troubleBrewing = {
         'fortune_teller',
         'monk',
         'imp',
+        'ravenkeeper',
     ],
     characters: [
         { id: 'washerwoman', name: 'Washerwoman', nameZh: '洗衣妇', alignment: 'good', type: 'townsfolk', ability: '你会得知两名玩家其中一人的身份。', firstNightOnly: true, requiresStorytellerChoice: true },

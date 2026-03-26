@@ -17,5 +17,6 @@ export function buildStorytellerRequest(room: Room, stepId: string, stepNameZh: 
     aliveSeatIndices,
     deadSeatIndices,
     playerCount: room.players.length,
+    poisonedSeatIndex: room.poisonedSeatIndex ?? null,
   };
 }
