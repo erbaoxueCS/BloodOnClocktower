@@ -20,6 +20,7 @@
 | **1.0.7** | 洗衣妇/图书管理员/调查员信息失真统一为 `distortWasherLibrarianInvestigatorDecision`（中毒/醉酒：约 50% 换人设、50% 换两人组合）；守鸦人：普通夜 `imp` 后增加 `ravenkeeper` 步，死亡守鸦人依 `nightKillAttackerByVictim` 获知行凶者（中毒/醉酒可假信息）；`advanceNight` 防止跳过守鸦人步；恶魔杀人时记录受害者→行凶者映射。 |
 | **1.0.8** | **P1**：在线 `runNightLoop` 对洗衣妇/图书管理员/调查员调用 `getStorytellerDecision`（`USE_AI_STORYTELLER` + `OPENAI_API_KEY` 时请求 OpenAI，`OPENAI_MODEL` 可选）；校验失败或未配置时回退随机；中毒座位摘要写入 AI 提示；`GET /api/storyteller-ai` 查询是否启用；`validateDecision` 允许恶魔目标为自己（与引擎一致）。 |
 | **1.0.9** | 进度控制从“1号玩家”解耦为**房主权限**：创建房间返回 `hostSecret`，WebSocket 连接携带 `hostSecret` 才具备控制权限（`start/next_phase/end_voting/execute` 等）。对局中新增 `Room.publicLog` 公开事件日志，前端增加“公共大屏”展示公开事件（提名、投票结果、处决、白天宣称技能与结果等）。 |
+| **1.0.10** | 增加“管理员专用页面”（大厅可用 `roomId + hostSecret` 直接进入，不占玩家座位，`admin=1` WebSocket 连接）；管理员可控制进度但不可 ready/提名/投票/白天技能/夜间行动。白天主动技能“宣称次数”改为严格限制：如 `slayer_shot` 超过 1 次直接返回 `day_action_limit_reached`，不再记录二次宣称。 |
 
 后续迭代请在表中追加行，并在本文相关章节（消息协议、Room 结构）同步更新。
 

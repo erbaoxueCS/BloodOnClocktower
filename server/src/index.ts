@@ -253,14 +253,16 @@ wss.on('connection', (ws: any, req) => {
   const roomId = url.searchParams.get('roomId');
   const seatIndexStr = url.searchParams.get('seatIndex');
   const hostSecret = url.searchParams.get('hostSecret');
+  const adminMode = url.searchParams.get('admin') === '1';
   const connectionId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   ws.connectionId = connectionId;
   ws.roomId = roomId;
   ws.seatIndex = seatIndexStr !== null ? parseInt(seatIndexStr, 10) : null;
   ws.isHost = false;
+  ws.isAdmin = adminMode;
 
-  if (!roomId || seatIndexStr === null) {
-    ws.send(JSON.stringify({ type: 'error', message: 'roomId and seatIndex required' }));
+  if (!roomId || (!adminMode && seatIndexStr === null)) {
+    ws.send(JSON.stringify({ type: 'error', message: 'roomId required; seatIndex required unless admin=1' }));
     ws.close();
     return;
   }
@@ -272,32 +274,50 @@ wss.on('connection', (ws: any, req) => {
     return;
   }
   if (hostSecret && hostSecret === room.hostSecret) ws.isHost = true;
-  bindConnection(room, connectionId, parseInt(seatIndexStr, 10));
-  const si = parseInt(seatIndexStr, 10);
-  ws.send(
-    JSON.stringify({
-      type: 'room',
-      room: getRoomView(room),
-      yourSeatIndex: si,
-      yourCharacterId: getShownCharacterId(room.players[si]),
-      yourRole: buildYourRolePayload(room, si),
-      isHost: ws.isHost,
-    }),
-  );
+  if (!adminMode) {
+    const siStr = seatIndexStr as string;
+    bindConnection(room, connectionId, parseInt(siStr, 10));
+    const si = parseInt(siStr, 10);
+    ws.send(
+      JSON.stringify({
+        type: 'room',
+        room: getRoomView(room),
+        yourSeatIndex: si,
+        yourCharacterId: getShownCharacterId(room.players[si]),
+        yourRole: buildYourRolePayload(room, si),
+        isHost: ws.isHost,
+        isAdmin: false,
+      }),
+    );
+  } else {
+    ws.send(
+      JSON.stringify({
+        type: 'room',
+        room: getRoomView(room),
+        isHost: ws.isHost,
+        isAdmin: true,
+      }),
+    );
+  }
 
   ws.on('message', async (data: Buffer) => {
     try {
       const msg = JSON.parse(data.toString()) as ClientMessage;
       const room = getRoom(roomId);
       if (!room) return;
-      const seatIndex = parseInt(seatIndexStr, 10);
+      const seatIndex = seatIndexStr !== null ? parseInt(seatIndexStr, 10) : -1;
       const isHost = !!ws.isHost;
+      const isAdmin = !!ws.isAdmin;
 
       if (msg.type === 'ping') {
         ws.send(JSON.stringify({ type: 'pong' }));
         return;
       }
       if (msg.type === 'ready') {
+        if (isAdmin) {
+          ws.send(JSON.stringify({ type: 'error', message: 'admin_cannot_ready' }));
+          return;
+        }
         setReady(room, seatIndex, msg.ready);
         // 需要回推给发起者，否则其 UI 不会更新 ready 状态
         broadcast(roomId, { type: 'room', room: getRoomView(room) });
@@ -329,6 +349,10 @@ wss.on('connection', (ws: any, req) => {
         return;
       }
       if (msg.type === 'nominate') {
+        if (isAdmin) {
+          ws.send(JSON.stringify({ type: 'error', message: 'admin_cannot_nominate' }));
+          return;
+        }
         const ok = nominate(room, seatIndex, msg.nominatedSeat);
         if (!ok) {
           ws.send(JSON.stringify({ type: 'error', message: 'Nomination not allowed' }));
@@ -356,6 +380,10 @@ wss.on('connection', (ws: any, req) => {
         return;
       }
       if (msg.type === 'vote') {
+        if (isAdmin) {
+          ws.send(JSON.stringify({ type: 'error', message: 'admin_cannot_vote' }));
+          return;
+        }
         vote(room, seatIndex, msg.inFavor);
         broadcast(roomId, { type: 'room', room: getRoomView(room) });
         return;
@@ -401,6 +429,10 @@ wss.on('connection', (ws: any, req) => {
         return;
       }
       if (msg.type === 'day_action') {
+        if (isAdmin) {
+          ws.send(JSON.stringify({ type: 'error', message: 'admin_cannot_day_action' }));
+          return;
+        }
         if (room.status !== 'playing' || room.phase !== 'day') {
           ws.send(JSON.stringify({ type: 'error', message: 'day_action_not_allowed' }));
           return;
@@ -424,17 +456,15 @@ wss.on('connection', (ws: any, req) => {
             return;
           }
 
+          const used = room.usedDayActionsBySeat.get(seatIndex) ?? new Set<string>();
+          if (used.has('slayer_shot')) {
+            ws.send(JSON.stringify({ type: 'error', message: 'day_action_limit_reached:slayer_shot' }));
+            return;
+          }
+
           // 所有人都可以“宣称发动”，但只有真实杀手且未中毒/醉酒且未使用过才会生效
           pushReplay(room, key, title, `[白天技能] ${seatLabel(room, seatIndex)} 宣称自己是「杀手」并向 ${seatLabel(room, targetSeat as number)} 开枪。`);
           pushPublic(room, `${seatLabel(room, seatIndex)} 宣称自己是「杀手」并向 ${seatLabel(room, targetSeat as number)} 开枪。`);
-
-          const used = room.usedDayActionsBySeat.get(seatIndex) ?? new Set<string>();
-          if (used.has('slayer_shot')) {
-            pushReplay(room, key, title, '枪击结果：无事发生（你本局已使用过该技能）。');
-            pushPublic(room, '枪击结果：无事发生。');
-            broadcast(roomId, { type: 'room', room: getRoomView(room) });
-            return;
-          }
           used.add('slayer_shot');
           room.usedDayActionsBySeat.set(seatIndex, used);
 
@@ -517,6 +547,10 @@ wss.on('connection', (ws: any, req) => {
         return;
       }
       if (msg.type === 'night_action') {
+        if (isAdmin) {
+          ws.send(JSON.stringify({ type: 'error', message: 'admin_cannot_night_action' }));
+          return;
+        }
         const pendingBefore = room.pendingNightAction;
         const targets = msg.targets ?? [];
         const result = submitNightAction(room, seatIndex, targets);
@@ -571,7 +605,7 @@ wss.on('connection', (ws: any, req) => {
 
   ws.on('close', () => {
     const room = getRoom(roomId ?? '');
-    if (room) unbindConnection(room, connectionId);
+    if (room && !ws.isAdmin) unbindConnection(room, connectionId);
   });
 });
 

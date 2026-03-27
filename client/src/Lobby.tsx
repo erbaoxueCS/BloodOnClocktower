@@ -7,9 +7,10 @@ type Script = { id: string; name: string; nameZh: string; minPlayers: number; ma
 
 interface LobbyProps {
   onEnterRoom: (room: RoomView, seatIndex: number, characterId: string | null, roomId: string, hostSecret?: string | null) => void;
+  onEnterAdmin: (roomId: string, hostSecret: string) => void;
 }
 
-export function Lobby({ onEnterRoom }: LobbyProps) {
+export function Lobby({ onEnterRoom, onEnterAdmin }: LobbyProps) {
   const [scripts, setScripts] = useState<Script[]>([]);
   const [roomId, setRoomId] = useState('');
   const [nickname, setNickname] = useState('');
@@ -53,6 +54,14 @@ export function Lobby({ onEnterRoom }: LobbyProps) {
     }
   };
 
+  const enterAdmin = () => {
+    if (!roomId.trim() || !hostSecret.trim()) {
+      setError('管理员模式需要房间号和房主密钥');
+      return;
+    }
+    onEnterAdmin(roomId.trim(), hostSecret.trim());
+  };
+
   return (
     <div style={{ padding: 24, maxWidth: 480, margin: '0 auto' }}>
       <h1 style={{ marginBottom: 24 }}>血染钟楼</h1>
@@ -79,6 +88,10 @@ export function Lobby({ onEnterRoom }: LobbyProps) {
         <input placeholder="房间号" value={roomId} onChange={(e) => setRoomId(e.target.value)} style={{ marginRight: 8, padding: 8 }} />
         <input placeholder="昵称" value={nickname} onChange={(e) => setNickname(e.target.value)} style={{ marginRight: 8, padding: 8 }} />
         <button type="button" onClick={joinRoom}>加入房间</button>
+      </div>
+      <div style={{ marginTop: 16 }}>
+        <input placeholder="房主密钥 hostSecret" value={hostSecret} onChange={(e) => setHostSecret(e.target.value)} style={{ marginRight: 8, padding: 8, minWidth: 320 }} />
+        <button type="button" onClick={enterAdmin}>进入管理员页面</button>
       </div>
       {error && <p style={{ color: '#f88', marginTop: 16 }}>{error}</p>}
     </div>

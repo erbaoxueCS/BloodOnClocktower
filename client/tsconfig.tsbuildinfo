@@ -1,1 +1,1 @@
-{"root":["./src/app.tsx","./src/game.tsx","./src/lobby.tsx","./src/env.d.ts","./src/main.tsx","./src/types.ts"],"version":"5.9.3"}
+{"root":["./src/adminpanel.tsx","./src/app.tsx","./src/game.tsx","./src/lobby.tsx","./src/env.d.ts","./src/main.tsx","./src/types.ts"],"version":"5.9.3"}
