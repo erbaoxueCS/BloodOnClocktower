@@ -48,12 +48,12 @@ export function toEngineDecision(room, stepId, validated) {
 /**
  * 调用 AI 获取说书人决策；失败或未配置时回退到随机
  */
-export async function getStorytellerDecision(room, stepId, stepNameZh) {
+export async function getStorytellerDecision(room, stepId, stepNameZh, forceAi = false) {
     const req = buildStorytellerRequest(room, stepId, stepNameZh);
     const goodCharacterIds = room.script.characters.filter((c) => c.alignment === 'good').map((c) => c.id);
     const ctx = { ...req, goodCharacterIds };
     let raw = null;
-    if (USE_AI && OPENAI_API_KEY) {
+    if ((USE_AI || forceAi) && OPENAI_API_KEY) {
         try {
             raw = await callOpenAI(ctx, stepId);
         }

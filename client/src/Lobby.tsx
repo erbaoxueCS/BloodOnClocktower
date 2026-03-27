@@ -2,6 +2,15 @@ import { useState } from 'react';
 import type { RoomView } from './types';
 
 const API = '/api';
+const NICK_PREFIX = ['夜行', '钟声', '雾隐', '火漆', '预言', '静默', '迷踪', '秘钥', '月影', '余烬'];
+const NICK_SUFFIX = ['守夜人', '提名王', '验人师', '反转侠', '沉默狼', '谜语客', '夜鸦', '推理官', '投票手', '烛火'];
+
+function buildDefaultNickname(): string {
+  const p = NICK_PREFIX[Math.floor(Math.random() * NICK_PREFIX.length)] ?? '夜行';
+  const s = NICK_SUFFIX[Math.floor(Math.random() * NICK_SUFFIX.length)] ?? '守夜人';
+  const n = Math.floor(Math.random() * 90) + 10;
+  return `${p}${s}${n}`;
+}
 
 type Script = { id: string; name: string; nameZh: string; minPlayers: number; maxPlayers: number };
 
@@ -13,9 +22,22 @@ interface LobbyProps {
 export function Lobby({ onEnterRoom, onEnterAdmin }: LobbyProps) {
   const [scripts, setScripts] = useState<Script[]>([]);
   const [roomId, setRoomId] = useState('');
-  const [nickname, setNickname] = useState('');
+  const [nickname, setNickname] = useState(buildDefaultNickname);
   const [hostSecret, setHostSecret] = useState<string>('');
   const [error, setError] = useState('');
+  const [copyTip, setCopyTip] = useState('');
+
+  const copyRoomId = async () => {
+    if (!roomId.trim()) return;
+    try {
+      await navigator.clipboard.writeText(roomId.trim());
+      setCopyTip('房间号已复制');
+      setTimeout(() => setCopyTip(''), 1500);
+    } catch {
+      setCopyTip('复制失败，请手动复制');
+      setTimeout(() => setCopyTip(''), 1800);
+    }
+  };
 
   const loadScripts = async () => {
     try {
@@ -63,37 +85,68 @@ export function Lobby({ onEnterRoom, onEnterAdmin }: LobbyProps) {
   };
 
   return (
-    <div style={{ padding: 24, maxWidth: 480, margin: '0 auto' }}>
-      <h1 style={{ marginBottom: 24 }}>血染钟楼</h1>
-      <button type="button" onClick={loadScripts}>加载剧本</button>
-      {scripts.length > 0 && (
-        <ul style={{ marginTop: 8 }}>
-          {scripts.map((s) => (
-            <li key={s.id}>{s.nameZh}（{s.name}） {s.minPlayers}-{s.maxPlayers}人</li>
-          ))}
-        </ul>
-      )}
-      <hr style={{ margin: '24px 0', borderColor: '#333' }} />
-      <div>
-        <button type="button" onClick={createRoom}>创建房间</button>
-        {roomId && <p style={{ marginTop: 8 }}>房间号：<code>{roomId}</code></p>}
-        {hostSecret && (
-          <p style={{ marginTop: 8, opacity: 0.9 }}>
-            房主密钥：<code>{hostSecret}</code>
-            <span style={{ marginLeft: 8, fontSize: 12, opacity: 0.7 }}>（只有持有者可控制进度；可复制到另一终端/AI 连接）</span>
-          </p>
-        )}
+    <div className="page">
+      <header className="header">
+        <div>
+          <h1 className="title">血染钟楼</h1>
+          <p className="subtitle">在线推理对局 · 支持玩家视角与管理员控制台</p>
+        </div>
+      </header>
+      <div className="grid">
+        <section className="card col-8">
+          <h3>剧本信息</h3>
+          <p className="muted">默认剧本为 Trouble Brewing，可先查看人数范围后再开房。</p>
+          <button type="button" onClick={loadScripts}>加载剧本列表</button>
+          {scripts.length > 0 && (
+            <ul style={{ marginTop: 10 }}>
+              {scripts.map((s) => (
+                <li key={s.id}>{s.nameZh}（{s.name}） {s.minPlayers}-{s.maxPlayers} 人</li>
+              ))}
+            </ul>
+          )}
+        </section>
+        <section className="card col-4">
+          <h3>快速开始</h3>
+          <div className="row">
+            <button className="btn-primary" type="button" onClick={createRoom}>创建房间</button>
+          </div>
+          {roomId && (
+            <p style={{ marginTop: 10 }}>
+              房间号：<code className="mono">{roomId}</code>
+              <button type="button" style={{ marginLeft: 8 }} onClick={copyRoomId}>复制房间号</button>
+              {copyTip && <span className="muted" style={{ marginLeft: 8 }}>{copyTip}</span>}
+            </p>
+          )}
+          {hostSecret && (
+            <p className="muted" style={{ marginTop: 8 }}>
+              房主密钥：<code className="mono">{hostSecret}</code>
+            </p>
+          )}
+        </section>
+        <section className="card col-8">
+          <h3>玩家加入</h3>
+          <div className="row">
+            <label className="field">
+              <span className="label">房间号</span>
+              <input placeholder="例如：ABCD12" value={roomId} onChange={(e) => setRoomId(e.target.value)} />
+            </label>
+            <label className="field">
+              <span className="label">昵称</span>
+              <input placeholder="请输入昵称" value={nickname} onChange={(e) => setNickname(e.target.value)} />
+            </label>
+            <button className="btn-primary" type="button" onClick={joinRoom}>加入房间</button>
+          </div>
+        </section>
+        <section className="card col-4">
+          <h3>管理员入口</h3>
+          <label className="field">
+            <span className="label">hostSecret</span>
+            <input placeholder="房主密钥" value={hostSecret} onChange={(e) => setHostSecret(e.target.value)} />
+          </label>
+          <button style={{ marginTop: 8 }} type="button" onClick={enterAdmin}>进入管理员页面</button>
+        </section>
       </div>
-      <div style={{ marginTop: 16 }}>
-        <input placeholder="房间号" value={roomId} onChange={(e) => setRoomId(e.target.value)} style={{ marginRight: 8, padding: 8 }} />
-        <input placeholder="昵称" value={nickname} onChange={(e) => setNickname(e.target.value)} style={{ marginRight: 8, padding: 8 }} />
-        <button type="button" onClick={joinRoom}>加入房间</button>
-      </div>
-      <div style={{ marginTop: 16 }}>
-        <input placeholder="房主密钥 hostSecret" value={hostSecret} onChange={(e) => setHostSecret(e.target.value)} style={{ marginRight: 8, padding: 8, minWidth: 320 }} />
-        <button type="button" onClick={enterAdmin}>进入管理员页面</button>
-      </div>
-      {error && <p style={{ color: '#f88', marginTop: 16 }}>{error}</p>}
+      {error && <p className="error">{error}</p>}
     </div>
   );
 }

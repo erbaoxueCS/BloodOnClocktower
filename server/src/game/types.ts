@@ -129,6 +129,10 @@ export interface Room {
   usedDayActionsBySeat: Map<number, Set<string>>;
   /** 本夜「恶魔刀人」等：受害者 seatIndex -> 行凶者 seatIndex（守鸦人等用） */
   nightKillAttackerByVictim: Map<number, number>;
+  /** 是否启用 AI 说书人接管流程 */
+  aiStorytellerEnabled: boolean;
+  /** AI 说书人最近一次动作时间（节流） */
+  aiLastActionAt: number;
 }
 
 /** 发给客户端的房间摘要（不含身份） */
@@ -147,6 +151,10 @@ export interface RoomView {
   lastNightDeaths: number[];
   lastNightRevivals: number[];
   publicLog: PublicLogEntry[];
+  /** 仅管理员可见：全局记录（含私密与裁定信息） */
+  globalLog?: ReplayLogEntry[];
+  /** 是否开启 AI 说书人接管 */
+  aiStorytellerEnabled?: boolean;
   minPlayers: number;
   maxPlayers: number;
 }

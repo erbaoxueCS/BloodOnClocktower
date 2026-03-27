@@ -60,6 +60,8 @@ export interface RoomView {
   lastNightDeaths: number[];
   lastNightRevivals: number[];
   publicLog?: Array<{ seq: number; at: number; line: string }>;
+  globalLog?: ReplayLogEntry[];
+  aiStorytellerEnabled?: boolean;
   minPlayers: number;
   maxPlayers: number;
 }

@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
-import { createRoom, getRoom, joinRoom, getRoomView, setReady, bindConnection, unbindConnection } from './game/roomManager.js';
+import { createRoom, getRoom, joinRoom, getRoomView, setReady, bindConnection, unbindConnection, rooms } from './game/roomManager.js';
 import { buildYourRolePayload } from './game/yourRole.js';
 import { startGame, advanceNight, getCurrentNightStep, nominate, vote, tallyVotes, execute, startNominationPhase, submitNightAction, findAliveSeatByCharacter, computeChefPairsForSeat, computeEmpathCountForSeat, formatUndertakerInfoForSeat, formatWasherLibrarianInvestigator, checkWin, getShownCharacterId, distortWasherLibrarianInvestigatorDecision, resolveRavenkeeperNightInfo } from './game/gameEngine.js';
 import { getStorytellerDecision } from './ai/storyteller.js';
@@ -146,7 +146,7 @@ async function runNightLoop(roomId, room) {
         if (stepId === 'washerwoman' || stepId === 'librarian' || stepId === 'investigator') {
             const seat = findAliveSeatByCharacter(room, stepId);
             const stepNameZh = room.script.characters.find((c) => c.id === stepId)?.nameZh ?? stepId;
-            const raw = (await getStorytellerDecision(room, stepId, stepNameZh));
+            const raw = (await getStorytellerDecision(room, stepId, stepNameZh, room.aiStorytellerEnabled));
             let decision = raw;
             if (seat != null && raw && Array.isArray(raw.players) && raw.players.length === 2 && typeof raw.characterId === 'string') {
                 decision = distortWasherLibrarianInvestigatorDecision(room, seat, { players: raw.players, characterId: raw.characterId });
@@ -167,6 +167,79 @@ async function runNightLoop(roomId, room) {
 }
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
+function maybeAiTakeoverDay(roomId, room) {
+    if (room.phase !== 'day' || room.status !== 'playing')
+        return;
+    const now = Date.now();
+    if (now - room.aiLastActionAt < 2400)
+        return;
+    const { key, title } = dayReplayTitle(room);
+    if (room.pendingExecution != null) {
+        const targetSeat = room.pendingExecution;
+        const phaseBeforeExec = room.phase;
+        execute(room);
+        pushReplay(room, key, title, `AI 说书人：执行处决 ${seatLabel(room, targetSeat)}。`);
+        pushPublic(room, `AI 说书人：执行处决 #${targetSeat + 1}。`);
+        room.aiLastActionAt = now;
+        const winNow = checkWin(room);
+        if (winNow) {
+            const win = winNow;
+            pushReplay(room, 'result', '游戏结束', `${win === 'good' ? '善良阵营' : '邪恶阵营'} 获胜。`);
+            const replay = buildReplayBundle(room, win);
+            broadcast(roomId, { type: 'game_over', winner: win, room: getRoomView(room), replay });
+            return;
+        }
+        maybeLogEnterNight(room, phaseBeforeExec);
+        room.pendingNightAction = null;
+        room.protectedSeatIndex = null;
+        const phaseBeforeLoop = room.phase;
+        void runNightLoop(roomId, room).then(() => {
+            sendNightPrompt(roomId, room);
+            broadcastAfterNight(roomId, room, phaseBeforeLoop);
+        });
+        return;
+    }
+    if (room.daySubPhase === 'discussion') {
+        startNominationPhase(room);
+        room.aiLastActionAt = now;
+        pushReplay(room, key, title, 'AI 说书人：自动进入提名阶段。');
+        pushPublic(room, 'AI 说书人：进入提名阶段。');
+        broadcast(roomId, { type: 'room', room: getRoomView(room) });
+        return;
+    }
+    if (room.daySubPhase === 'nomination') {
+        if (!room.currentNomination)
+            return;
+        // 仅主持“结束投票并结算”，不替玩家投票或发起提名。
+        // 严格要求：所有可投票玩家都完成选择后，才结束投票。
+        const eligibleVoters = room.players.filter((p) => p.isAlive || p.hasDeadVote).map((p) => p.seatIndex);
+        const allVoted = eligibleVoters.every((seat) => room.votes.has(seat));
+        if (!allVoted)
+            return;
+        if (now - room.aiLastActionAt < 9000)
+            return;
+        const { passed, votesFor, votes } = tallyVotes(room);
+        const voteLines = votes.map((v) => `${seatLabel(room, v.seatIndex)}：${v.inFavor ? '赞成' : '反对'}`).join('；');
+        pushReplay(room, key, title, `AI 说书人：结束本次投票并结算，${passed ? '达到处决条件' : '未达到处决条件'}（赞成 ${votesFor} 票）。票型：${voteLines || '（无人投票记录）'}`);
+        pushPublic(room, `AI 说书人：结束本次投票并结算，${passed ? '达到处决条件' : '未达到处决条件'}（赞成 ${votesFor} 票）。`);
+        broadcast(roomId, { type: 'room', room: getRoomView(room) });
+        broadcast(roomId, { type: 'vote_result', passed, votesFor, votes });
+        room.aiLastActionAt = now;
+        return;
+    }
+}
+async function maybeAiTakeoverNight(roomId, room) {
+    if (room.status !== 'playing' || (room.phase !== 'night' && room.phase !== 'first_night'))
+        return;
+    // 严格边界：夜晚若轮到玩家行动，AI 说书人只等待，不代替玩家提交目标
+    if (room.pendingNightAction)
+        return;
+    const phaseBeforeLoop = room.phase;
+    await runNightLoop(roomId, room);
+    // runNightLoop 可能推进到“等待玩家输入”的步骤，此时只负责发提示，不做代操作
+    sendNightPrompt(roomId, room);
+    broadcastAfterNight(roomId, room, phaseBeforeLoop);
+}
 function broadcast(roomId, payload, excludeConnectionId) {
     const room = getRoom(roomId);
     if (!room)
@@ -181,7 +254,22 @@ function broadcast(roomId, payload, excludeConnectionId) {
             if (typeof seatIndex === 'number' && (type === 'room' || type === 'game_over') && payload.room) {
                 const yourCharacterId = getShownCharacterId(room.players[seatIndex]);
                 const yourRole = buildYourRolePayload(room, seatIndex);
-                p = { ...payload, yourCharacterId, yourRole, yourSeatIndex: seatIndex, isHost: !!ws.isHost };
+                p = {
+                    ...payload,
+                    room: getRoomView(room, seatIndex, false),
+                    yourCharacterId,
+                    yourRole,
+                    yourSeatIndex: seatIndex,
+                    isHost: !!ws.isHost,
+                };
+            }
+            else if ((type === 'room' || type === 'game_over') && payload.room && ws.isAdmin) {
+                p = {
+                    ...payload,
+                    room: getRoomView(room, undefined, true),
+                    isHost: !!ws.isHost,
+                    isAdmin: true,
+                };
             }
         }
         ws.send(JSON.stringify(p));
@@ -273,7 +361,7 @@ wss.on('connection', (ws, req) => {
     else {
         ws.send(JSON.stringify({
             type: 'room',
-            room: getRoomView(room),
+            room: getRoomView(room, undefined, true),
             isHost: ws.isHost,
             isAdmin: true,
         }));
@@ -289,6 +377,20 @@ wss.on('connection', (ws, req) => {
             const isAdmin = !!ws.isAdmin;
             if (msg.type === 'ping') {
                 ws.send(JSON.stringify({ type: 'pong' }));
+                return;
+            }
+            if (msg.type === 'toggle_ai_storyteller') {
+                if (!isHost) {
+                    ws.send(JSON.stringify({ type: 'error', message: 'host_only:toggle_ai_storyteller' }));
+                    return;
+                }
+                room.aiStorytellerEnabled = !!msg.enabled;
+                room.aiLastActionAt = 0;
+                const tip = room.aiStorytellerEnabled ? 'AI 说书人已接管流程。' : 'AI 说书人已关闭，切回人工控制。';
+                const section = room.phase === 'day' ? dayReplayTitle(room) : nightReplayTitle(room);
+                pushReplay(room, section.key, section.title, tip);
+                pushPublic(room, tip);
+                broadcast(roomId, { type: 'room', room: getRoomView(room) });
                 return;
             }
             if (msg.type === 'ready') {
@@ -591,3 +693,13 @@ wss.on('connection', (ws, req) => {
 server.listen(HTTP_PORT, () => {
     console.log(`HTTP + WS server on http://localhost:${HTTP_PORT}`);
 });
+setInterval(async () => {
+    for (const [rid, room] of rooms.entries()) {
+        if (!room.aiStorytellerEnabled || room.status !== 'playing')
+            continue;
+        if (room.phase === 'day')
+            maybeAiTakeoverDay(rid, room);
+        else if (room.phase === 'night' || room.phase === 'first_night')
+            await maybeAiTakeoverNight(rid, room);
+    }
+}, 1200);

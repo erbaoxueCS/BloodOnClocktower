@@ -55,13 +55,13 @@ export function toEngineDecision(room: Room, stepId: string, validated: Storytel
 /**
  * 调用 AI 获取说书人决策；失败或未配置时回退到随机
  */
-export async function getStorytellerDecision(room: Room, stepId: string, stepNameZh: string): Promise<unknown> {
+export async function getStorytellerDecision(room: Room, stepId: string, stepNameZh: string, forceAi = false): Promise<unknown> {
   const req = buildStorytellerRequest(room, stepId, stepNameZh);
   const goodCharacterIds = room.script.characters.filter((c) => c.alignment === 'good').map((c) => c.id);
   const ctx: StorytellerContext = { ...req, goodCharacterIds };
   let raw: unknown = null;
 
-  if (USE_AI && OPENAI_API_KEY) {
+  if ((USE_AI || forceAi) && OPENAI_API_KEY) {
     try {
       raw = await callOpenAI(ctx, stepId);
     } catch (e) {

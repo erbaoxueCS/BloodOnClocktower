@@ -16,6 +16,21 @@ interface GameProps {
   onRoomUpdate: (room: RoomView) => void;
 }
 
+function toZhError(raw: string): string {
+  if (raw.startsWith('night_action_failed:')) {
+    return `夜晚行动无效：${raw.replace('night_action_failed:', '')}`;
+  }
+  if (raw.startsWith('day_action_limit_reached:slayer_shot') || raw.startsWith('day_action_limit_reached:slayer_sho')) {
+    return '白天技能已达使用上限：本局你已使用过一次“杀手开枪”';
+  }
+  if (raw === 'day_action_not_allowed') return '当前阶段不可使用白天技能';
+  if (raw === 'day_action_actor_not_alive') return '只有存活玩家可以发动白天技能';
+  if (raw === 'day_action_target_not_alive') return '目标已死亡，无法选择';
+  if (raw === 'day_action_invalid_target') return '无效目标，请重新选择';
+  if (raw === 'day_action_unknown') return '未知白天技能操作';
+  return raw;
+}
+
 export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId: initialChar, hostSecret, onLeave, onRoomUpdate }: GameProps) {
   const [room, setRoom] = useState<RoomView>(initialRoom);
   const [characterId, setCharacterId] = useState<string | null>(initialChar);
@@ -28,8 +43,21 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
   const [nightLog, setNightLog] = useState<string[]>([]);
   const [endedReplay, setEndedReplay] = useState<ReplayBundle | null>(null);
   const [slayerTarget, setSlayerTarget] = useState<number | null>(null);
+  const [myVoteChoice, setMyVoteChoice] = useState<boolean | null>(null);
   const [isHost, setIsHost] = useState<boolean>(false);
+  const [copyTip, setCopyTip] = useState('');
   const wsRef = useRef<WebSocket | null>(null);
+
+  const copyRoomId = async () => {
+    try {
+      await navigator.clipboard.writeText(room.id);
+      setCopyTip('已复制');
+      setTimeout(() => setCopyTip(''), 1200);
+    } catch {
+      setCopyTip('复制失败');
+      setTimeout(() => setCopyTip(''), 1500);
+    }
+  };
 
   const replaySections = useMemo(() => {
     if (!endedReplay?.entries?.length) return [];
@@ -87,6 +115,7 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
           }
         } else if (msg.type === 'vote_result') {
           setRoom((r) => ({ ...r, currentNomination: null }));
+          setMyVoteChoice(null);
           // 票型公开：打印到控制台（后续可做 UI 面板）
           if (Array.isArray(msg.votes)) {
             console.log('vote_result', { passed: msg.passed, votesFor: msg.votesFor, votes: msg.votes });
@@ -102,10 +131,7 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
         } else if (msg.type === 'error') {
           console.error(msg.message);
           const raw = String(msg.message ?? '未知错误');
-          const zh = raw.startsWith('night_action_failed:')
-            ? `夜晚行动无效：${raw.replace('night_action_failed:', '')}`
-            : raw;
-          setLastSendError(zh);
+          setLastSendError(toZhError(raw));
         }
       } catch (_) {}
     };
@@ -114,6 +140,10 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
       wsRef.current = null;
     };
   }, [roomId, yourSeatIndex, hostSecret]);
+
+  useEffect(() => {
+    if (!room.currentNomination) setMyVoteChoice(null);
+  }, [room.currentNomination]);
 
   const send = (payload: object) => {
     setLastSendError('');
@@ -130,13 +160,21 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
   const isMyNightTurn = nightPrompt?.actorSeatIndex === yourSeatIndex;
 
   return (
-    <div style={{ padding: 24, maxWidth: 800, margin: '0 auto' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-        <h1>血染钟楼 · {room.scriptNameZh}</h1>
-        <button type="button" onClick={onLeave}>离开房间</button>
+    <div className="page">
+      <div className="header">
+        <div>
+          <h1 className="title">血染钟楼 · {room.scriptNameZh}</h1>
+          <p className="subtitle">
+            房间号：<code className="mono">{room.id}</code>
+            <button type="button" style={{ marginLeft: 8 }} onClick={copyRoomId}>复制</button>
+            {copyTip && <span style={{ marginLeft: 6 }}>{copyTip}</span>}
+            {' '}· 你的座位：{yourSeatIndex + 1}
+          </p>
+        </div>
+        <button className="btn-danger" type="button" onClick={onLeave}>离开房间</button>
       </div>
-      <p>
-        房间号：<code>{room.id}</code> · 你的座位：{yourSeatIndex + 1} ·{' '}
+      <p className="muted">
+        当前进度：{' '}
         {room.status === 'lobby'
           ? '大厅'
           : room.status === 'ended'
@@ -147,14 +185,18 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
                 ? `第 ${room.dayNumber + 1} 夜`
                 : `第 ${room.dayNumber} 天 · 白天`}
       </p>
-      <p style={{ marginTop: 4, color: wsStatus === 'open' ? '#8f8' : '#f88' }}>
-        连接状态：{wsStatus === 'open' ? '已连接' : wsStatus === 'connecting' ? '连接中' : wsStatus === 'closed' ? '已断开' : '错误'}
-        {lastSendError ? `（${lastSendError}）` : ''}
-      </p>
+      <div className="row">
+        <span className={`pill ${wsStatus === 'open' ? 'status-ok' : 'status-danger'}`}>
+          连接状态：{wsStatus === 'open' ? '已连接' : wsStatus === 'connecting' ? '连接中' : wsStatus === 'closed' ? '已断开' : '错误'}
+        </span>
+        {lastSendError && <span className="pill status-danger">{lastSendError}</span>}
+      </div>
 
       {room.status === 'lobby' && (
-        <div>
+        <section className="card" style={{ marginTop: 16 }}>
+          <h3>大厅准备阶段</h3>
           <button
+            className={effectiveReady ? '' : 'btn-primary'}
             type="button"
             onClick={() => {
               const next = !effectiveReady;
@@ -165,29 +207,29 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
           >
             {effectiveReady ? '已准备（点击取消）' : '准备'}
           </button>
-          <span style={{ marginLeft: 8, opacity: 0.85 }}>你的状态：{effectiveReady ? '已准备' : '未准备'}</span>
-          {canStart && <button type="button" onClick={() => send({ type: 'start' })} style={{ marginLeft: 8 }}>开始游戏</button>}
-          {hostSecret && <span style={{ marginLeft: 8, fontSize: 12, opacity: 0.7 }}>（你是房主，可控制进度）</span>}
-        </div>
+          <span style={{ marginLeft: 8 }} className="muted">你的状态：{effectiveReady ? '已准备' : '未准备'}</span>
+          {canStart && <button className="btn-primary" type="button" onClick={() => send({ type: 'start' })} style={{ marginLeft: 8 }}>开始游戏</button>}
+          {hostSecret && <span style={{ marginLeft: 8 }} className="muted">（你是房主，可控制进度）</span>}
+        </section>
       )}
 
       {room.status === 'playing' && (
         <>
-          <section style={{ marginTop: 16, padding: 12, border: '1px solid #333', borderRadius: 8, background: '#111' }}>
-            <h3 style={{ margin: '0 0 10px' }}>公共大屏（公开信息）</h3>
-            <p style={{ margin: '0 0 8px', opacity: 0.85 }}>
+          <section className="card" style={{ marginTop: 16 }}>
+            <h3>公共大屏（公开信息）</h3>
+            <p className="muted">
               存活 {room.players.filter((p) => p.isAlive).length}/{room.players.length} · 待处决：{room.pendingExecution != null ? `#${room.pendingExecution + 1}` : '无'}
             </p>
             <ol style={{ margin: 0, paddingLeft: 18, lineHeight: 1.55 }}>
               {(room.publicLog ?? []).slice(-20).map((e) => (
                 <li key={`${e.seq}-${e.at}`}>{e.line}</li>
               ))}
-              {(room.publicLog ?? []).length === 0 && <li style={{ opacity: 0.65 }}>（暂无公开事件）</li>}
+              {(room.publicLog ?? []).length === 0 && <li className="muted">（暂无公开事件）</li>}
             </ol>
           </section>
 
           {nightLog.length > 0 && (
-            <section style={{ marginTop: 16, padding: 12, border: '1px solid #333', borderRadius: 8 }}>
+            <section className="card" style={{ marginTop: 16 }}>
               <h3>夜间信息</h3>
               <ul style={{ margin: 0, paddingLeft: 18 }}>
                 {nightLog.map((t, i) => (
@@ -197,7 +239,7 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
             </section>
           )}
           {nightPrompt && (
-            <section style={{ marginTop: 16, padding: 12, border: '1px solid #333', borderRadius: 8 }}>
+            <section className="card" style={{ marginTop: 16 }}>
               <h3>
                 夜晚行动：{yourRole?.characterId === nightPrompt.stepId ? `${yourRole.characterNameZh}（${yourRole.characterName}）` : nightPrompt.stepId}
               </h3>
@@ -254,24 +296,16 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
             <p style={{ color: '#8f8' }}>昨夜复活：{room.lastNightRevivals.map((s) => `#${s + 1}`).join('、')}</p>
           )}
           {(yourRole || characterId) && (
-            <section
-              style={{
-                marginTop: 16,
-                padding: 14,
-                border: '1px solid #355',
-                borderRadius: 8,
-                background: '#121a18',
-              }}
-            >
-              <h3 style={{ margin: '0 0 10px', fontSize: 17 }}>你的角色</h3>
+            <section className="card" style={{ marginTop: 16 }}>
+              <h3>你的角色</h3>
               {yourRole ? (
                 <>
-                  <p style={{ margin: '0 0 6px', fontSize: '1.1rem' }}>
+                  <p style={{ margin: '0 0 6px' }}>
                     <strong>{yourRole.characterNameZh}</strong>
-                    <span style={{ marginLeft: 8, opacity: 0.85, fontSize: '0.95rem' }}>{yourRole.characterName}</span>
+                    <span className="muted" style={{ marginLeft: 8 }}>{yourRole.characterName}</span>
                   </p>
-                  <p style={{ margin: 0, lineHeight: 1.55, opacity: 0.92 }}>{yourRole.ability}</p>
-                  <p style={{ margin: '10px 0 0', fontSize: 12, opacity: 0.55 }}>角色 id：{yourRole.characterId}</p>
+                  <p style={{ margin: 0, lineHeight: 1.55 }}>{yourRole.ability}</p>
+                  <p className="muted" style={{ margin: '10px 0 0', fontSize: 12 }}>角色 id：{yourRole.characterId}</p>
                 </>
               ) : (
                 <p style={{ margin: 0 }}>
@@ -281,9 +315,9 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
             </section>
           )}
 
-          <section style={{ marginTop: 16 }}>
+          <section className="card" style={{ marginTop: 16 }}>
             <h3>玩家</h3>
-            <ul style={{ listStyle: 'none', padding: 0 }}>
+            <ul className="list-reset">
               {room.players.map((p) => (
                 <li key={p.id} style={{ opacity: p.isAlive ? 1 : 0.5, marginBottom: 8 }}>
                   #{p.seatIndex + 1} {p.nickname} {p.isReady && room.status === 'lobby' && '✓'} {!p.isAlive && '(已死亡)'}
@@ -293,7 +327,7 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
           </section>
 
           {room.phase === 'day' && (
-            <section style={{ marginTop: 24 }}>
+            <section className="card" style={{ marginTop: 16 }}>
               <h3>白天</h3>
               {isHost && room.daySubPhase === 'nomination' && (
                 <div style={{ marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -306,7 +340,7 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
                 </div>
               )}
               {you?.isAlive && (
-                <section style={{ marginTop: 12, padding: 12, border: '1px solid #333', borderRadius: 8 }}>
+                <section className="card" style={{ marginTop: 12 }}>
                   <h4 style={{ margin: '0 0 10px' }}>白天主动技能（所有玩家都可宣称发动）</h4>
                   <p style={{ margin: '0 0 10px', opacity: 0.85, lineHeight: 1.5 }}>
                     例如：你可以宣称自己是「杀手」并开枪。若你真实拥有该能力且条件满足，效果才会生效；否则将“无事发生”（但复盘会记录你的宣称）。
@@ -354,8 +388,30 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
                       <span style={{ marginLeft: 8, opacity: 0.85, fontSize: 13 }}>
                         被提名者也可投票（含投给自己）。
                       </span>
-                      <button type="button" onClick={() => send({ type: 'vote', inFavor: true })} style={{ marginLeft: 8 }}>投票赞成</button>
-                      <button type="button" onClick={() => send({ type: 'vote', inFavor: false })}>反对</button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setMyVoteChoice(true);
+                          send({ type: 'vote', inFavor: true });
+                        }}
+                        style={{ marginLeft: 8 }}
+                      >
+                        {myVoteChoice === true ? '已赞成（可改投）' : '投票赞成'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setMyVoteChoice(false);
+                          send({ type: 'vote', inFavor: false });
+                        }}
+                      >
+                        {myVoteChoice === false ? '已反对（可改投）' : '投票反对'}
+                      </button>
+                      {myVoteChoice !== null && (
+                        <span className={`pill ${myVoteChoice ? 'status-ok' : 'status-warn'}`} style={{ marginLeft: 8 }}>
+                          你的投票：{myVoteChoice ? '已赞成' : '已反对'}
+                        </span>
+                      )}
                     </>
                   )}
                   {isHost && <button type="button" onClick={() => send({ type: 'end_voting' })} style={{ marginLeft: 8 }}>结束投票</button>}
@@ -372,22 +428,34 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
         </>
       )}
 
+      {room.status === 'ended' && (
+        <section className="card" style={{ marginTop: 16 }}>
+          <h3>下一局准备</h3>
+          <p className="muted">对局结束后无需离开房间，所有玩家可直接准备并开启新一局。</p>
+          <button
+            className={effectiveReady ? '' : 'btn-primary'}
+            type="button"
+            onClick={() => {
+              const next = !effectiveReady;
+              setOptimisticReady(next);
+              send({ type: 'ready', ready: next });
+            }}
+            disabled={wsStatus !== 'open'}
+          >
+            {effectiveReady ? '已准备（点击取消）' : '准备下一局'}
+          </button>
+          <span style={{ marginLeft: 8 }} className="muted">你的状态：{effectiveReady ? '已准备' : '未准备'}</span>
+        </section>
+      )}
+
       {room.status === 'ended' && endedReplay && (
         <section style={{ marginTop: 24 }}>
-          <h2>对局复盘</h2>
+          <h2 style={{ marginBottom: 8 }}>对局复盘</h2>
           <p style={{ marginTop: 8, fontSize: '1.05rem' }}>
             结果：<strong>{endedReplay.winnerZh}</strong> 获胜
           </p>
           {yourRole && (
-            <aside
-              style={{
-                marginTop: 14,
-                padding: 12,
-                border: '1px solid #355',
-                borderRadius: 8,
-                background: '#121a18',
-              }}
-            >
+            <aside className="card" style={{ marginTop: 14 }}>
               <strong>你本局角色：</strong>
               {yourRole.characterNameZh}（{yourRole.characterName}）— {yourRole.ability}
             </aside>
