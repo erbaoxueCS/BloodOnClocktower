@@ -57,6 +57,10 @@ export interface RoomView {
   daySubPhase: DaySubPhase | null;
   currentNomination: { nominator: number; nominated: number } | null;
   pendingExecution: number | null;
+  nominationsToday: Array<{ nominator: number; nominated: number }>;
+  skippedNominationsToday: number[];
+  pendingExecutionVotesFor: number;
+  pendingExecutionTied: boolean;
   lastNightDeaths: number[];
   lastNightRevivals: number[];
   publicLog?: Array<{ seq: number; at: number; line: string }>;

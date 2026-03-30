@@ -19,8 +19,9 @@
 | **1.0.6** | 处女（Virgin）落地：白天提名真实处女且未中毒/醉酒、且提名者真实为镇民时，提名者立即被处决并写入复盘；可能即时触发胜负并下发 `game_over`。 |
 | **1.0.7** | 洗衣妇/图书管理员/调查员信息失真统一为 `distortWasherLibrarianInvestigatorDecision`（中毒/醉酒：约 50% 换人设、50% 换两人组合）；守鸦人：普通夜 `imp` 后增加 `ravenkeeper` 步，死亡守鸦人依 `nightKillAttackerByVictim` 获知行凶者（中毒/醉酒可假信息）；`advanceNight` 防止跳过守鸦人步；恶魔杀人时记录受害者→行凶者映射。 |
 | **1.0.8** | **P1**：在线 `runNightLoop` 对洗衣妇/图书管理员/调查员调用 `getStorytellerDecision`（`USE_AI_STORYTELLER` + `OPENAI_API_KEY` 时请求 OpenAI，`OPENAI_MODEL` 可选）；校验失败或未配置时回退随机；中毒座位摘要写入 AI 提示；`GET /api/storyteller-ai` 查询是否启用；`validateDecision` 允许恶魔目标为自己（与引擎一致）。 |
-| **1.0.9** | 进度控制从“1号玩家”解耦为**房主权限**：创建房间返回 `hostSecret`，WebSocket 连接携带 `hostSecret` 才具备控制权限（`start/next_phase/end_voting/execute` 等）。对局中新增 `Room.publicLog` 公开事件日志，前端增加“公共大屏”展示公开事件（提名、投票结果、处决、白天宣称技能与结果等）。 |
+| **1.0.9** | 进度控制从“1号玩家”解耦为**房主权限**：创建房间返回 `hostSecret`，WebSocket 连接携带 `hostSecret` 才具备控制权限（如 `start` 等）。对局中新增 `Room.publicLog` 公开事件日志，前端增加“公共大屏”展示公开事件（提名、投票结果、处决、白天宣称技能与结果等）。 |
 | **1.0.10** | 增加“管理员专用页面”（大厅可用 `roomId + hostSecret` 直接进入，不占玩家座位，`admin=1` WebSocket 连接）；管理员可控制进度但不可 ready/提名/投票/白天技能/夜间行动。白天主动技能“宣称次数”改为严格限制：如 `slayer_shot` 超过 1 次直接返回 `day_action_limit_reached`，不再记录二次宣称。 |
+| **1.0.11** | 白天提名/投票/处决流转细化：白天自动进入提名环节；每名**存活**玩家必须“提名一次”或“声明本轮不提名”后才能结束白天并入夜；投票达到处决条件时仅**标记待处决**（记录最高赞成票），待白天结束统一执行处决或无人处决入夜；死亡玩家仍有 1 次“死人票”（`hasDeadVote`）且整局仅可用一次。 |
 
 后续迭代请在表中追加行，并在本文相关章节（消息协议、Room 结构）同步更新。
 
@@ -102,9 +103,14 @@ npm run dev
 
 ### 3.3 阶段与流程
 
-- 首夜 → 白天（讨论→提名）→ 夜晚 → … 循环
+- 首夜 → 白天（自动进入提名流转）→ 夜晚 → … 循环
 - 白天提名：每名玩家每天最多提名一次；每名玩家每天最多被提名一次；同一时间只有一个提名；**可提名自己**
-- 投票与处决：统计赞成票，达到“存活人数半数（向上取整）”则进入待处决；**被提名者可参与投票（含投给自己）**
+- 投票与处决（简化但更贴近桌游节奏）：
+  - 统计赞成票，达到“存活人数半数（向上取整）”则**标记为待处决候选**（不立刻处决）
+  - 本日可能出现多次提名投票：以**最高赞成票**作为当日待处决候选；若最高票平局，则本日默认无人处决（除非后续出现更高票打破）
+  - 白天结束（见下条）时才会真正执行处决并入夜；若无处决则直接入夜
+  - **被提名者可参与投票（含投给自己）**
+- 白天结束条件：每名**存活玩家**必须“提名一次”或“选择本轮不提名”，且当前没有进行中的投票，才会结束白天进入夜晚（并在需要时统一结算处决）
 - 胜利判定：
   - 善良：恶魔死亡
   - 邪恶：场上存活 ≤ 2
@@ -164,7 +170,7 @@ npm run dev
 
 - **剧本/角色实现为精简版**：只实现了部分角色的夜序与能力（重点保证流程跑通）
 - **醉酒（Drunk）尚未实现**：目前仅存在角色条目，未实现“伪装为镇民且能力无效/信息错误”等机制
-- **投毒持续时间简化**：当前在 `execute()` 进入夜晚时清除；原版更细的“到下一黄昏”需要明确阶段边界
+- **投毒持续时间简化**：当前在“进入夜晚（黄昏）”时清除；原版更细的“到下一黄昏”需要明确阶段边界
   - 补充说明（现状）：投毒在夜晚行动时写入 `poisonedSeatIndex`，会影响当夜后续信息/能力；在进入下一次夜晚前清除（简化）
 - **恶魔/爪牙互认规则简化**：目前按座位号互认，不区分 7 人以下/以上的细节与不在场身份展示细节
 - **夜晚顺序表不完整**：`spy` 等步骤目前大多跳过或仅作为占位
@@ -201,13 +207,9 @@ npm run dev
 
 - `ready`: `{ type:'ready', ready:boolean }`
 - `start`: `{ type:'start' }`
-- `next_phase`: `{ type:'next_phase' }`（讨论 → 提名）
 - `nominate`: `{ type:'nominate', nominatedSeat:number }`
+- `skip_nomination`: `{ type:'skip_nomination' }`（存活玩家：声明本轮不提名）
 - `vote`: `{ type:'vote', inFavor:boolean }`
-- `end_nomination`: `{ type:'end_nomination' }`（房主：结束提名阶段→回到讨论）
-- `cancel_current_nomination`: `{ type:'cancel_current_nomination' }`（房主：取消当前提名）
-- `end_voting`: `{ type:'end_voting' }`
-- `execute`: `{ type:'execute' }`
 - `night_action`: `{ type:'night_action', targets:number[] }`
 - `ping`: `{ type:'ping' }`
 
@@ -215,6 +217,7 @@ npm run dev
 
 - `room`: `{ type:'room', room:RoomView, yourSeatIndex, yourCharacterId, yourRole?:null|{ characterId, characterName, characterNameZh, ability } }`（**1.0.2+** 发牌后 `yourRole` 为完整名片；大厅为 `null`）
   - **1.0.9+**：额外包含 `isHost:boolean`，表示本连接是否具备房主权限；`RoomView` 额外包含 `publicLog`（公开事件日志）
+  - **1.0.11+**：`RoomView` 增加 `nominationsToday` / `skippedNominationsToday` / `pendingExecutionVotesFor` / `pendingExecutionTied`，用于前端提示“本轮提名完成情况”与“当前标记的最高票待处决状态”
 - `phase`: `{ type:'phase', phase, dayNumber }`
 - `night_prompt`: `{ type:'night_prompt', stepId, actorSeatIndex, pick, aliveSeatIndices }`（只发给行动者）
 - `night_info`: `{ type:'night_info', message }`（只发给对应玩家）

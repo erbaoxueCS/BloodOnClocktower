@@ -87,12 +87,18 @@ export interface Room {
   currentNomination: { nominator: number; nominated: number } | null;
   /** 今日已提名记录：nominator -> nominated */
   nominationsToday: Map<number, number>;
+  /** 今日声明“不提名”的存活玩家 seatIndex 集合 */
+  skippedNominationsToday: Set<number>;
   /** 今日被提名记录 */
   nominatedToday: Set<number>;
   /** 当前投票：seatIndex -> 是否投赞成 */
   votes: Map<number, boolean>;
   /** 待处决的玩家 seatIndex（投票通过后） */
   pendingExecution: number | null;
+  /** 待处决候选的赞成票数（用于比较更高票） */
+  pendingExecutionVotesFor: number;
+  /** 待处决是否出现最高票平局（平局则当日无人处决） */
+  pendingExecutionTied: boolean;
   /** 夜晚顺序当前步（首夜/普通夜步骤索引） */
   nightStepIndex: number;
   /** 夜晚等待玩家输入的行动（若不为 null，则夜晚流程暂停） */
@@ -148,6 +154,13 @@ export interface RoomView {
   daySubPhase: DaySubPhase | null;
   currentNomination: Room['currentNomination'];
   pendingExecution: number | null;
+  /** 今日提名记录（用于前端展示/判断） */
+  nominationsToday: Array<{ nominator: number; nominated: number }>;
+  /** 今日声明“不提名”的玩家 seatIndex 列表 */
+  skippedNominationsToday: number[];
+  /** 当前“最高票待处决”信息（仅用于提示，不代表会立即处决） */
+  pendingExecutionVotesFor: number;
+  pendingExecutionTied: boolean;
   lastNightDeaths: number[];
   lastNightRevivals: number[];
   publicLog: PublicLogEntry[];

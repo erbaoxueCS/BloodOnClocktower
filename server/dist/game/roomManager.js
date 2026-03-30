@@ -20,9 +20,12 @@ export function createRoom(scriptId) {
         daySubPhase: null,
         currentNomination: null,
         nominationsToday: new Map(),
+        skippedNominationsToday: new Set(),
         nominatedToday: new Set(),
         votes: new Map(),
         pendingExecution: null,
+        pendingExecutionVotesFor: 0,
+        pendingExecutionTied: false,
         nightStepIndex: 0,
         pendingNightAction: null,
         protectedSeatIndex: null,
@@ -89,6 +92,10 @@ export function getRoomView(room, _forSeatIndex, includeGlobalLog = false) {
         daySubPhase: room.daySubPhase,
         currentNomination: room.currentNomination,
         pendingExecution: room.pendingExecution,
+        nominationsToday: Array.from(room.nominationsToday.entries()).map(([nominator, nominated]) => ({ nominator, nominated })),
+        skippedNominationsToday: Array.from(room.skippedNominationsToday.values()),
+        pendingExecutionVotesFor: room.pendingExecutionVotesFor,
+        pendingExecutionTied: room.pendingExecutionTied,
         lastNightDeaths: room.lastNightDeaths,
         lastNightRevivals: room.lastNightRevivals,
         publicLog: room.publicLog,
@@ -105,9 +112,12 @@ function resetRoomForNextGame(room) {
     room.daySubPhase = null;
     room.currentNomination = null;
     room.nominationsToday = new Map();
+    room.skippedNominationsToday = new Set();
     room.nominatedToday = new Set();
     room.votes = new Map();
     room.pendingExecution = null;
+    room.pendingExecutionVotesFor = 0;
+    room.pendingExecutionTied = false;
     room.nightStepIndex = 0;
     room.pendingNightAction = null;
     room.protectedSeatIndex = null;

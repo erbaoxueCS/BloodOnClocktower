@@ -4,7 +4,7 @@ import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { createRoom, getRoom, joinRoom, getRoomView, setReady, bindConnection, unbindConnection, rooms } from './game/roomManager.js';
 import { buildYourRolePayload } from './game/yourRole.js';
-import { startGame, advanceNight, getCurrentNightStep, nominate, vote, tallyVotes, execute, startNominationPhase, submitNightAction, findAliveSeatByCharacter, computeChefPairsForSeat, computeEmpathCountForSeat, formatUndertakerInfoForSeat, formatWasherLibrarianInvestigator, checkWin, getShownCharacterId, distortWasherLibrarianInvestigatorDecision, resolveRavenkeeperNightInfo } from './game/gameEngine.js';
+import { startGame, advanceNight, getCurrentNightStep, nominate, skipNomination, vote, tallyVotes, execute, maybeFinishDay, submitNightAction, findAliveSeatByCharacter, computeChefPairsForSeat, computeEmpathCountForSeat, formatUndertakerInfoForSeat, formatWasherLibrarianInvestigator, checkWin, getShownCharacterId, distortWasherLibrarianInvestigatorDecision, resolveRavenkeeperNightInfo } from './game/gameEngine.js';
 import { getStorytellerDecision } from './ai/storyteller.js';
 import { pushReplay, buildReplayBundle, seatLabel, pushPublic } from './game/replay.js';
 import type { GamePhase } from './game/types.js';
@@ -176,57 +176,35 @@ type ClientMessage =
   | { type: 'ready'; ready: boolean }
   | { type: 'start' }
   | { type: 'nominate'; nominatedSeat: number }
+  | { type: 'skip_nomination' }
   | { type: 'vote'; inFavor: boolean }
-  | { type: 'end_voting' }
-  | { type: 'end_nomination' }
-  | { type: 'cancel_current_nomination' }
-  | { type: 'execute' }
   | { type: 'night_action'; targets: number[] }
   | { type: 'day_action'; actionId: string; targetSeat?: number }
-  | { type: 'next_phase' }
   | { type: 'toggle_ai_storyteller'; enabled: boolean }
   | { type: 'ping' };
+
+async function handleDayMaybeEnterNight(roomId: string, room: import('./game/types.js').Room, phaseBefore: GamePhase, executedSeatIndex: number | null): Promise<void> {
+  if (room.status === 'ended') return;
+  const { key, title } = dayReplayTitle(room);
+  if (executedSeatIndex != null) {
+    pushReplay(room, key, title, `处决执行：${seatLabel(room, executedSeatIndex)} 死亡。`);
+    pushPublic(room, `处决执行：${seatLabel(room, executedSeatIndex)} 死亡。`);
+  } else {
+    pushReplay(room, key, title, '今日无人被处决。');
+    pushPublic(room, '今日无人被处决。');
+  }
+  maybeLogEnterNight(room, phaseBefore);
+  const phaseBeforeLoop = room.phase;
+  await runNightLoop(roomId, room);
+  if (room.phase !== 'waiting') sendNightPrompt(roomId, room);
+  broadcastAfterNight(roomId, room, phaseBeforeLoop);
+}
 
 function maybeAiTakeoverDay(roomId: string, room: import('./game/types.js').Room): void {
   if (room.phase !== 'day' || room.status !== 'playing') return;
   const now = Date.now();
   if (now - room.aiLastActionAt < 2400) return;
   const { key, title } = dayReplayTitle(room);
-
-  if (room.pendingExecution != null) {
-    const targetSeat = room.pendingExecution;
-    const phaseBeforeExec = room.phase;
-    execute(room);
-    pushReplay(room, key, title, `AI 说书人：执行处决 ${seatLabel(room, targetSeat)}。`);
-    pushPublic(room, `AI 说书人：执行处决 #${targetSeat + 1}。`);
-    room.aiLastActionAt = now;
-    const winNow = checkWin(room);
-    if (winNow) {
-      const win = winNow;
-      pushReplay(room, 'result', '游戏结束', `${win === 'good' ? '善良阵营' : '邪恶阵营'} 获胜。`);
-      const replay = buildReplayBundle(room, win);
-      broadcast(roomId, { type: 'game_over', winner: win, room: getRoomView(room), replay });
-      return;
-    }
-    maybeLogEnterNight(room, phaseBeforeExec);
-    room.pendingNightAction = null;
-    room.protectedSeatIndex = null;
-    const phaseBeforeLoop = room.phase;
-    void runNightLoop(roomId, room).then(() => {
-      sendNightPrompt(roomId, room);
-      broadcastAfterNight(roomId, room, phaseBeforeLoop);
-    });
-    return;
-  }
-
-  if (room.daySubPhase === 'discussion') {
-    startNominationPhase(room);
-    room.aiLastActionAt = now;
-    pushReplay(room, key, title, 'AI 说书人：自动进入提名阶段。');
-    pushPublic(room, 'AI 说书人：进入提名阶段。');
-    broadcast(roomId, { type: 'room', room: getRoomView(room) });
-    return;
-  }
 
   if (room.daySubPhase === 'nomination') {
     if (!room.currentNomination) return;
@@ -243,6 +221,13 @@ function maybeAiTakeoverDay(roomId: string, room: import('./game/types.js').Room
     broadcast(roomId, { type: 'room', room: getRoomView(room) });
     broadcast(roomId, { type: 'vote_result', passed, votesFor, votes });
     room.aiLastActionAt = now;
+
+    const phaseBefore = room.phase;
+    const fin = maybeFinishDay(room);
+    if (fin.ended) {
+      void handleDayMaybeEnterNight(roomId, room, phaseBefore, fin.executedSeatIndex);
+      return;
+    }
     return;
   }
 }
@@ -479,53 +464,56 @@ wss.on('connection', (ws: any, req) => {
         broadcast(roomId, { type: 'room', room: getRoomView(room) });
         return;
       }
+      if (msg.type === 'skip_nomination') {
+        if (isAdmin) {
+          ws.send(JSON.stringify({ type: 'error', message: 'admin_cannot_skip_nomination' }));
+          return;
+        }
+        const ok = skipNomination(room, seatIndex);
+        if (!ok) {
+          ws.send(JSON.stringify({ type: 'error', message: 'Skip nomination not allowed' }));
+          return;
+        }
+        const { key, title } = dayReplayTitle(room);
+        pushReplay(room, key, title, `${seatLabel(room, seatIndex)} 选择本轮不提名。`);
+        pushPublic(room, `${seatLabel(room, seatIndex)} 选择本轮不提名。`);
+        broadcast(roomId, { type: 'room', room: getRoomView(room) });
+
+        const phaseBefore = room.phase;
+        const fin = maybeFinishDay(room);
+        if (fin.ended) {
+          await handleDayMaybeEnterNight(roomId, room, phaseBefore, fin.executedSeatIndex);
+          return;
+        }
+        return;
+      }
       if (msg.type === 'vote') {
         if (isAdmin) {
           ws.send(JSON.stringify({ type: 'error', message: 'admin_cannot_vote' }));
           return;
         }
         vote(room, seatIndex, msg.inFavor);
+        // 自动结束投票：所有可投票玩家都完成选择后立即结算
+        if (room.currentNomination) {
+          const eligibleVoters = room.players.filter((p) => p.isAlive || p.hasDeadVote).map((p) => p.seatIndex);
+          const allVoted = eligibleVoters.every((s) => room.votes.has(s));
+          if (allVoted) {
+            const { passed, votesFor, votes } = tallyVotes(room);
+            const { key, title } = dayReplayTitle(room);
+            const voteLines = votes.map((v) => `${seatLabel(room, v.seatIndex)}：${v.inFavor ? '赞成' : '反对'}`).join('；');
+            pushReplay(room, key, title, `投票结束：${passed ? '达到处决条件（已标记待处决）' : '未达到处决条件'}（赞成 ${votesFor} 票）。票型：${voteLines || '（无人投票记录）'}`);
+            pushPublic(room, `投票结束：${passed ? '达到处决条件（已标记待处决）' : '未达到处决条件'}（赞成 ${votesFor} 票）。`);
+            broadcast(roomId, { type: 'vote_result', passed, votesFor, votes });
+          }
+        }
         broadcast(roomId, { type: 'room', room: getRoomView(room) });
-        return;
-      }
-      if (msg.type === 'end_nomination') {
-        if (!isHost) {
-          ws.send(JSON.stringify({ type: 'error', message: 'host_only:end_nomination' }));
+
+        const phaseBefore = room.phase;
+        const fin = maybeFinishDay(room);
+        if (fin.ended) {
+          await handleDayMaybeEnterNight(roomId, room, phaseBefore, fin.executedSeatIndex);
           return;
         }
-        if (room.phase !== 'day') {
-          ws.send(JSON.stringify({ type: 'error', message: 'end_nomination_not_in_day' }));
-          return;
-        }
-        room.daySubPhase = 'discussion';
-        room.currentNomination = null;
-        room.votes = new Map();
-        pushPublic(room, '房主结束提名阶段，回到讨论。');
-        const { key, title } = dayReplayTitle(room);
-        pushReplay(room, key, title, '房主结束提名阶段，回到讨论。');
-        broadcast(roomId, { type: 'room', room: getRoomView(room) });
-        return;
-      }
-      if (msg.type === 'cancel_current_nomination') {
-        if (!isHost) {
-          ws.send(JSON.stringify({ type: 'error', message: 'host_only:cancel_current_nomination' }));
-          return;
-        }
-        if (room.phase !== 'day') {
-          ws.send(JSON.stringify({ type: 'error', message: 'cancel_nomination_not_in_day' }));
-          return;
-        }
-        if (!room.currentNomination) {
-          ws.send(JSON.stringify({ type: 'error', message: 'no_current_nomination' }));
-          return;
-        }
-        const n = room.currentNomination;
-        room.currentNomination = null;
-        room.votes = new Map();
-        pushPublic(room, `房主取消本次提名：#${n.nominator + 1} → #${n.nominated + 1}。`);
-        const { key, title } = dayReplayTitle(room);
-        pushReplay(room, key, title, `房主取消本次提名：${seatLabel(room, n.nominator)} → ${seatLabel(room, n.nominated)}。`);
-        broadcast(roomId, { type: 'room', room: getRoomView(room) });
         return;
       }
       if (msg.type === 'day_action') {
@@ -596,56 +584,6 @@ wss.on('connection', (ws: any, req) => {
         ws.send(JSON.stringify({ type: 'error', message: 'day_action_unknown' }));
         return;
       }
-      if (msg.type === 'end_voting') {
-        if (!isHost) {
-          ws.send(JSON.stringify({ type: 'error', message: 'host_only:end_voting' }));
-          return;
-        }
-        const { passed, votesFor, votes } = tallyVotes(room);
-        const { key, title } = dayReplayTitle(room);
-        const voteLines = votes.map((v) => `${seatLabel(room, v.seatIndex)}：${v.inFavor ? '赞成' : '反对'}`).join('；');
-        pushReplay(room, key, title, `投票结束：${passed ? '达到处决条件' : '未达到处决条件'}（赞成 ${votesFor} 票）。票型：${voteLines || '（无人投票记录）'}`);
-        pushPublic(room, `投票结束：${passed ? '达到处决条件' : '未达到处决条件'}（赞成 ${votesFor} 票）。`);
-        broadcast(roomId, { type: 'room', room: getRoomView(room) });
-        broadcast(roomId, { type: 'vote_result', passed, votesFor, votes });
-        return;
-      }
-      if (msg.type === 'execute') {
-        if (!isHost) {
-          ws.send(JSON.stringify({ type: 'error', message: 'host_only:execute' }));
-          return;
-        }
-        const phaseBeforeExec = room.phase;
-        const targetSeat = room.pendingExecution;
-        const dayNumForReplay = room.dayNumber;
-        const dayReplayKey = `day_${dayNumForReplay}`;
-        const dayReplayTitleText = `第 ${dayNumForReplay} 天 · 白天`;
-        execute(room);
-        if (room.status === 'ended') {
-          const win = room.players.some((p) => p.isAlive && p.characterId === 'imp') ? 'evil' : 'good';
-          if (targetSeat != null) {
-            pushReplay(room, dayReplayKey, dayReplayTitleText, `处决执行：${seatLabel(room, targetSeat)} 死亡。`);
-            pushPublic(room, `处决执行：${seatLabel(room, targetSeat)} 死亡。`);
-          }
-          pushReplay(room, 'result', '游戏结束', `${win === 'good' ? '善良阵营' : '邪恶阵营'} 获胜。`);
-          const replay = buildReplayBundle(room, win);
-          broadcast(roomId, { type: 'game_over', winner: win, room: getRoomView(room), replay });
-        } else {
-          if (targetSeat != null) {
-            pushReplay(room, dayReplayKey, dayReplayTitleText, `处决执行：${seatLabel(room, targetSeat)} 死亡。`);
-            pushPublic(room, `处决执行：${seatLabel(room, targetSeat)} 死亡。`);
-          }
-          maybeLogEnterNight(room, phaseBeforeExec);
-          room.pendingNightAction = null;
-          room.protectedSeatIndex = null;
-          const phaseBeforeLoop = room.phase;
-          await runNightLoop(roomId, room);
-          // 若已结束（phase=waiting），不再提示夜晚行动
-          if (room.phase !== 'waiting') sendNightPrompt(roomId, room);
-          broadcastAfterNight(roomId, room, phaseBeforeLoop);
-        }
-        return;
-      }
       if (msg.type === 'night_action') {
         if (isAdmin) {
           ws.send(JSON.stringify({ type: 'error', message: 'admin_cannot_night_action' }));
@@ -682,20 +620,6 @@ wss.on('connection', (ws: any, req) => {
         // 若已结束（phase=waiting），不再提示夜晚行动
         if (room.phase !== 'waiting') sendNightPrompt(roomId, room);
         broadcastAfterNight(roomId, room, phaseBeforeLoop);
-        return;
-      }
-      if (msg.type === 'next_phase') {
-        if (room.phase === 'day' && room.daySubPhase === 'discussion') {
-          if (!isHost) {
-            ws.send(JSON.stringify({ type: 'error', message: 'host_only:next_phase' }));
-            return;
-          }
-          startNominationPhase(room);
-          const { key, title } = dayReplayTitle(room);
-          pushReplay(room, key, title, '进入提名阶段。');
-          pushPublic(room, '进入提名阶段。');
-          broadcast(roomId, { type: 'room', room: getRoomView(room) });
-        }
         return;
       }
     } catch (e) {

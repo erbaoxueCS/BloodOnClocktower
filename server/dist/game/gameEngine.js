@@ -440,12 +440,16 @@ export function submitNightAction(room, actorSeatIndex, targets) {
 function gotoDay(room) {
     room.phase = 'day';
     room.dayNumber++;
-    room.daySubPhase = 'discussion';
+    // 按需求：白天不需要“进入提名阶段”按钮，天亮后直接开始提名流转
+    room.daySubPhase = 'nomination';
     room.currentNomination = null;
     room.nominationsToday = new Map();
+    room.skippedNominationsToday = new Set();
     room.nominatedToday = new Set();
     room.votes = new Map();
     room.pendingExecution = null;
+    room.pendingExecutionVotesFor = 0;
+    room.pendingExecutionTied = false;
     /** 胜负仅在「进入白天」时结算，便于夜间链式规则（刀自己、后续角色等）自由组合 */
     const win = checkWin(room);
     if (win) {
@@ -453,10 +457,56 @@ function gotoDay(room) {
         room.phase = 'waiting';
     }
 }
-/** 进入提名阶段 */
-export function startNominationPhase(room) {
-    room.daySubPhase = 'nomination';
-    room.currentNomination = null;
+function gotoNight(room) {
+    room.phase = 'night';
+    // 进入夜晚视为黄昏：清除上一夜投毒效果
+    room.poisonedSeatIndex = null;
+    room.nightStepIndex = 0;
+    room.pendingNightAction = null;
+    room.protectedSeatIndex = null;
+    room.lastNightDeaths = [];
+    room.lastNightRevivals = [];
+    room.nightKillAttackerByVictim = new Map();
+}
+function allAliveHandledNomination(room) {
+    const aliveSeats = room.players.filter((p) => p.isAlive).map((p) => p.seatIndex);
+    return aliveSeats.every((s) => room.nominationsToday.has(s) || room.skippedNominationsToday.has(s));
+}
+export function skipNomination(room, seatIndex) {
+    if (room.phase !== 'day')
+        return false;
+    if (room.daySubPhase !== 'nomination' && room.daySubPhase !== 'discussion')
+        return false;
+    if (room.currentNomination !== null)
+        return false;
+    const p = room.players[seatIndex];
+    if (!p?.isAlive)
+        return false;
+    if (room.nominationsToday.has(seatIndex))
+        return false;
+    room.skippedNominationsToday.add(seatIndex);
+    return true;
+}
+/** 白天结束：若存在唯一最高票待处决者则处决，否则直接入夜 */
+export function maybeFinishDay(room) {
+    if (room.phase !== 'day')
+        return { ended: false, executedSeatIndex: null };
+    if (room.currentNomination !== null)
+        return { ended: false, executedSeatIndex: null };
+    if (!allAliveHandledNomination(room))
+        return { ended: false, executedSeatIndex: null };
+    if (room.pendingExecution != null && !room.pendingExecutionTied) {
+        const executed = room.pendingExecution;
+        execute(room);
+        return { ended: true, executedSeatIndex: executed };
+    }
+    // 平局或无人达到处决条件：今日无人处决，直接入夜
+    room.pendingExecution = null;
+    room.pendingExecutionVotesFor = 0;
+    room.pendingExecutionTied = false;
+    room.daySubPhase = 'discussion';
+    gotoNight(room);
+    return { ended: true, executedSeatIndex: null };
 }
 /** 发起提名（允许提名自己；处决投票中被提名者亦可自投赞成/反对） */
 export function nominate(room, nominatorSeat, nominatedSeat) {
@@ -467,6 +517,8 @@ export function nominate(room, nominatorSeat, nominatedSeat) {
     if (!nominator?.isAlive || !nominated?.isAlive)
         return false;
     if (room.nominationsToday.has(nominatorSeat))
+        return false;
+    if (room.skippedNominationsToday.has(nominatorSeat))
         return false;
     if (room.nominatedToday.has(nominatedSeat))
         return false;
@@ -543,8 +595,19 @@ export function tallyVotes(room) {
         votesFor++; });
     const required = Math.ceil(aliveCount / 2);
     const passed = votesFor >= required;
-    if (passed)
-        room.pendingExecution = room.currentNomination.nominated;
+    if (passed) {
+        const nominee = room.currentNomination.nominated;
+        if (votesFor > room.pendingExecutionVotesFor) {
+            room.pendingExecution = nominee;
+            room.pendingExecutionVotesFor = votesFor;
+            room.pendingExecutionTied = false;
+        }
+        else if (votesFor === room.pendingExecutionVotesFor) {
+            // 最高票平局：当日无人处决（即使后续不再出现更高票）
+            room.pendingExecution = null;
+            room.pendingExecutionTied = true;
+        }
+    }
     const votes = Array.from(room.votes.entries()).map(([seatIndex, inFavor]) => ({ seatIndex, inFavor }));
     room.currentNomination = null;
     return { passed, votesFor, votes };
@@ -564,19 +627,15 @@ export function execute(room) {
     room.lastExecutedCharacterId = p.characterId ?? null;
     room.pendingExecution = null;
     room.daySubPhase = 'discussion';
+    room.pendingExecutionVotesFor = 0;
+    room.pendingExecutionTied = false;
     const win = checkWin(room);
     if (win) {
         room.status = 'ended';
         room.phase = 'waiting';
         return;
     }
-    room.phase = 'night';
-    // 进入夜晚视为黄昏：清除上一夜投毒效果
-    room.poisonedSeatIndex = null;
-    room.nightStepIndex = 0;
-    room.lastNightDeaths = [];
-    room.lastNightRevivals = [];
-    room.nightKillAttackerByVictim = new Map();
+    gotoNight(room);
 }
 /** 检查胜利条件 */
 export function checkWin(room) {
