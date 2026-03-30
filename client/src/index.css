@@ -137,6 +137,15 @@ button:hover {
   transform: translateY(-1px);
 }
 
+button:active {
+  transform: translateY(0px) scale(0.99);
+}
+
+button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(108, 123, 255, 0.22);
+}
+
 button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
@@ -148,10 +157,20 @@ button:disabled {
   background: linear-gradient(90deg, var(--brand) 0%, var(--brand-2) 100%);
 }
 
+.btn-primary:disabled {
+  border-color: transparent;
+}
+
 .btn-danger {
   border-color: #8d3147;
   background: #3a1320;
   color: #ffd9e0;
+}
+
+@media (hover: none) and (pointer: coarse) {
+  button:hover {
+    transform: none;
+  }
 }
 
 .pill {

@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
-import type { Room, PlayerSeat, RoomView } from './types.js';
+import type { ChatEntry, Room, PlayerSeat, RoomView } from './types.js';
 import { troubleBrewing } from '../script/troubleBrewing.js';
 
 const rooms = new Map<string, Room>();
@@ -48,6 +48,12 @@ export function createRoom(scriptId: string): Room {
     nightKillAttackerByVictim: new Map(),
     aiStorytellerEnabled: false,
     aiLastActionAt: 0,
+    chatLog: [],
+    awaitingNightConfirm: false,
+    nightConfirmations: new Set(),
+    aiPlayerEnabledBySeat: new Map(),
+    aiPlayerLastActionAtBySeat: new Map(),
+    aiPlayerTemperatureBySeat: new Map(),
   };
   rooms.set(room.id, room);
   return room;
@@ -84,6 +90,18 @@ export function getRoomView(room: Room, _forSeatIndex?: number, includeGlobalLog
     const { characterId, drunkPretendCharacterId, usedDayActions, ...rest } = p;
     return rest;
   });
+  const forSeatIndex = typeof _forSeatIndex === 'number' ? _forSeatIndex : undefined;
+  const chatLog: ChatEntry[] | undefined = (() => {
+    if (includeGlobalLog) return room.chatLog;
+    if (forSeatIndex === undefined) return undefined;
+    return room.chatLog.filter((e) => {
+      if (e.scope === 'public') return true;
+      if (e.scope === 'god') return e.fromSeat === forSeatIndex;
+      if (e.scope === 'dm') return e.fromSeat === forSeatIndex || e.toSeat === forSeatIndex;
+      return false;
+    });
+  })();
+
   return {
     id: room.id,
     scriptId: room.scriptId,
@@ -103,6 +121,11 @@ export function getRoomView(room: Room, _forSeatIndex?: number, includeGlobalLog
     lastNightDeaths: room.lastNightDeaths,
     lastNightRevivals: room.lastNightRevivals,
     publicLog: room.publicLog,
+    awaitingNightConfirm: room.awaitingNightConfirm,
+    nightConfirmedSeats: Array.from(room.nightConfirmations.values()),
+    chatLog,
+    aiPlayerEnabled: forSeatIndex === undefined ? undefined : (room.aiPlayerEnabledBySeat.get(forSeatIndex) ?? false),
+    aiPlayerTemperature: forSeatIndex === undefined ? undefined : (room.aiPlayerTemperatureBySeat.get(forSeatIndex) ?? 0.5),
     globalLog: includeGlobalLog ? room.replayLog : undefined,
     aiStorytellerEnabled: room.aiStorytellerEnabled,
     minPlayers: room.script.minPlayers,
@@ -138,6 +161,12 @@ function resetRoomForNextGame(room: Room): void {
   room.usedDayActionsBySeat = new Map();
   room.nightKillAttackerByVictim = new Map();
   room.aiLastActionAt = 0;
+  room.chatLog = [];
+  room.awaitingNightConfirm = false;
+  room.nightConfirmations = new Set();
+  room.aiPlayerEnabledBySeat = new Map();
+  room.aiPlayerLastActionAtBySeat = new Map();
+  room.aiPlayerTemperatureBySeat = new Map();
   for (const p of room.players) {
     p.isReady = false;
     p.isAlive = true;

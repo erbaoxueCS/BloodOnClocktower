@@ -83,6 +83,7 @@ export function AdminPanel({ roomId, hostSecret, onLeave }: AdminPanelProps) {
       setLastError('管理员连接未就绪');
     }
   };
+  const canSend = wsStatus === 'open';
 
   return (
     <div className="page">
@@ -117,19 +118,56 @@ export function AdminPanel({ roomId, hostSecret, onLeave }: AdminPanelProps) {
             <button
               className={room?.aiStorytellerEnabled ? 'btn-danger' : 'btn-primary'}
               type="button"
+              disabled={!canSend || !isHost}
               onClick={() => send({ type: 'toggle_ai_storyteller', enabled: !room?.aiStorytellerEnabled })}
             >
               {room?.aiStorytellerEnabled ? '关闭 AI 接管' : '开启 AI 接管'}
             </button>
           </div>
           <div className="row">
-            <button className="btn-primary" type="button" onClick={() => send({ type: 'start' })}>开始游戏</button>
-            <button type="button" onClick={() => send({ type: 'next_phase' })}>进入提名阶段</button>
-            <button type="button" onClick={() => send({ type: 'end_nomination' })}>结束提名阶段</button>
-            <button type="button" onClick={() => send({ type: 'cancel_current_nomination' })}>取消本次提名</button>
-            <button type="button" onClick={() => send({ type: 'end_voting' })}>结束投票</button>
-            <button className="btn-danger" type="button" onClick={() => send({ type: 'execute' })}>执行处决</button>
+            <button className="btn-primary" type="button" disabled={!canSend || !isHost || room?.status !== 'lobby'} onClick={() => send({ type: 'start' })}>
+              开始游戏
+            </button>
+            {!isHost && <span className="muted">（无房主权限，按钮已禁用）</span>}
           </div>
+        </section>
+
+        <section className="card col-6">
+          <h3>夜晚确认状态</h3>
+          <p className="muted">
+            awaitingNightConfirm：{room?.awaitingNightConfirm ? 'true' : 'false'}
+          </p>
+          <p className="muted" style={{ marginTop: 4 }}>
+            已确认：{room?.nightConfirmedSeats?.length ?? 0}/{room?.players?.length ?? 0}
+          </p>
+          <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+            {(room?.players ?? []).map((p) => {
+              const ok = !!room?.nightConfirmedSeats?.includes(p.seatIndex);
+              return (
+                <span key={`night-confirm-${p.id}`} className={`pill ${ok ? 'status-ok' : 'status-warn'}`}>
+                  #{p.seatIndex + 1} {p.nickname} {ok ? '✓' : '…'}
+                </span>
+              );
+            })}
+          </div>
+        </section>
+
+        <section className="card col-6">
+          <h3>聊天（管理员全量）</h3>
+          <p className="muted">仅用于观察对话与卡点；玩家侧只会看到与自己相关的消息。</p>
+          <ol style={{ margin: 0, paddingLeft: 20, lineHeight: 1.55, maxHeight: 420, overflow: 'auto' }}>
+            {(room?.chatLog ?? []).slice(-80).map((e) => (
+              <li key={e.id}>
+                <span className="muted">
+                  [{e.scope}] #{(e.fromSeat ?? 0) + 1}
+                  {e.scope === 'dm' && typeof e.toSeat === 'number' ? `→#${e.toSeat + 1}` : ''}
+                  ：
+                </span>{' '}
+                {e.text}
+              </li>
+            ))}
+            {(room?.chatLog ?? []).length === 0 && <li className="muted">（暂无聊天记录）</li>}
+          </ol>
         </section>
 
         <section className="card col-6">

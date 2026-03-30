@@ -64,6 +64,20 @@ export interface RoomView {
   lastNightDeaths: number[];
   lastNightRevivals: number[];
   publicLog?: Array<{ seq: number; at: number; line: string }>;
+  awaitingNightConfirm?: boolean;
+  nightConfirmedSeats?: number[];
+  chatLog?: Array<{
+    id: string;
+    at: number;
+    scope: 'god' | 'dm' | 'public';
+    phase: GamePhase;
+    dayNumber: number;
+    fromSeat: number;
+    toSeat?: number;
+    text: string;
+  }>;
+  aiPlayerEnabled?: boolean;
+  aiPlayerTemperature?: number;
   globalLog?: ReplayLogEntry[];
   aiStorytellerEnabled?: boolean;
   minPlayers: number;

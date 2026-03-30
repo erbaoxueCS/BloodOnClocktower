@@ -73,6 +73,19 @@ export interface PublicLogEntry {
   line: string;
 }
 
+export type ChatScope = 'god' | 'dm' | 'public';
+
+export interface ChatEntry {
+  id: string;
+  at: number;
+  scope: ChatScope;
+  phase: GamePhase;
+  dayNumber: number;
+  fromSeat: number;
+  toSeat?: number;
+  text: string;
+}
+
 /** 房间（含对局状态） */
 export interface Room {
   id: string;
@@ -139,6 +152,21 @@ export interface Room {
   aiStorytellerEnabled: boolean;
   /** AI 说书人最近一次动作时间（节流） */
   aiLastActionAt: number;
+
+  /** 聊天日志（追加式；仅相关方可见） */
+  chatLog: ChatEntry[];
+
+  /** 夜晚是否已进入“等待全员确认天亮”状态 */
+  awaitingNightConfirm: boolean;
+  /** 已确认“夜晚结束”的座位集合 */
+  nightConfirmations: Set<number>;
+
+  /** AI 玩家托管开关：seatIndex -> enabled */
+  aiPlayerEnabledBySeat: Map<number, boolean>;
+  /** AI 玩家最近一次动作时间（节流）：seatIndex -> at(ms) */
+  aiPlayerLastActionAtBySeat: Map<number, number>;
+  /** AI 玩家积极程度/温度（0~1）：seatIndex -> temperature */
+  aiPlayerTemperatureBySeat: Map<number, number>;
 }
 
 /** 发给客户端的房间摘要（不含身份） */
@@ -164,6 +192,16 @@ export interface RoomView {
   lastNightDeaths: number[];
   lastNightRevivals: number[];
   publicLog: PublicLogEntry[];
+  /** 夜晚是否正在等待全员确认天亮 */
+  awaitingNightConfirm?: boolean;
+  /** 已确认夜晚结束的座位 */
+  nightConfirmedSeats?: number[];
+  /** 当前玩家可见的聊天记录（管理员可见全量） */
+  chatLog?: ChatEntry[];
+  /** 当前座位是否开启 AI 托管（仅对本人显示） */
+  aiPlayerEnabled?: boolean;
+  /** 当前座位 AI 积极程度/温度（仅对本人显示） */
+  aiPlayerTemperature?: number;
   /** 仅管理员可见：全局记录（含私密与裁定信息） */
   globalLog?: ReplayLogEntry[];
   /** 是否开启 AI 说书人接管 */

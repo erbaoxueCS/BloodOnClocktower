@@ -41,12 +41,20 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
   const [nightPrompt, setNightPrompt] = useState<null | { stepId: string; actorSeatIndex: number; pick: 1 | 2; aliveSeatIndices: number[] }>(null);
   const [nightTargets, setNightTargets] = useState<number[]>([]);
   const [nightLog, setNightLog] = useState<string[]>([]);
+  const [chatEntries, setChatEntries] = useState<NonNullable<RoomView['chatLog']>>([]);
+  const [chatScope, setChatScope] = useState<'god' | 'dm' | 'public'>('god');
+  const [chatDmTarget, setChatDmTarget] = useState<number | null>(null);
+  const [chatText, setChatText] = useState('');
+  const [chatSending, setChatSending] = useState(false);
+  const [awaitingNightConfirm, setAwaitingNightConfirm] = useState(false);
+  const [nightConfirmedSeats, setNightConfirmedSeats] = useState<number[]>([]);
   const [endedReplay, setEndedReplay] = useState<ReplayBundle | null>(null);
   const [slayerTarget, setSlayerTarget] = useState<number | null>(null);
   const [myVoteChoice, setMyVoteChoice] = useState<boolean | null>(null);
   const [isHost, setIsHost] = useState<boolean>(false);
   const [copyTip, setCopyTip] = useState('');
   const wsRef = useRef<WebSocket | null>(null);
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
 
   const copyRoomId = async () => {
     try {
@@ -95,6 +103,20 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
           else setCharacterId(null);
           setYourRole(msg.yourRole ?? null);
           setIsHost(!!msg.isHost);
+          setChatEntries(Array.isArray(msg.room.chatLog) ? msg.room.chatLog : []);
+          setAwaitingNightConfirm(!!msg.room.awaitingNightConfirm);
+          setNightConfirmedSeats(Array.isArray(msg.room.nightConfirmedSeats) ? msg.room.nightConfirmedSeats : []);
+          // 每局重置：房间回到大厅时，清空本地夜间信息与对话输入状态（避免下一局残留）
+          if (msg.room.status === 'lobby') {
+            setNightLog([]);
+            setChatEntries([]);
+            setChatText('');
+            setChatScope('god');
+            setChatDmTarget(null);
+            setAwaitingNightConfirm(false);
+            setNightConfirmedSeats([]);
+            setEndedReplay(null);
+          }
           if (msg.room.phase === 'day' || msg.room.phase === 'waiting') {
             setNightPrompt(null);
             setNightTargets([]);
@@ -107,6 +129,11 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
         } else if (msg.type === 'night_info') {
           const text = String(msg.message ?? '');
           if (text) setNightLog((prev) => [text, ...prev].slice(0, 50));
+        } else if (msg.type === 'chat_event') {
+          if (msg.entry && typeof msg.entry === 'object') setChatEntries((prev) => [...prev, msg.entry].slice(-500));
+        } else if (msg.type === 'night_confirm_update') {
+          setAwaitingNightConfirm(!!msg.awaiting);
+          setNightConfirmedSeats(Array.isArray(msg.confirmedSeats) ? msg.confirmedSeats : []);
         } else if (msg.type === 'phase') {
           setRoom((r) => ({ ...r, phase: msg.phase, dayNumber: msg.dayNumber ?? r.dayNumber }));
           if (msg.phase === 'day' || msg.phase === 'waiting') {
@@ -128,6 +155,9 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
           setIsHost(!!msg.isHost);
           setNightPrompt(null);
           setNightTargets([]);
+          setChatEntries(Array.isArray(msg.room.chatLog) ? msg.room.chatLog : []);
+          setAwaitingNightConfirm(!!msg.room.awaitingNightConfirm);
+          setNightConfirmedSeats(Array.isArray(msg.room.nightConfirmedSeats) ? msg.room.nightConfirmedSeats : []);
         } else if (msg.type === 'error') {
           console.error(msg.message);
           const raw = String(msg.message ?? '未知错误');
@@ -153,11 +183,66 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
       setLastSendError('未连接到后端（WebSocket 未打开）');
     }
   };
+  const canSend = wsStatus === 'open';
 
   const you = room.players[yourSeatIndex];
   const effectiveReady = optimisticReady ?? you?.isReady ?? false;
   const canStart = room.status === 'lobby' && room.players.length >= room.minPlayers && room.players.every((p) => p.isReady) && isHost;
   const isMyNightTurn = nightPrompt?.actorSeatIndex === yourSeatIndex;
+  const inNight = room.phase === 'night' || room.phase === 'first_night';
+  const mySeat = yourSeatIndex;
+  const dmTabs = useMemo(() => {
+    const set = new Set<number>();
+    for (const e of (chatEntries ?? [])) {
+      if (e.scope !== 'dm') continue;
+      const a = e.fromSeat;
+      const b = (typeof e.toSeat === 'number') ? e.toSeat : null;
+      if (a === mySeat && b != null) set.add(b);
+      if (b === mySeat && a != null) set.add(a);
+    }
+    // 让当前选择的目标也出现在 tabs 里
+    if (chatDmTarget != null) set.add(chatDmTarget);
+    return Array.from(set.values()).sort((x, y) => x - y);
+  }, [chatEntries, chatDmTarget, mySeat]);
+
+  const visibleChat = useMemo(() => {
+    const base = [...(chatEntries ?? [])].sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
+    const filtered = base.filter((e) => {
+      if (chatScope === 'god') return e.scope === 'god';
+      if (chatScope === 'public') return e.scope === 'public';
+      if (e.scope !== 'dm') return false;
+      if (chatDmTarget == null) return false;
+      const a = e.fromSeat;
+      const b = (typeof e.toSeat === 'number') ? e.toSeat : null;
+      return (a === mySeat && b === chatDmTarget) || (b === mySeat && a === chatDmTarget);
+    });
+    return filtered.slice(-120);
+  }, [chatEntries, chatScope, chatDmTarget, mySeat]);
+
+  // 对话自动滚动：只有在用户本来就在底部附近时才自动滚
+  useEffect(() => {
+    const el = chatScrollRef.current;
+    if (!el) return;
+    const distToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (distToBottom < 60) el.scrollTop = el.scrollHeight;
+  }, [visibleChat.length, chatScope, chatDmTarget]);
+
+  const trySendChat = () => {
+    if (chatSending) return;
+    const text = chatText.trim();
+    if (!text) return;
+    if (!canSend) return;
+    if (chatScope === 'dm' && chatDmTarget == null) return;
+    if (chatScope === 'god' && !inNight) return;
+
+    setChatSending(true);
+    if (chatScope === 'god') send({ type: 'chat_send', scope: 'god', text });
+    else if (chatScope === 'public') send({ type: 'chat_send', scope: 'public', text });
+    else send({ type: 'chat_send', scope: 'dm', toSeat: chatDmTarget, text });
+    setChatText('');
+    // 轻量防连点：避免重复发送/重复点击
+    setTimeout(() => setChatSending(false), 350);
+  };
 
   return (
     <div className="page">
@@ -215,6 +300,35 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
 
       {room.status === 'playing' && (
         <>
+          <section className="card" style={{ marginTop: 16 }}>
+            <h3>AI 托管</h3>
+            <p className="muted" style={{ marginTop: 6 }}>
+              你可以让 AI 代你理解信息、聊天、提名与投票（每个座位独立通道，不共享私密信息）。
+            </p>
+            <button
+              type="button"
+              className={room.aiPlayerEnabled ? 'btn-danger' : 'btn-primary'}
+              disabled={wsStatus !== 'open'}
+              onClick={() => send({ type: 'toggle_ai_player', enabled: !room.aiPlayerEnabled })}
+            >
+              {room.aiPlayerEnabled ? '关闭 AI 托管' : '开启 AI 托管'}
+            </button>
+            {room.aiPlayerEnabled ? <span className="pill status-ok" style={{ marginLeft: 8 }}>已托管</span> : <span className="pill status-warn" style={{ marginLeft: 8 }}>手动</span>}
+            <div style={{ marginTop: 10 }}>
+              <span className="muted">积极程度：</span>
+              <select
+                value={String(room.aiPlayerTemperature ?? 0.5)}
+                onChange={(e) => send({ type: 'set_ai_player_temperature', temperature: parseFloat(e.target.value) })}
+                disabled={wsStatus !== 'open' || !room.aiPlayerEnabled}
+                style={{ marginLeft: 8 }}
+              >
+                <option value="0.2">低（更沉默）</option>
+                <option value="0.5">中性（默认）</option>
+                <option value="0.8">高（更积极）</option>
+              </select>
+            </div>
+          </section>
+
           <section className="card" style={{ marginTop: 16 }}>
             <h3>公共大屏（公开信息）</h3>
             <p className="muted">
@@ -289,6 +403,142 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
               )}
             </section>
           )}
+          {(inNight || room.phase === 'day') && (
+            <section className="card" style={{ marginTop: 16 }}>
+              <h3>对话</h3>
+              <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+                <button type="button" className={chatScope === 'god' ? 'btn-primary' : ''} onClick={() => setChatScope('god')}>
+                  上帝
+                </button>
+                <button type="button" className={chatScope === 'public' ? 'btn-primary' : ''} onClick={() => setChatScope('public')}>
+                  公开屏幕
+                </button>
+                <button type="button" className={chatScope === 'dm' ? 'btn-primary' : ''} onClick={() => setChatScope('dm')}>
+                  私聊
+                </button>
+                {chatScope === 'dm' && (
+                  <span className="muted" style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
+                    对话：
+                    {dmTabs.length === 0 ? (
+                      <span className="muted">（暂无私聊）</span>
+                    ) : (
+                      dmTabs.map((s) => {
+                        const active = chatDmTarget === s;
+                        const nick = room.players[s]?.nickname ?? `#${s + 1}`;
+                        return (
+                          <button
+                            key={`dm-tab-${s}`}
+                            type="button"
+                            className={active ? 'btn-primary' : ''}
+                            onClick={() => setChatDmTarget(s)}
+                          >
+                            #{s + 1} {nick}
+                          </button>
+                        );
+                      })
+                    )}
+                    <span className="muted" style={{ marginLeft: 6 }}>
+                      新建：
+                      <select
+                        value=""
+                        onChange={(e) => {
+                          const v = e.target.value ? parseInt(e.target.value, 10) : null;
+                          if (v == null) return;
+                          setChatDmTarget(v);
+                        }}
+                        style={{ marginLeft: 6 }}
+                      >
+                        <option value="">选择玩家</option>
+                        {room.players
+                          .filter((p) => p.seatIndex !== yourSeatIndex)
+                          .map((p) => (
+                            <option key={`dm-opt-${p.id}`} value={p.seatIndex}>
+                              #{p.seatIndex + 1} {p.nickname}
+                            </option>
+                          ))}
+                      </select>
+                    </span>
+                  </span>
+                )}
+              </div>
+
+              <div
+                ref={chatScrollRef}
+                style={{ marginTop: 10, border: '1px solid #333', borderRadius: 8, padding: 10, maxHeight: 220, overflow: 'auto' }}
+              >
+                {visibleChat.length === 0 ? (
+                  <div className="muted">（暂无对话）</div>
+                ) : (
+                  <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.55 }}>
+                    {visibleChat.map((e) => (
+                      <li key={e.id}>
+                        <span className="muted">
+                          #{(e.fromSeat ?? 0) + 1}
+                          {e.scope === 'dm' && typeof e.toSeat === 'number'
+                            ? ` → #${e.toSeat + 1}`
+                            : e.scope === 'god'
+                              ? '（上帝）'
+                              : ''}
+                          ：
+                        </span>{' '}
+                        {e.text}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+
+              <div style={{ marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                <input
+                  value={chatText}
+                  onChange={(e) => setChatText(e.target.value)}
+                  onKeyDown={(e) => {
+                    // Enter 发送；Shift+Enter 交给浏览器（此处是单行 input）
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      trySendChat();
+                    }
+                  }}
+                  placeholder={chatScope === 'god' ? '对上帝说…（例如：今晚信息）' : chatScope === 'public' ? '公开发言…' : '私聊内容…'}
+                  style={{ flex: '1 1 240px', minWidth: 200 }}
+                />
+                <button
+                  type="button"
+                  disabled={!canSend
+                    || !chatText.trim()
+                    || chatSending
+                    || (chatScope === 'dm' && chatDmTarget == null)
+                    || (chatScope === 'god' && !inNight)
+                  }
+                  onClick={trySendChat}
+                >
+                  {chatSending ? '发送中…' : '发送'}
+                </button>
+              </div>
+            </section>
+          )}
+
+          {inNight && awaitingNightConfirm && (
+            <section className="card" style={{ marginTop: 16 }}>
+              <h3>夜晚结束确认</h3>
+              <p className="muted" style={{ marginTop: 6 }}>
+                所有玩家都需要手动确认夜晚结束后，才会进入白天。当前已确认：{nightConfirmedSeats.length}/{room.players.length}
+              </p>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                {room.players.map((p) => {
+                  const ok = nightConfirmedSeats.includes(p.seatIndex);
+                  return (
+                    <span key={`confirm-seat-${p.id}`} className={`pill ${ok ? 'status-ok' : 'status-warn'}`}>
+                      #{p.seatIndex + 1} {p.nickname} {ok ? '✓' : '…'}
+                    </span>
+                  );
+                })}
+              </div>
+              <button type="button" style={{ marginTop: 10 }} onClick={() => send({ type: 'night_confirm' })} disabled={wsStatus !== 'open'}>
+                我已完成夜晚活动（确认）
+              </button>
+            </section>
+          )}
           {room.lastNightDeaths?.length > 0 && (
             <p style={{ color: '#f88' }}>昨夜死亡：{room.lastNightDeaths.map((s) => `#${s + 1}`).join('、')}</p>
           )}
@@ -329,16 +579,6 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
           {room.phase === 'day' && (
             <section className="card" style={{ marginTop: 16 }}>
               <h3>白天</h3>
-              {isHost && room.daySubPhase === 'nomination' && (
-                <div style={{ marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                  <button type="button" onClick={() => send({ type: 'end_nomination' })}>结束提名阶段</button>
-                  {room.currentNomination && (
-                    <button type="button" onClick={() => send({ type: 'cancel_current_nomination' })}>
-                      取消本次提名
-                    </button>
-                  )}
-                </div>
-              )}
               {you?.isAlive && (
                 <section className="card" style={{ marginTop: 12 }}>
                   <h4 style={{ margin: '0 0 10px' }}>白天主动技能（所有玩家都可宣称发动）</h4>
@@ -367,9 +607,6 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
                   </div>
                 </section>
               )}
-              {room.daySubPhase === 'discussion' && isHost && (
-                <button type="button" onClick={() => send({ type: 'next_phase' })}>进入提名阶段</button>
-              )}
               {room.daySubPhase === 'nomination' && room.currentNomination === null && you?.isAlive && (
                 <div>
                   提名一名玩家（可提名自己）：
@@ -378,15 +615,19 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
                       #{p.seatIndex + 1} {p.nickname}{p.seatIndex === yourSeatIndex ? '（我）' : ''}
                     </button>
                   ))}
+                  <div style={{ marginTop: 10 }}>
+                    <button type="button" onClick={() => send({ type: 'skip_nomination' })}>本轮不提名</button>
+                    <span className="muted" style={{ marginLeft: 8 }}>（所有存活玩家都需完成“提名/不提名”，白天才会结束）</span>
+                  </div>
                 </div>
               )}
               {room.currentNomination && (
                 <p>
                   当前提名：#{room.currentNomination.nominator + 1} 提名 #{room.currentNomination.nominated + 1}
-                  {you?.isAlive && (
+                  {(you?.isAlive || you?.hasDeadVote) && (
                     <>
                       <span style={{ marginLeft: 8, opacity: 0.85, fontSize: 13 }}>
-                        被提名者也可投票（含投给自己）。
+                        被提名者也可投票（含投给自己）。死亡玩家可用一次“死人票”（用掉就不能改票/不能再投）。
                       </span>
                       <button
                         type="button"
@@ -396,7 +637,7 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
                         }}
                         style={{ marginLeft: 8 }}
                       >
-                        {myVoteChoice === true ? '已赞成（可改投）' : '投票赞成'}
+                        {myVoteChoice === true ? (you?.isAlive ? '已赞成（可改投）' : '已赞成（死人票已用）') : '投票赞成'}
                       </button>
                       <button
                         type="button"
@@ -405,7 +646,7 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
                           send({ type: 'vote', inFavor: false });
                         }}
                       >
-                        {myVoteChoice === false ? '已反对（可改投）' : '投票反对'}
+                        {myVoteChoice === false ? (you?.isAlive ? '已反对（可改投）' : '已反对（死人票已用）') : '投票反对'}
                       </button>
                       {myVoteChoice !== null && (
                         <span className={`pill ${myVoteChoice ? 'status-ok' : 'status-warn'}`} style={{ marginLeft: 8 }}>
@@ -414,14 +655,16 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
                       )}
                     </>
                   )}
-                  {isHost && <button type="button" onClick={() => send({ type: 'end_voting' })} style={{ marginLeft: 8 }}>结束投票</button>}
                 </p>
               )}
               {room.pendingExecution != null && (
                 <p>
-                  待处决：#{room.pendingExecution + 1} {room.players[room.pendingExecution]?.nickname}
-                  {isHost && <button type="button" onClick={() => send({ type: 'execute' })} style={{ marginLeft: 8 }}>执行处决</button>}
+                  待处决（仅标记，白天结束后才会统一结算）：#{room.pendingExecution + 1} {room.players[room.pendingExecution]?.nickname}
+                  {room.pendingExecutionVotesFor ? <span className="muted" style={{ marginLeft: 8 }}>最高赞成票：{room.pendingExecutionVotesFor}</span> : null}
                 </p>
+              )}
+              {room.pendingExecution == null && room.pendingExecutionTied && (
+                <p className="muted">当前出现“最高票平局”，若后续不再出现更高票，本日将无人被处决。</p>
               )}
             </section>
           )}

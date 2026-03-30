@@ -321,7 +321,9 @@ export function advanceNight(room) {
         return false;
     const order = getCurrentNightOrder(room);
     if (room.nightStepIndex >= order.length) {
-        gotoDay(room);
+        // 夜序结束：改为等待全员确认天亮
+        room.awaitingNightConfirm = true;
+        room.nightConfirmations = new Set();
         return false;
     }
     const stepId = order[room.nightStepIndex];
@@ -450,12 +452,25 @@ function gotoDay(room) {
     room.pendingExecution = null;
     room.pendingExecutionVotesFor = 0;
     room.pendingExecutionTied = false;
+    room.awaitingNightConfirm = false;
+    room.nightConfirmations = new Set();
     /** 胜负仅在「进入白天」时结算，便于夜间链式规则（刀自己、后续角色等）自由组合 */
     const win = checkWin(room);
     if (win) {
         room.status = 'ended';
         room.phase = 'waiting';
     }
+}
+export function finishNightAndGotoDay(room) {
+    if (room.status !== 'playing')
+        return;
+    if (room.phase !== 'night' && room.phase !== 'first_night')
+        return;
+    if (!room.awaitingNightConfirm)
+        return;
+    room.awaitingNightConfirm = false;
+    room.nightConfirmations = new Set();
+    gotoDay(room);
 }
 function gotoNight(room) {
     room.phase = 'night';

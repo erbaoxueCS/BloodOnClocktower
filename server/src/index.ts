@@ -4,11 +4,73 @@ import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { createRoom, getRoom, joinRoom, getRoomView, setReady, bindConnection, unbindConnection, rooms } from './game/roomManager.js';
 import { buildYourRolePayload } from './game/yourRole.js';
-import { startGame, advanceNight, getCurrentNightStep, nominate, skipNomination, vote, tallyVotes, execute, maybeFinishDay, submitNightAction, findAliveSeatByCharacter, computeChefPairsForSeat, computeEmpathCountForSeat, formatUndertakerInfoForSeat, formatWasherLibrarianInvestigator, checkWin, getShownCharacterId, distortWasherLibrarianInvestigatorDecision, resolveRavenkeeperNightInfo } from './game/gameEngine.js';
+import { startGame, advanceNight, getCurrentNightStep, nominate, skipNomination, vote, tallyVotes, execute, maybeFinishDay, submitNightAction, findAliveSeatByCharacter, computeChefPairsForSeat, computeEmpathCountForSeat, formatUndertakerInfoForSeat, formatWasherLibrarianInvestigator, checkWin, getShownCharacterId, distortWasherLibrarianInvestigatorDecision, resolveRavenkeeperNightInfo, finishNightAndGotoDay } from './game/gameEngine.js';
 import { getStorytellerDecision } from './ai/storyteller.js';
+import { aiPlayerLlmAvailable, decideAiPlayerAction } from './ai/playerAgent.js';
 import { pushReplay, buildReplayBundle, seatLabel, pushPublic } from './game/replay.js';
 import type { GamePhase } from './game/types.js';
 import { troubleBrewing } from './script/troubleBrewing.js';
+
+function normalizeGodQuery(text: string): string {
+  return text.trim().replace(/\s+/g, '');
+}
+
+function makeDeterministicGodReply(room: import('./game/types.js').Room, seatIndex: number, queryRaw: string): string {
+  const query = normalizeGodQuery(queryRaw);
+  const p = room.players[seatIndex];
+  if (!p) return '上帝：……';
+  if (room.status !== 'playing') return '上帝：……';
+  if (room.phase !== 'night' && room.phase !== 'first_night') return '上帝：现在不是夜晚。';
+  if (query !== '今晚信息' && query !== '信息' && query !== '今晚' && query !== '结果') return '上帝：你现在得不到更多信息。';
+
+  const shown = getShownCharacterId(p);
+  if (!shown) return '上帝：……';
+
+  if (!p.isAlive) return '上帝：你已死亡。';
+
+  if (shown === 'chef') {
+    return `厨师：你得知相邻两名邪恶玩家的数量为 ${computeChefPairsForSeat(room, seatIndex)}。`;
+  }
+  if (shown === 'empath') {
+    return `共情者：你得知相邻邪恶玩家数量为 ${computeEmpathCountForSeat(room, seatIndex)}。`;
+  }
+  if (shown === 'undertaker') {
+    return formatUndertakerInfoForSeat(room, seatIndex);
+  }
+  if (shown === 'washerwoman' || shown === 'librarian' || shown === 'investigator') {
+    const decision = room.storytellerDecisions.get(shown);
+    if (!decision) return `${room.script.characters.find((c) => c.id === shown)?.nameZh ?? shown}：无信息`;
+    return formatWasherLibrarianInvestigator(room, shown, decision);
+  }
+  if (shown === 'ravenkeeper') {
+    const msg = resolveRavenkeeperNightInfo(room, seatIndex);
+    return msg || '守鸦人：无信息';
+  }
+
+  return '上帝：你现在得不到更多信息。';
+}
+
+function pushChat(room: import('./game/types.js').Room, entry: Omit<import('./game/types.js').ChatEntry, 'id'>): import('./game/types.js').ChatEntry {
+  const full = { ...entry, id: `${Date.now()}-${Math.random().toString(36).slice(2)}` };
+  room.chatLog.push(full);
+  if (room.chatLog.length > 500) room.chatLog = room.chatLog.slice(-500);
+  return full;
+}
+
+function broadcastChat(roomId: string, entry: import('./game/types.js').ChatEntry): void {
+  if (entry.scope === 'god') {
+    sendToSeat(roomId, entry.fromSeat, { type: 'chat_event', entry });
+    return;
+  }
+  if (entry.scope === 'dm') {
+    sendToSeat(roomId, entry.fromSeat, { type: 'chat_event', entry });
+    if (typeof entry.toSeat === 'number') sendToSeat(roomId, entry.toSeat, { type: 'chat_event', entry });
+    return;
+  }
+  if (entry.scope === 'public') {
+    broadcast(roomId, { type: 'chat_event', entry });
+  }
+}
 
 const app = express();
 app.use(cors());
@@ -71,6 +133,10 @@ function dayReplayTitle(room: import('./game/types.js').Room): { key: string; ti
 function sendNightInfo(roomId: string, room: import('./game/types.js').Room, seatIndex: number, message: string) {
   const { key, title } = nightReplayTitle(room);
   pushReplay(room, key, title, `[夜间信息] ${seatLabel(room, seatIndex)}：${message}`);
+  const log = getNightInfoLogBySeat(room);
+  const prev = log.get(seatIndex) ?? [];
+  prev.push(message);
+  log.set(seatIndex, prev.slice(-NIGHT_INFO_LOG_LIMIT));
   sendToSeat(roomId, seatIndex, { type: 'night_info', message });
 }
 
@@ -91,14 +157,25 @@ function broadcastAfterNight(roomId: string, room: import('./game/types.js').Roo
   if (room.status === 'ended') {
     const win = checkWin(room);
     if (win) {
-      pushReplay(room, 'result', '游戏结束', `${win === 'good' ? '善良阵营' : '邪恶阵营'} 获胜。`);
-      const replay = buildReplayBundle(room, win);
-      broadcast(roomId, { type: 'game_over', winner: win, room: getRoomView(room), replay });
+      emitGameOver(roomId, room, win);
     }
     return;
   }
   broadcast(roomId, { type: 'room', room: getRoomView(room) });
   broadcast(roomId, { type: 'phase', phase: room.phase, dayNumber: room.dayNumber });
+}
+
+function emitGameOver(roomId: string, room: import('./game/types.js').Room, winner: 'good' | 'evil'): void {
+  const k = 'game_over_sent';
+  if (room.storytellerDecisions.get(k) === true) return;
+  room.storytellerDecisions.set(k, true);
+
+  // 下一局默认未准备：避免“结束后所有人都显示已准备”
+  for (const p of room.players) p.isReady = false;
+
+  pushReplay(room, 'result', '游戏结束', `${winner === 'good' ? '善良阵营' : '邪恶阵营'} 获胜。`);
+  const replay = buildReplayBundle(room, winner);
+  broadcast(roomId, { type: 'game_over', winner, room: getRoomView(room), replay });
 }
 
 function maybeLogEnterNight(room: import('./game/types.js').Room, phaseBefore: GamePhase): void {
@@ -110,10 +187,12 @@ function maybeLogEnterNight(room: import('./game/types.js').Room, phaseBefore: G
 async function runNightLoop(roomId: string, room: import('./game/types.js').Room): Promise<void> {
   for (;;) {
     if (room.pendingNightAction) break;
+    if (room.awaitingNightConfirm) break;
     const stepId = getCurrentNightStep(room);
     if (!stepId) {
       advanceNight(room);
       if (room.phase === 'day' || room.phase === 'waiting') break;
+      if (room.awaitingNightConfirm) break;
       continue;
     }
 
@@ -166,6 +245,7 @@ async function runNightLoop(roomId: string, room: import('./game/types.js').Room
     advanceNight(room);
     if (room.phase === 'day' || room.phase === 'waiting') break;
     if (room.pendingNightAction) break;
+    if (room.awaitingNightConfirm) break;
   }
 }
 
@@ -178,13 +258,21 @@ type ClientMessage =
   | { type: 'nominate'; nominatedSeat: number }
   | { type: 'skip_nomination' }
   | { type: 'vote'; inFavor: boolean }
+  | { type: 'chat_send'; scope: 'god' | 'dm' | 'public'; toSeat?: number; text: string }
+  | { type: 'toggle_ai_player'; enabled: boolean }
+  | { type: 'set_ai_player_temperature'; temperature: number }
+  | { type: 'night_confirm' }
   | { type: 'night_action'; targets: number[] }
   | { type: 'day_action'; actionId: string; targetSeat?: number }
   | { type: 'toggle_ai_storyteller'; enabled: boolean }
   | { type: 'ping' };
 
 async function handleDayMaybeEnterNight(roomId: string, room: import('./game/types.js').Room, phaseBefore: GamePhase, executedSeatIndex: number | null): Promise<void> {
-  if (room.status === 'ended') return;
+  if (room.status === 'ended') {
+    const win = checkWin(room);
+    if (win) emitGameOver(roomId, room, win);
+    return;
+  }
   const { key, title } = dayReplayTitle(room);
   if (executedSeatIndex != null) {
     pushReplay(room, key, title, `处决执行：${seatLabel(room, executedSeatIndex)} 死亡。`);
@@ -194,10 +282,12 @@ async function handleDayMaybeEnterNight(roomId: string, room: import('./game/typ
     pushPublic(room, '今日无人被处决。');
   }
   maybeLogEnterNight(room, phaseBefore);
+  if (room.phase === 'night') pushPublic(room, '进入夜晚。');
   const phaseBeforeLoop = room.phase;
   await runNightLoop(roomId, room);
   if (room.phase !== 'waiting') sendNightPrompt(roomId, room);
   broadcastAfterNight(roomId, room, phaseBeforeLoop);
+  broadcastNightConfirm(roomId, room);
 }
 
 function maybeAiTakeoverDay(roomId: string, room: import('./game/types.js').Room): void {
@@ -236,11 +326,13 @@ async function maybeAiTakeoverNight(roomId: string, room: import('./game/types.j
   if (room.status !== 'playing' || (room.phase !== 'night' && room.phase !== 'first_night')) return;
   // 严格边界：夜晚若轮到玩家行动，AI 说书人只等待，不代替玩家提交目标
   if (room.pendingNightAction) return;
+  if (room.awaitingNightConfirm) return;
   const phaseBeforeLoop = room.phase;
   await runNightLoop(roomId, room);
   // runNightLoop 可能推进到“等待玩家输入”的步骤，此时只负责发提示，不做代操作
   sendNightPrompt(roomId, room);
   broadcastAfterNight(roomId, room, phaseBeforeLoop);
+  broadcastNightConfirm(roomId, room);
 }
 
 function broadcast(roomId: string, payload: object, excludeConnectionId?: string) {
@@ -302,6 +394,57 @@ function sendNightPrompt(roomId: string, room: import('./game/types.js').Room) {
     pick: a.pick,
     aliveSeatIndices: room.players.filter((p) => p.isAlive).map((p) => p.seatIndex),
   });
+}
+
+function broadcastNightConfirm(roomId: string, room: import('./game/types.js').Room): void {
+  broadcast(roomId, {
+    type: 'night_confirm_update',
+    awaiting: room.awaitingNightConfirm,
+    confirmedSeats: Array.from(room.nightConfirmations.values()),
+  });
+}
+
+const NIGHT_INFO_LOG_LIMIT = 20;
+function getNightInfoLogBySeat(room: import('./game/types.js').Room): Map<number, string[]> {
+  const k = 'night_info_log_by_seat';
+  const v = room.storytellerDecisions.get(k);
+  if (v instanceof Map) return v as Map<number, string[]>;
+  const m = new Map<number, string[]>();
+  room.storytellerDecisions.set(k, m);
+  return m;
+}
+
+function getAiSharedNightInfoSet(room: import('./game/types.js').Room): Set<string> {
+  const k = 'ai_shared_nightinfo_marks';
+  const v = room.storytellerDecisions.get(k);
+  if (v instanceof Set) return v as Set<string>;
+  const s = new Set<string>();
+  room.storytellerDecisions.set(k, s);
+  return s;
+}
+
+function shareAiNightInfoAtDawn(roomId: string, room: import('./game/types.js').Room): void {
+  if (room.status !== 'playing' || room.phase !== 'day') return;
+  const log = getNightInfoLogBySeat(room);
+  const marks = getAiSharedNightInfoSet(room);
+  for (const p of room.players) {
+    const seatIndex = p.seatIndex;
+    if (!(room.aiPlayerEnabledBySeat.get(seatIndex) ?? false)) continue;
+    const key = `day_${room.dayNumber}_seat_${seatIndex}`;
+    if (marks.has(key)) continue;
+    const msgs = log.get(seatIndex) ?? [];
+    if (msgs.length === 0) continue;
+    const last = msgs[msgs.length - 1];
+    const temp = room.aiPlayerTemperatureBySeat.get(seatIndex) ?? 0.5;
+    // 公开分享：以“公开发言”的形式发到公屏，避免与真人行为产生可观察差异；并按温度控制积极程度
+    if (Math.random() < temp) {
+      pushPublic(room, `公开发言：${seatLabel(room, seatIndex)}：${last}`);
+      const entry = pushChat(room, { at: Date.now(), scope: 'public', phase: room.phase, dayNumber: room.dayNumber, fromSeat: seatIndex, text: last });
+      broadcastChat(roomId, entry);
+    }
+    marks.add(key);
+  }
+  broadcast(roomId, { type: 'room', room: getRoomView(room) });
 }
 
 function sendEvilInfo(roomId: string, room: import('./game/types.js').Room) {
@@ -380,6 +523,164 @@ wss.on('connection', (ws: any, req) => {
       const isHost = !!ws.isHost;
       const isAdmin = !!ws.isAdmin;
 
+      if (msg.type === 'toggle_ai_player') {
+        if (isAdmin) {
+          ws.send(JSON.stringify({ type: 'error', message: 'admin_cannot_toggle_ai_player' }));
+          return;
+        }
+        if (room.status !== 'playing') {
+          ws.send(JSON.stringify({ type: 'error', message: 'toggle_ai_player_not_allowed' }));
+          return;
+        }
+        const enabled = !!msg.enabled;
+        room.aiPlayerEnabledBySeat.set(seatIndex, enabled);
+        room.aiPlayerLastActionAtBySeat.set(seatIndex, 0);
+        if (enabled && !room.aiPlayerTemperatureBySeat.has(seatIndex)) room.aiPlayerTemperatureBySeat.set(seatIndex, 0.5);
+        const tip = enabled ? `AI 托管已开启：${seatLabel(room, seatIndex)}。` : `AI 托管已关闭：${seatLabel(room, seatIndex)}。`;
+        pushPublic(room, tip);
+        broadcast(roomId, { type: 'room', room: getRoomView(room) });
+        return;
+      }
+
+      if (msg.type === 'set_ai_player_temperature') {
+        if (isAdmin) {
+          ws.send(JSON.stringify({ type: 'error', message: 'admin_cannot_set_ai_player_temperature' }));
+          return;
+        }
+        if (room.status !== 'playing') {
+          ws.send(JSON.stringify({ type: 'error', message: 'set_ai_player_temperature_not_allowed' }));
+          return;
+        }
+        const t = Number(msg.temperature);
+        if (!Number.isFinite(t) || t < 0 || t > 1) {
+          ws.send(JSON.stringify({ type: 'error', message: 'invalid_ai_player_temperature' }));
+          return;
+        }
+        room.aiPlayerTemperatureBySeat.set(seatIndex, t);
+        broadcast(roomId, { type: 'room', room: getRoomView(room) });
+        return;
+      }
+
+      if (msg.type === 'chat_send') {
+        if (isAdmin) {
+          ws.send(JSON.stringify({ type: 'error', message: 'admin_cannot_chat_send' }));
+          return;
+        }
+        if (room.status !== 'playing') {
+          ws.send(JSON.stringify({ type: 'error', message: 'chat_not_allowed' }));
+          return;
+        }
+        const text = String(msg.text ?? '').trim();
+        if (!text) {
+          ws.send(JSON.stringify({ type: 'error', message: 'chat_empty' }));
+          return;
+        }
+        if (text.length > 500) {
+          ws.send(JSON.stringify({ type: 'error', message: 'chat_too_long' }));
+          return;
+        }
+        if (msg.scope === 'dm') {
+          const toSeat = msg.toSeat;
+          if (!Number.isInteger(toSeat)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'chat_dm_missing_toSeat' }));
+            return;
+          }
+          if (toSeat === seatIndex) {
+            ws.send(JSON.stringify({ type: 'error', message: 'chat_dm_to_self' }));
+            return;
+          }
+          if (!room.players[toSeat as number]) {
+            ws.send(JSON.stringify({ type: 'error', message: 'chat_dm_invalid_toSeat' }));
+            return;
+          }
+          const entry = pushChat(room, {
+            at: Date.now(),
+            scope: 'dm',
+            phase: room.phase,
+            dayNumber: room.dayNumber,
+            fromSeat: seatIndex,
+            toSeat: toSeat as number,
+            text,
+          });
+          broadcastChat(roomId, entry);
+          return;
+        }
+        if (msg.scope === 'god') {
+          const entry = pushChat(room, {
+            at: Date.now(),
+            scope: 'god',
+            phase: room.phase,
+            dayNumber: room.dayNumber,
+            fromSeat: seatIndex,
+            text,
+          });
+          broadcastChat(roomId, entry);
+
+          const replyText = makeDeterministicGodReply(room, seatIndex, text);
+          const reply = pushChat(room, {
+            at: Date.now(),
+            scope: 'god',
+            phase: room.phase,
+            dayNumber: room.dayNumber,
+            fromSeat: seatIndex,
+            text: replyText,
+          });
+          broadcastChat(roomId, reply);
+          return;
+        }
+        if (msg.scope === 'public') {
+          const entry = pushChat(room, {
+            at: Date.now(),
+            scope: 'public',
+            phase: room.phase,
+            dayNumber: room.dayNumber,
+            fromSeat: seatIndex,
+            text,
+          });
+          // 公开屏幕交流：写入 publicLog（公共大屏），并广播 chat_event
+          pushPublic(room, `公开发言：${seatLabel(room, seatIndex)}：${text}`);
+          broadcastChat(roomId, entry);
+          broadcast(roomId, { type: 'room', room: getRoomView(room) });
+          return;
+        }
+        ws.send(JSON.stringify({ type: 'error', message: 'chat_unknown_scope' }));
+        return;
+      }
+
+      if (msg.type === 'night_confirm') {
+        if (isAdmin) {
+          ws.send(JSON.stringify({ type: 'error', message: 'admin_cannot_night_confirm' }));
+          return;
+        }
+        if (room.status !== 'playing' || (room.phase !== 'night' && room.phase !== 'first_night')) {
+          ws.send(JSON.stringify({ type: 'error', message: 'night_confirm_not_in_night' }));
+          return;
+        }
+        if (!room.awaitingNightConfirm) {
+          ws.send(JSON.stringify({ type: 'error', message: 'night_confirm_not_waiting' }));
+          return;
+        }
+        room.nightConfirmations.add(seatIndex);
+        broadcastNightConfirm(roomId, room);
+
+        if (room.nightConfirmations.size >= room.players.length) {
+          // 全员确认后才天亮
+          const { key, title } = nightReplayTitle(room);
+          pushReplay(room, key, title, '全员确认夜晚结束，天亮。');
+          pushPublic(room, '全员确认夜晚结束，天亮。');
+          finishNightAndGotoDay(room);
+          if (checkWin(room)) {
+            const win = checkWin(room);
+            if (win) emitGameOver(roomId, room, win);
+            return;
+          }
+          shareAiNightInfoAtDawn(roomId, room);
+          broadcast(roomId, { type: 'room', room: getRoomView(room) });
+          broadcast(roomId, { type: 'phase', phase: room.phase, dayNumber: room.dayNumber });
+        }
+        return;
+      }
+
       if (msg.type === 'ping') {
         ws.send(JSON.stringify({ type: 'pong' }));
         return;
@@ -431,6 +732,7 @@ wss.on('connection', (ws: any, req) => {
           sendNightPrompt(roomId, room);
         }
         broadcastAfterNight(roomId, room, phaseBeforeLoop);
+        broadcastNightConfirm(roomId, room);
         return;
       }
       if (msg.type === 'nominate') {
@@ -620,6 +922,7 @@ wss.on('connection', (ws: any, req) => {
         // 若已结束（phase=waiting），不再提示夜晚行动
         if (room.phase !== 'waiting') sendNightPrompt(roomId, room);
         broadcastAfterNight(roomId, room, phaseBeforeLoop);
+        broadcastNightConfirm(roomId, room);
         return;
       }
     } catch (e) {
@@ -639,8 +942,300 @@ server.listen(HTTP_PORT, () => {
 
 setInterval(async () => {
   for (const [rid, room] of rooms.entries()) {
-    if (!room.aiStorytellerEnabled || room.status !== 'playing') continue;
-    if (room.phase === 'day') maybeAiTakeoverDay(rid, room);
-    else if (room.phase === 'night' || room.phase === 'first_night') await maybeAiTakeoverNight(rid, room);
+    if (room.status !== 'playing') continue;
+    if (room.aiStorytellerEnabled) {
+      if (room.phase === 'day') maybeAiTakeoverDay(rid, room);
+      else if (room.phase === 'night' || room.phase === 'first_night') await maybeAiTakeoverNight(rid, room);
+    }
+
+    // AI 玩家托管：每座位独立节流与上下文（严格隔离）
+    for (const p of room.players) {
+      const seatIndex = p.seatIndex;
+      if (!(room.aiPlayerEnabledBySeat.get(seatIndex) ?? false)) continue;
+
+      // 确定性兜底：避免 AI 沉默导致流程卡死
+      // 1) 夜晚等待确认：AI 玩家自动确认
+      if (room.awaitingNightConfirm && (room.phase === 'night' || room.phase === 'first_night')) {
+        if (!room.nightConfirmations.has(seatIndex)) {
+          room.nightConfirmations.add(seatIndex);
+          broadcastNightConfirm(rid, room);
+          if (room.nightConfirmations.size >= room.players.length) {
+            const { key, title } = nightReplayTitle(room);
+            pushReplay(room, key, title, '全员确认夜晚结束，天亮。');
+            pushPublic(room, '全员确认夜晚结束，天亮。');
+            finishNightAndGotoDay(room);
+            if (checkWin(room)) {
+              const win = checkWin(room);
+              if (win) emitGameOver(rid, room, win);
+              continue;
+            }
+            shareAiNightInfoAtDawn(rid, room);
+            broadcast(rid, { type: 'room', room: getRoomView(room) });
+            broadcast(rid, { type: 'phase', phase: room.phase, dayNumber: room.dayNumber });
+          }
+        }
+        continue;
+      }
+
+      // 2) 夜晚轮到该 AI 玩家行动：自动随机选目标提交
+      if (room.pendingNightAction && room.pendingNightAction.actorSeatIndex === seatIndex) {
+        const pendingBefore = room.pendingNightAction;
+        const pick = room.pendingNightAction.pick;
+        const alive = room.players.filter((x) => x.isAlive).map((x) => x.seatIndex);
+        const targets: number[] = [];
+        for (let i = 0; i < pick; i++) {
+          const remain = alive.filter((s) => !targets.includes(s));
+          if (remain.length === 0) break;
+          targets.push(remain[Math.floor(Math.random() * remain.length)]);
+        }
+        if (targets.length === pick) {
+          const result = submitNightAction(room, seatIndex, targets);
+          if (result.ok) {
+            if (pendingBefore) {
+              const { key, title } = nightReplayTitle(room);
+              if (pendingBefore.stepId === 'imp' && targets[0] !== undefined) {
+                pushReplay(room, key, title, `${seatLabel(room, pendingBefore.actorSeatIndex)}（恶魔）选择杀害 ${seatLabel(room, targets[0])}。`);
+              } else if (pendingBefore.stepId === 'monk' && targets[0] !== undefined) {
+                pushReplay(room, key, title, `${seatLabel(room, pendingBefore.actorSeatIndex)}（僧侣）选择保护 ${seatLabel(room, targets[0])}。`);
+              } else if (pendingBefore.stepId === 'poisoner' && targets[0] !== undefined) {
+                pushReplay(room, key, title, `${seatLabel(room, pendingBefore.actorSeatIndex)}（投毒者）选择毒害 ${seatLabel(room, targets[0])}。`);
+              } else if (pendingBefore.stepId === 'fortune_teller' && targets.length === 2) {
+                pushReplay(room, key, title, `${seatLabel(room, pendingBefore.actorSeatIndex)}（占卜师）选择查验 ${seatLabel(room, targets[0])} 与 ${seatLabel(room, targets[1])}。`);
+              }
+            }
+            if (result.info) sendToSeat(rid, seatIndex, { type: 'night_info', message: result.info });
+            const phaseBeforeLoop = room.phase;
+            await runNightLoop(rid, room);
+            if (room.phase !== 'waiting') sendNightPrompt(rid, room);
+            broadcastAfterNight(rid, room, phaseBeforeLoop);
+            broadcastNightConfirm(rid, room);
+          }
+        }
+        continue;
+      }
+
+      // 3) 白天提名阶段：若该 AI 玩家尚未做出“提名/不提名”，则自动进行一次操作，保证白天可结束
+      if (room.phase === 'day' && room.daySubPhase === 'nomination' && room.currentNomination === null) {
+        const me = room.players[seatIndex];
+        const decided = room.nominationsToday.has(seatIndex) || room.skippedNominationsToday.has(seatIndex);
+        if (me?.isAlive && !decided) {
+          // 优先随机提名一名存活玩家（含自己），若无法提名则不提名
+          const alive = room.players.filter((x) => x.isAlive).map((x) => x.seatIndex);
+          const pick = alive[Math.floor(Math.random() * alive.length)];
+          const ok = typeof pick === 'number' ? nominate(room, seatIndex, pick) : false;
+          if (ok) {
+            const { key, title } = dayReplayTitle(room);
+            pushReplay(room, key, title, `${seatLabel(room, seatIndex)}（AI）提名 ${seatLabel(room, pick)}。`);
+            pushPublic(room, `${seatLabel(room, seatIndex)} 提名 ${seatLabel(room, pick)}。`);
+            broadcast(rid, { type: 'room', room: getRoomView(room) });
+          } else {
+            const ok2 = skipNomination(room, seatIndex);
+            if (ok2) {
+              const { key, title } = dayReplayTitle(room);
+              pushReplay(room, key, title, `${seatLabel(room, seatIndex)}（AI）选择本轮不提名。`);
+              pushPublic(room, `${seatLabel(room, seatIndex)} 选择本轮不提名。`);
+              broadcast(rid, { type: 'room', room: getRoomView(room) });
+              const phaseBefore = room.phase;
+              const fin = maybeFinishDay(room);
+              if (fin.ended) await handleDayMaybeEnterNight(rid, room, phaseBefore, fin.executedSeatIndex);
+            }
+          }
+          continue;
+        }
+      }
+
+      // 4) 白天投票：若当前有提名且该 AI 玩家可投票但尚未投，则自动投票
+      if (room.phase === 'day' && room.currentNomination) {
+        const me = room.players[seatIndex];
+        const canVote = !!me && (me.isAlive || me.hasDeadVote);
+        if (canVote && !room.votes.has(seatIndex)) {
+          // 若已配置大模型，则交给大模型决策，避免“生硬随机票”
+          if (aiPlayerLlmAvailable()) {
+            // 继续走后面的 LLM 决策分支
+          } else {
+            // 兜底启发式：被提名者默认反对；其他人默认反对（保守），避免轻易过半
+            const inFavor = room.currentNomination.nominated === seatIndex ? false : false;
+            vote(room, seatIndex, inFavor);
+          }
+          // 可能触发自动结算与白天结束
+          if (room.currentNomination) {
+            const eligibleVoters = room.players.filter((x) => x.isAlive || x.hasDeadVote).map((x) => x.seatIndex);
+            const allVoted = eligibleVoters.every((s) => room.votes.has(s));
+            if (allVoted) {
+              const { passed, votesFor, votes: vv } = tallyVotes(room);
+              const { key, title } = dayReplayTitle(room);
+              const voteLines = vv.map((v) => `${seatLabel(room, v.seatIndex)}：${v.inFavor ? '赞成' : '反对'}`).join('；');
+              pushReplay(room, key, title, `投票结束：${passed ? '达到处决条件（已标记待处决）' : '未达到处决条件'}（赞成 ${votesFor} 票）。票型：${voteLines || '（无人投票记录）'}`);
+              pushPublic(room, `投票结束：${passed ? '达到处决条件（已标记待处决）' : '未达到处决条件'}（赞成 ${votesFor} 票）。`);
+              broadcast(rid, { type: 'vote_result', passed, votesFor, votes: vv });
+            }
+          }
+          broadcast(rid, { type: 'room', room: getRoomView(room) });
+          const phaseBefore = room.phase;
+          const fin = maybeFinishDay(room);
+          if (fin.ended) await handleDayMaybeEnterNight(rid, room, phaseBefore, fin.executedSeatIndex);
+          if (!aiPlayerLlmAvailable()) continue;
+        }
+      }
+
+      const last = room.aiPlayerLastActionAtBySeat.get(seatIndex) ?? 0;
+      const now = Date.now();
+      if (now - last < 2500) continue;
+      room.aiPlayerLastActionAtBySeat.set(seatIndex, now);
+
+      try {
+        const roomView = getRoomView(room, seatIndex, false);
+        const yourCharacterId = getShownCharacterId(room.players[seatIndex]) ?? null;
+        const yourRole = buildYourRolePayload(room, seatIndex);
+        const chatLog = (roomView.chatLog ?? []).map((e) => ({
+          scope: e.scope,
+          fromSeat: e.fromSeat,
+          toSeat: e.toSeat,
+          text: e.text,
+          at: e.at,
+        }));
+        const nightInfo = (getNightInfoLogBySeat(room).get(seatIndex) ?? []).slice(-NIGHT_INFO_LOG_LIMIT);
+
+        const nightPrompt = room.pendingNightAction && room.pendingNightAction.actorSeatIndex === seatIndex
+          ? {
+            stepId: room.pendingNightAction.stepId,
+            pick: room.pendingNightAction.pick,
+            aliveSeatIndices: room.players.filter((x) => x.isAlive).map((x) => x.seatIndex),
+          }
+          : null;
+
+        const temp = room.aiPlayerTemperatureBySeat.get(seatIndex) ?? 0.5;
+        const action = await decideAiPlayerAction(room, seatIndex, {
+          roomView,
+          yourSeatIndex: seatIndex,
+          yourRole,
+          yourCharacterId,
+          chatLog,
+          nightInfo,
+          nightPrompt,
+          currentNomination: room.currentNomination,
+        }, temp);
+
+        // 执行动作（复用既有逻辑入口，保持规则一致）
+        if (action.type === 'chat_public') {
+          const entry = pushChat(room, { at: Date.now(), scope: 'public', phase: room.phase, dayNumber: room.dayNumber, fromSeat: seatIndex, text: action.text });
+          pushPublic(room, `公开发言：${seatLabel(room, seatIndex)}：${action.text}`);
+          broadcastChat(rid, entry);
+          broadcast(rid, { type: 'room', room: getRoomView(room) });
+        } else if (action.type === 'chat_dm') {
+          const entry = pushChat(room, { at: Date.now(), scope: 'dm', phase: room.phase, dayNumber: room.dayNumber, fromSeat: seatIndex, toSeat: action.toSeat, text: action.text });
+          broadcastChat(rid, entry);
+        } else if (action.type === 'chat_god') {
+          const entry = pushChat(room, { at: Date.now(), scope: 'god', phase: room.phase, dayNumber: room.dayNumber, fromSeat: seatIndex, text: action.text });
+          broadcastChat(rid, entry);
+          const replyText = makeDeterministicGodReply(room, seatIndex, action.text);
+          const reply = pushChat(room, { at: Date.now(), scope: 'god', phase: room.phase, dayNumber: room.dayNumber, fromSeat: seatIndex, text: replyText });
+          broadcastChat(rid, reply);
+        } else if (action.type === 'night_confirm') {
+          if (room.awaitingNightConfirm && (room.phase === 'night' || room.phase === 'first_night')) {
+            room.nightConfirmations.add(seatIndex);
+            broadcastNightConfirm(rid, room);
+            if (room.nightConfirmations.size >= room.players.length) {
+              const { key, title } = nightReplayTitle(room);
+              pushReplay(room, key, title, '全员确认夜晚结束，天亮。');
+              pushPublic(room, '全员确认夜晚结束，天亮。');
+              finishNightAndGotoDay(room);
+              shareAiNightInfoAtDawn(rid, room);
+              broadcast(rid, { type: 'room', room: getRoomView(room) });
+              broadcast(rid, { type: 'phase', phase: room.phase, dayNumber: room.dayNumber });
+            }
+          }
+        } else if (action.type === 'night_action') {
+          if (room.pendingNightAction && room.pendingNightAction.actorSeatIndex === seatIndex) {
+            const pendingBefore = room.pendingNightAction;
+            const result = submitNightAction(room, seatIndex, action.targets);
+            if (result.ok) {
+              if (pendingBefore) {
+                const { key, title } = nightReplayTitle(room);
+                if (pendingBefore.stepId === 'imp' && action.targets[0] !== undefined) {
+                  pushReplay(room, key, title, `${seatLabel(room, pendingBefore.actorSeatIndex)}（恶魔）选择杀害 ${seatLabel(room, action.targets[0])}。`);
+                } else if (pendingBefore.stepId === 'monk' && action.targets[0] !== undefined) {
+                  pushReplay(room, key, title, `${seatLabel(room, pendingBefore.actorSeatIndex)}（僧侣）选择保护 ${seatLabel(room, action.targets[0])}。`);
+                } else if (pendingBefore.stepId === 'poisoner' && action.targets[0] !== undefined) {
+                  pushReplay(room, key, title, `${seatLabel(room, pendingBefore.actorSeatIndex)}（投毒者）选择毒害 ${seatLabel(room, action.targets[0])}。`);
+                } else if (pendingBefore.stepId === 'fortune_teller' && action.targets.length === 2) {
+                  pushReplay(room, key, title, `${seatLabel(room, pendingBefore.actorSeatIndex)}（占卜师）选择查验 ${seatLabel(room, action.targets[0])} 与 ${seatLabel(room, action.targets[1])}。`);
+                }
+              }
+              if (result.info) sendToSeat(rid, seatIndex, { type: 'night_info', message: result.info });
+              const phaseBeforeLoop = room.phase;
+              await runNightLoop(rid, room);
+              if (room.phase !== 'waiting') sendNightPrompt(rid, room);
+              broadcastAfterNight(rid, room, phaseBeforeLoop);
+              broadcastNightConfirm(rid, room);
+            }
+          }
+        } else if (action.type === 'nominate') {
+          if (room.phase === 'day') {
+            const ok = nominate(room, seatIndex, action.nominatedSeat);
+            if (ok) {
+              const { key, title } = dayReplayTitle(room);
+              pushReplay(room, key, title, `${seatLabel(room, seatIndex)} 提名 ${seatLabel(room, action.nominatedSeat)}。`);
+              pushPublic(room, `${seatLabel(room, seatIndex)} 提名 ${seatLabel(room, action.nominatedSeat)}。`);
+              broadcast(rid, { type: 'room', room: getRoomView(room) });
+            }
+          }
+        } else if (action.type === 'skip_nomination') {
+          if (room.phase === 'day') {
+            const ok = skipNomination(room, seatIndex);
+            if (ok) {
+              const { key, title } = dayReplayTitle(room);
+              pushReplay(room, key, title, `${seatLabel(room, seatIndex)} 选择本轮不提名。`);
+              pushPublic(room, `${seatLabel(room, seatIndex)} 选择本轮不提名。`);
+              broadcast(rid, { type: 'room', room: getRoomView(room) });
+              const phaseBefore = room.phase;
+              const fin = maybeFinishDay(room);
+              if (fin.ended) await handleDayMaybeEnterNight(rid, room, phaseBefore, fin.executedSeatIndex);
+            }
+          }
+        } else if (action.type === 'vote') {
+          if (room.phase === 'day') {
+            vote(room, seatIndex, action.inFavor);
+            if (room.currentNomination) {
+              const eligibleVoters = room.players.filter((x) => x.isAlive || x.hasDeadVote).map((x) => x.seatIndex);
+              const allVoted = eligibleVoters.every((s) => room.votes.has(s));
+              if (allVoted) {
+                const { passed, votesFor, votes: vv } = tallyVotes(room);
+                const { key, title } = dayReplayTitle(room);
+                const voteLines = vv.map((v) => `${seatLabel(room, v.seatIndex)}：${v.inFavor ? '赞成' : '反对'}`).join('；');
+                pushReplay(room, key, title, `投票结束：${passed ? '达到处决条件（已标记待处决）' : '未达到处决条件'}（赞成 ${votesFor} 票）。票型：${voteLines || '（无人投票记录）'}`);
+                pushPublic(room, `投票结束：${passed ? '达到处决条件（已标记待处决）' : '未达到处决条件'}（赞成 ${votesFor} 票）。`);
+                broadcast(rid, { type: 'vote_result', passed, votesFor, votes: vv });
+              }
+            }
+            broadcast(rid, { type: 'room', room: getRoomView(room) });
+            const phaseBefore = room.phase;
+            const fin = maybeFinishDay(room);
+            if (fin.ended) await handleDayMaybeEnterNight(rid, room, phaseBefore, fin.executedSeatIndex);
+          }
+        } else if (action.type === 'day_action') {
+          if (room.phase === 'day') {
+            // 直接复用已有 day_action 处理路径太重，这里仅支持 slayer_shot（与现有实现一致）
+            if (action.actionId === 'slayer_shot' && Number.isInteger(action.targetSeat)) {
+              const fakeWs = { send: (_: any) => {} } as any;
+              // 复用现有逻辑：走同一段代码需要大改结构；这里先让 AI 玩家以“公开宣称”方式引导人类点按钮。
+              // 先不自动执行，避免越权；后续可以把 day_action 逻辑抽函数供复用。
+              void fakeWs;
+            }
+          }
+        }
+      } catch {
+        // ignore ai errors
+      }
+    }
+
+    // 房间级兜底：若白天所有存活玩家都已完成“提名/不提名”，则结束白天（避免遗漏触发导致卡死）
+    if (room.phase === 'day' && room.currentNomination === null) {
+      const phaseBefore = room.phase;
+      const fin = maybeFinishDay(room);
+      if (fin.ended) {
+        await handleDayMaybeEnterNight(rid, room, phaseBefore, fin.executedSeatIndex);
+      }
+    }
   }
 }, 1200);
