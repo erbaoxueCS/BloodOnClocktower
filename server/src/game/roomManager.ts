@@ -54,6 +54,10 @@ export function createRoom(scriptId: string): Room {
     aiPlayerEnabledBySeat: new Map(),
     aiPlayerLastActionAtBySeat: new Map(),
     aiPlayerTemperatureBySeat: new Map(),
+    // [NEW] AI 玩家人设、记忆、心路历程
+    aiPersonaBySeat: new Map(),
+    aiMemoryBySeat: new Map(),
+    aiThoughtLog: [],
   };
   rooms.set(room.id, room);
   return room;
@@ -128,6 +132,8 @@ export function getRoomView(room: Room, _forSeatIndex?: number, includeGlobalLog
     aiPlayerTemperature: forSeatIndex === undefined ? undefined : (room.aiPlayerTemperatureBySeat.get(forSeatIndex) ?? 0.5),
     globalLog: includeGlobalLog ? room.replayLog : undefined,
     aiStorytellerEnabled: room.aiStorytellerEnabled,
+    // [NEW] AI 心路历程（仅管理员可见）
+    aiThoughtLog: includeGlobalLog ? room.aiThoughtLog : undefined,
     minPlayers: room.script.minPlayers,
     maxPlayers: room.script.maxPlayers,
   };
@@ -167,6 +173,10 @@ function resetRoomForNextGame(room: Room): void {
   room.aiPlayerEnabledBySeat = new Map();
   room.aiPlayerLastActionAtBySeat = new Map();
   room.aiPlayerTemperatureBySeat = new Map();
+  // [NEW] 重置 AI 人设、记忆、心路历程
+  room.aiPersonaBySeat = new Map();
+  room.aiMemoryBySeat = new Map();
+  room.aiThoughtLog = [];
   for (const p of room.players) {
     p.isReady = false;
     p.isAlive = true;

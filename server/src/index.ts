@@ -10,6 +10,17 @@ import { aiPlayerLlmAvailable, decideAiPlayerAction } from './ai/playerAgent.js'
 import { pushReplay, buildReplayBundle, seatLabel, pushPublic } from './game/replay.js';
 import type { GamePhase } from './game/types.js';
 import { troubleBrewing } from './script/troubleBrewing.js';
+// [NEW] 模拟对局相关
+import { runSimulation, type SimulationConfig } from './runner/simulation.js';
+import { generateReport, formatReport } from './runner/report.js';
+import { getSimulationProgress } from './runner/simulationProgress.js';
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
+
+// ES 模块下模拟 __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 function normalizeGodQuery(text: string): string {
   return text.trim().replace(/\s+/g, '');
@@ -111,6 +122,77 @@ app.get('/api/storyteller-ai', (_req, res) => {
     useAiFlag: useFlag,
     hasApiKey: !!process.env.OPENAI_API_KEY,
     baseUrl,
+  });
+});
+
+// [NEW] 纯 AI 自对局模拟 API
+app.post('/api/simulation/run', async (req, res) => {
+  const config: SimulationConfig = {
+    playerCount: (req.body?.playerCount as number) ?? 7,
+    aiPlayerCount: (req.body?.aiPlayerCount as number) ?? 7,
+    maxDays: (req.body?.maxDays as number) ?? 10,
+    iterations: (req.body?.iterations as number) ?? 3,
+    delayMs: (req.body?.delayMs as number) ?? 200,
+  };
+
+  // 限制最大局数防止滥用
+  if (config.iterations > 20) {
+    return res.status(400).json({ error: '最多同时运行 20 局' });
+  }
+
+  try {
+    const results = await runSimulation(config);
+    const report = generateReport(results);
+    res.json({
+      results: results.map(r => ({
+        gameIndex: r.gameIndex,
+        winner: r.winner,
+        dayCount: r.dayCount,
+        playerCount: r.playerCount,
+        anomalies: r.anomalies,
+        thoughtCount: r.thoughts.length,
+      })),
+      report: {
+        totalGames: report.totalGames,
+        goodWins: report.goodWins,
+        evilWins: report.evilWins,
+        timeouts: report.timeouts,
+        avgDayCount: report.avgDayCount,
+        anomalies: report.anomalies,
+        recommendations: report.recommendations,
+      },
+      // 完整报告文本
+      reportText: formatReport(report),
+    });
+  } catch (e) {
+    console.error('Simulation error:', e);
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+// [NEW] 模拟进度查询 API
+app.get('/api/simulation/progress', (req, res) => {
+  res.json(getSimulationProgress());
+});
+
+// [NEW] 模拟进度可视化页面
+app.get('/sim', (req, res) => {
+  const htmlPath = path.join(__dirname, '..', 'sim_progress.html');
+  if (fs.existsSync(htmlPath)) {
+    res.sendFile(htmlPath);
+  } else {
+    res.status(404).send('模拟进度页面未找到');
+  }
+});
+
+// [NEW] 获取房间 AI 心路历程（仅管理员）
+app.get('/api/rooms/:roomId/ai-thoughts', (req, res) => {
+  const room = getRoom(req.params.roomId);
+  if (!room) return res.status(404).json({ error: 'Room not found' });
+
+  res.json({
+    thoughts: room.aiThoughtLog,
+    total: room.aiThoughtLog.length,
   });
 });
 

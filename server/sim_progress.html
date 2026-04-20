@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>血染钟楼 AI 模拟进度</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; padding: 20px; }
+  h1 { text-align: center; color: #e94560; margin-bottom: 20px; font-size: 1.5em; }
+  .summary { display: flex; justify-content: center; gap: 20px; margin-bottom: 20px; flex-wrap: wrap; }
+  .summary-item { background: #16213e; padding: 12px 20px; border-radius: 8px; text-align: center; min-width: 120px; }
+  .summary-item .label { font-size: 0.8em; color: #888; }
+  .summary-item .value { font-size: 1.5em; font-weight: bold; }
+  .good { color: #4ecca3 !important; }
+  .evil { color: #e94560 !important; }
+  .players { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 15px; margin-bottom: 20px; }
+  .player-card { background: #16213e; border-radius: 10px; padding: 15px; border-left: 4px solid #333; transition: all 0.3s; }
+  .player-card.idle { border-left-color: #555; }
+  .player-card.thinking { border-left-color: #f0a500; box-shadow: 0 0 10px rgba(240,165,0,0.3); }
+  .player-card.done { border-left-color: #4ecca3; }
+  .player-card.timeout { border-left-color: #e94560; }
+  .player-card.waiting { border-left-color: #0f3460; }
+  .player-card.error { border-left-color: #ff4444; }
+  .player-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+  .player-name { font-weight: bold; font-size: 1.1em; }
+  .player-role { font-size: 0.8em; color: #888; background: #1a1a2e; padding: 2px 8px; border-radius: 4px; }
+  .player-status { display: flex; align-items: center; gap: 8px; }
+  .status-dot { width: 10px; height: 10px; border-radius: 50%; }
+  .idle .status-dot { background: #555; }
+  .thinking .status-dot { background: #f0a500; animation: pulse 1.5s infinite; }
+  .done .status-dot { background: #4ecca3; }
+  .timeout .status-dot { background: #e94560; }
+  .waiting .status-dot { background: #0f3460; }
+  .error .status-dot { background: #ff4444; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+  .player-action { font-size: 0.9em; color: #aaa; margin-top: 8px; }
+  .player-elapsed { font-size: 0.8em; color: #666; margin-left: auto; }
+  .phase-badge { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 0.85em; margin-bottom: 15px; }
+  .phase-night { background: #0f3460; color: #aaa; }
+  .phase-day { background: #f0a500; color: #1a1a2e; }
+  .phase-first_night { background: #1a1a2e; color: #555; border: 1px solid #333; }
+  .phase-idle { background: #333; color: #888; }
+  .not-running { text-align: center; color: #888; padding: 50px; font-size: 1.2em; }
+  .footer { text-align: center; color: #555; font-size: 0.8em; margin-top: 20px; }
+</style>
+</head>
+<body>
+<h1>🩸 血染钟楼 AI 自对局</h1>
+<div id="app"></div>
+<div class="footer">每 2 秒自动刷新 | <a href="http://localhost:5173" style="color:#e94560">返回游戏</a></div>
+<script>
+const API = '/api/simulation/progress';
+const PHASE_LABELS = { night: '🌙 夜晚', day: '☀️ 白天', first_night: '🌙 首夜', idle: '⏸️ 空闲' };
+const STATUS_LABELS = { idle: '等待中', thinking: '思考中...', done: '已决策', timeout: '超时', waiting: '排队中', error: '错误' };
+async function update() {
+  try {
+    const res = await fetch(API);
+    const data = await res.json();
+    const app = document.getElementById('app');
+    if (!data || !data.running) {
+      app.innerHTML = '<div class="not-running">⏸️ 模拟未运行<br><span style="font-size:0.7em;color:#666">运行测试后自动显示进度</span></div>';
+      return;
+    }
+    const phaseClass = 'phase-' + data.currentPhase;
+    const phaseLabel = PHASE_LABELS[data.currentPhase] || data.currentPhase;
+    let html = '<div style="text-align:center"><span class="phase-badge ' + phaseClass + '">' + phaseLabel + '</span> <span style="margin-left:10px;color:#888">第 ' + data.currentGame + ' / ' + data.totalGames + ' 局</span></div>';
+    html += '<div class="summary">';
+    html += '<div class="summary-item"><div class="label">当前天数</div><div class="value">' + data.currentDay + '</div></div>';
+    html += '<div class="summary-item"><div class="label">思考中</div><div class="value evil">' + data.aiPlayers.filter(function(p){return p.status==='thinking'}).length + '</div></div>';
+    html += '<div class="summary-item"><div class="label">已决策</div><div class="value good">' + data.aiPlayers.filter(function(p){return p.status==='done'}).length + '</div></div>';
+    html += '<div class="summary-item"><div class="label">超时</div><div class="value evil">' + data.aiPlayers.filter(function(p){return p.status==='timeout'}).length + '</div></div>';
+    html += '</div><div class="players">';
+    data.aiPlayers.sort(function(a,b){return a.seatIndex - b.seatIndex}).forEach(function(p) {
+      var elapsed = p.elapsed ? (p.elapsed / 1000).toFixed(1) + 's' : '';
+      html += '<div class="player-card ' + p.status + '">';
+      html += '<div class="player-header"><span class="player-name">#' + (p.seatIndex + 1) + '</span><span class="player-role">' + (p.role || '???') + '</span></div>';
+      html += '<div class="player-status"><span class="status-dot"></span><span>' + (STATUS_LABELS[p.status] || p.status) + '</span>';
+      if (elapsed) html += '<span class="player-elapsed">' + elapsed + '</span>';
+      html += '</div>';
+      if (p.action) html += '<div class="player-action">🎯 ' + p.action + '</div>';
+      html += '</div>';
+    });
+    html += '</div>';
+    app.innerHTML = html;
+  } catch(e) {}
+}
+update();
+setInterval(update, 2000);
+</script>
+</body>
+</html>
