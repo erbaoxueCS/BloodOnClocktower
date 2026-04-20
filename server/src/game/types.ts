@@ -4,6 +4,65 @@ export type Alignment = 'good' | 'evil';
 /** 角色类型：镇民/外来者/爪牙/恶魔 */
 export type CharacterType = 'townsfolk' | 'outsider' | 'minion' | 'demon';
 
+// [NEW] ========== AI 玩家相关类型 ==========
+
+/** AI 玩家人设 */
+export interface AiPlayerPersona {
+  role: Alignment;
+  characterId: string;
+  characterNameZh: string;
+  personality: {
+    aggression: number;      // 0~1 攻击性：是否主动提名他人
+    bluffing: number;        // 0~1 撒谎倾向（邪恶越高越好）
+    trust: number;           // 0~1 轻信他人程度
+    social: number;          // 0~1 发言活跃度
+    riskTaking: number;      // 0~1 冒险倾向
+  };
+  strategy: 'logical' | 'emotional' | 'chaos';
+  // [NEW] 邪恶角色专属
+  evilStrategy?: {
+    bluffTarget: string | null;       // 伪装成哪个善良角色 (characterId)
+    protectWho: number | null;        // 保护哪个队友（恶魔保护爪牙/爪牙保护恶魔）
+    sacrificeWillingness: number;     // 0~1 牺牲队友意愿
+  };
+}
+
+/** AI 玩家记忆（按座位独立存储） */
+export interface AiPlayerMemory {
+  shortTerm: Array<{
+    day: number;
+    phase: string;
+    event: string;       // 事件描述
+    source: 'night_info' | 'chat_public' | 'chat_dm' | 'chat_god' | 'nomination' | 'vote' | 'death' | 'execution';
+    at: number;
+  }>;
+  longTerm: Array<{
+    day: number;
+    summary: string;     // 当日总结（由 AI 自己生成）
+  }>;
+  suspicion: Map<number, number>;  // seatIndex -> 怀疑度 0~1（1=确信是邪恶）
+  allyTrust: Map<number, number>;  // seatIndex -> 信任度 0~1（1=确信是善良）
+}
+
+/** AI 心路历程条目（持久化存储所有思考过程） */
+export interface AiThoughtEntry {
+  roomId: string;
+  dayNumber: number;
+  phase: string;
+  seatIndex: number;
+  characterId: string;
+  trigger: string;           // 触发思考的事件（如「被提名」「夜晚行动」「轮到自己发言」）
+  context: {                 // 当时的上下文快照
+    publicInfo: string;      // 公开信息摘要
+    privateInfo: string;     // 私有信息（夜间信息、私聊等）
+    suspicionSnapshot: Array<{ seat: number; suspicion: number }>;
+  };
+  reasoning: string;         // AI 的完整推理过程
+  decision: string;          // 最终决策
+  emotion?: string;          // 情绪标签（如「紧张」「自信」「困惑」）
+  timestamp: number;
+}
+
 /** 角色：id、名称、阵营、类型、技能描述、是否仅首夜、是否需要说书人选择 */
 export interface Character {
   id: string;
@@ -167,6 +226,13 @@ export interface Room {
   aiPlayerLastActionAtBySeat: Map<number, number>;
   /** AI 玩家积极程度/温度（0~1）：seatIndex -> temperature */
   aiPlayerTemperatureBySeat: Map<number, number>;
+
+  // [NEW] AI 玩家人设：seatIndex -> Persona
+  aiPersonaBySeat: Map<number, AiPlayerPersona>;
+  // [NEW] AI 玩家记忆：seatIndex -> AiPlayerMemory
+  aiMemoryBySeat: Map<number, AiPlayerMemory>;
+  // [NEW] AI 心路历程日志（全部座位的思考链，持久化存储）
+  aiThoughtLog: AiThoughtEntry[];
 }
 
 /** 发给客户端的房间摘要（不含身份） */
@@ -206,6 +272,8 @@ export interface RoomView {
   globalLog?: ReplayLogEntry[];
   /** 是否开启 AI 说书人接管 */
   aiStorytellerEnabled?: boolean;
+  /** [NEW] AI 玩家心路历程（仅管理员可见） */
+  aiThoughtLog?: AiThoughtEntry[];
   minPlayers: number;
   maxPlayers: number;
 }
