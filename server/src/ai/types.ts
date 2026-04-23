@@ -22,10 +22,16 @@ export interface ChoiceTwoPlayersOneCharacter {
   characterId: string;
 }
 
+/** 图书管理员在无外来者时的结果 */
+export interface LibrarianNoOutsiderChoice {
+  type: 'librarian_result';
+  noOutsider: true;
+}
+
 /** 恶魔杀人决策 */
 export interface DemonKillChoice {
   type: 'imp_kill';
   targetSeatIndex: number;
 }
 
-export type StorytellerDecision = ChoiceTwoPlayersOneCharacter | DemonKillChoice;
+export type StorytellerDecision = ChoiceTwoPlayersOneCharacter | LibrarianNoOutsiderChoice | DemonKillChoice;

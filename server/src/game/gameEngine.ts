@@ -93,6 +93,9 @@ export function computeEmpathCountForSeat(room: Room, empathSeatIndex: number): 
 }
 
 export function formatWasherLibrarianInvestigator(room: Room, stepId: string, decision: any): string {
+  if (stepId === 'librarian' && decision?.noOutsider === true) {
+    return '图书管理员：你得知本局没有外来者。';
+  }
   // decision: { players:[a,b], characterId }
   const players = decision?.players as number[] | undefined;
   const characterId = decision?.characterId as string | undefined;
@@ -110,6 +113,7 @@ export function formatWasherLibrarianInvestigator(room: Room, stepId: string, de
  */
 export function distortWasherLibrarianInvestigatorDecision(
   room: Room,
+  stepId: string,
   infoSeatIndex: number,
   truth: { players: number[]; characterId: string } | null,
 ): { players: number[]; characterId: string } | null {
@@ -117,16 +121,21 @@ export function distortWasherLibrarianInvestigatorDecision(
   if (!isPoisoned(room, infoSeatIndex)) return truth;
   const aliveSeats = room.players.filter((p) => p.isAlive).map((p) => p.seatIndex);
   if (aliveSeats.length < 2) return truth;
-  const goodTowns = room.script.characters.filter((c) => c.alignment === 'good' && c.type !== 'outsider');
-  if (goodTowns.length === 0) return truth;
+  const charPool =
+    stepId === 'washerwoman'
+      ? room.script.characters.filter((c) => c.alignment === 'good' && c.type === 'townsfolk')
+      : stepId === 'librarian'
+        ? room.script.characters.filter((c) => c.alignment === 'good' && c.type === 'outsider')
+        : room.script.characters.filter((c) => c.alignment === 'evil' && c.type === 'minion');
+  if (charPool.length === 0) return truth;
   if (Math.random() < 0.5) {
-    const others = goodTowns.filter((c) => c.id !== truth.characterId);
-    const pool = others.length > 0 ? others : goodTowns;
+    const others = charPool.filter((c) => c.id !== truth.characterId);
+    const pool = others.length > 0 ? others : charPool;
     const char = pool[randInt(0, pool.length - 1)];
     return { players: [truth.players[0], truth.players[1]], characterId: char.id };
   }
   const [a, b] = pickTwo(aliveSeats);
-  const char = goodTowns[randInt(0, goodTowns.length - 1)];
+  const char = charPool[randInt(0, charPool.length - 1)];
   return { players: [a, b], characterId: char.id };
 }
 
@@ -187,15 +196,24 @@ export function assignRoles(room: Room): void {
   const minions = script.characters.filter((c) => c.type === 'minion');
   const demons = script.characters.filter((c) => c.type === 'demon');
 
-  let numOutsiders = 0;
-  if (n <= 6) numOutsiders = 0;
-  else if (n <= 9) numOutsiders = 1;
-  else if (n <= 12) numOutsiders = 2;
-  else numOutsiders = 3;
-
-  const numEvil = n <= 6 ? 1 : 2;
-  const numMinions = numEvil - 1;
-  const numTownsfolk = n - numOutsiders - numEvil;
+  const setupByCount: Record<number, { townsfolk: number; outsiders: number; minions: number; demons: number }> = {
+    5: { townsfolk: 3, outsiders: 0, minions: 1, demons: 1 },
+    6: { townsfolk: 3, outsiders: 1, minions: 1, demons: 1 },
+    7: { townsfolk: 5, outsiders: 0, minions: 1, demons: 1 },
+    8: { townsfolk: 5, outsiders: 1, minions: 1, demons: 1 },
+    9: { townsfolk: 5, outsiders: 2, minions: 1, demons: 1 },
+    10: { townsfolk: 7, outsiders: 0, minions: 2, demons: 1 },
+    11: { townsfolk: 7, outsiders: 1, minions: 2, demons: 1 },
+    12: { townsfolk: 7, outsiders: 2, minions: 2, demons: 1 },
+    13: { townsfolk: 9, outsiders: 0, minions: 3, demons: 1 },
+    14: { townsfolk: 9, outsiders: 1, minions: 3, demons: 1 },
+    15: { townsfolk: 9, outsiders: 2, minions: 3, demons: 1 },
+  };
+  const setup = setupByCount[n] ?? setupByCount[5];
+  const numOutsiders = setup.outsiders;
+  const numMinions = setup.minions;
+  const numDemons = setup.demons;
+  const numTownsfolk = setup.townsfolk;
 
   const pool: string[] = [];
   for (let i = 0; i < numTownsfolk; i++) {
@@ -207,7 +225,9 @@ export function assignRoles(room: Room): void {
   for (let i = 0; i < numMinions; i++) {
     pool.push(minions[i % minions.length].id);
   }
-  pool.push(demons[0].id);
+  for (let i = 0; i < numDemons; i++) {
+    pool.push(demons[i % demons.length].id);
+  }
 
   shuffle(pool);
   room.players.forEach((p, i) => {
@@ -228,15 +248,13 @@ export function assignRoles(room: Room): void {
     p.drunkPretendCharacterId = pool2[Math.floor(Math.random() * pool2.length)] ?? 'washerwoman';
   }
 
-  if (n >= 7) {
-    const inGame = new Set(pool);
-    const goodChars = script.characters.filter((c) => c.alignment === 'good' && c.type !== 'demon');
-    const notInGame = goodChars.filter((c) => !inGame.has(c.id)).map((c) => c.id);
-    shuffle(notInGame);
-    room.demonBluffs = notInGame.slice(0, 3);
-  } else {
-    room.demonBluffs = null;
-  }
+  // 恶魔 3 张不在场“伪装身份”：无论人数多少都生成，便于邪恶阵营可持续伪装与编故事。
+  // 约束：必须是不在场的善良角色（排除恶魔）。
+  const inGame = new Set(pool);
+  const goodChars = script.characters.filter((c) => c.alignment === 'good' && c.type !== 'demon');
+  const notInGame = goodChars.filter((c) => !inGame.has(c.id)).map((c) => c.id);
+  shuffle(notInGame);
+  room.demonBluffs = notInGame.slice(0, 3);
 }
 
 function shuffle<T>(a: T[]): void {
@@ -258,6 +276,8 @@ export function startGame(room: Room): boolean {
   room.phase = 'first_night';
   room.dayNumber = 0;
   room.nightStepIndex = 0;
+  room.dayFlowStage = null;
+  room.dayFlowStartSeat = null;
   room.pendingNightAction = null;
   room.protectedSeatIndex = null;
   room.poisonedSeatIndex = null;
@@ -308,9 +328,19 @@ export function randomStorytellerDecision(room: Room): unknown {
   const aliveSeats = room.players.filter((p) => p.isAlive).map((p) => p.seatIndex);
   if (stepId === 'washerwoman' || stepId === 'librarian' || stepId === 'investigator') {
     if (aliveSeats.length < 2) return null;
+    if (stepId === 'librarian') {
+      const outsidersInGame = room.players.filter((p) => p.characterId && getCharacterMeta(room, p.characterId)?.type === 'outsider');
+      if (outsidersInGame.length === 0) return { type: 'librarian_result', noOutsider: true };
+    }
     const [a, b] = pickTwo(aliveSeats);
-    const goodChars = room.script.characters.filter((c) => c.alignment === 'good' && c.type !== 'outsider');
-    const char = goodChars[Math.floor(Math.random() * goodChars.length)];
+    const pool =
+      stepId === 'washerwoman'
+        ? room.script.characters.filter((c) => c.alignment === 'good' && c.type === 'townsfolk')
+        : stepId === 'librarian'
+          ? room.script.characters.filter((c) => c.alignment === 'good' && c.type === 'outsider')
+          : room.script.characters.filter((c) => c.alignment === 'evil' && c.type === 'minion');
+    if (pool.length === 0) return null;
+    const char = pool[Math.floor(Math.random() * pool.length)];
     return { type: `${stepId}_result`, players: [a, b], characterId: char.id };
   }
   return null;
@@ -441,8 +471,9 @@ export function submitNightAction(room: Room, actorSeatIndex: number, targets: n
 function gotoDay(room: Room): void {
   room.phase = 'day';
   room.dayNumber++;
-  // 按需求：白天不需要“进入提名阶段”按钮，天亮后直接开始提名流转
-  room.daySubPhase = 'nomination';
+  room.daySubPhase = 'discussion';
+  room.dayFlowStage = 'god_dialogue';
+  room.dayFlowStartSeat = randomAliveSeat(room);
   room.currentNomination = null;
   room.nominationsToday = new Map();
   room.skippedNominationsToday = new Set();
@@ -472,6 +503,8 @@ export function finishNightAndGotoDay(room: Room): void {
 
 function gotoNight(room: Room): void {
   room.phase = 'night';
+  room.dayFlowStage = null;
+  room.dayFlowStartSeat = null;
   // 进入夜晚视为黄昏：清除上一夜投毒效果
   room.poisonedSeatIndex = null;
   room.nightStepIndex = 0;
@@ -480,6 +513,12 @@ function gotoNight(room: Room): void {
   room.lastNightDeaths = [];
   room.lastNightRevivals = [];
   room.nightKillAttackerByVictim = new Map();
+}
+
+function randomAliveSeat(room: Room): number | null {
+  const alive = room.players.filter((p) => p.isAlive).map((p) => p.seatIndex);
+  if (alive.length === 0) return null;
+  return alive[Math.floor(Math.random() * alive.length)];
 }
 
 function allAliveHandledNomination(room: Room): boolean {

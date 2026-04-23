@@ -21,6 +21,8 @@ export function createRoom(scriptId: string): Room {
     phase: 'waiting',
     dayNumber: 0,
     daySubPhase: null,
+    dayFlowStage: null,
+    dayFlowStartSeat: null,
     currentNomination: null,
     nominationsToday: new Map(),
     skippedNominationsToday: new Set(),
@@ -112,6 +114,8 @@ export function getRoomView(room: Room, _forSeatIndex?: number, includeGlobalLog
     phase: room.phase,
     dayNumber: room.dayNumber,
     daySubPhase: room.daySubPhase,
+    dayFlowStage: room.dayFlowStage,
+    dayFlowStartSeat: room.dayFlowStartSeat,
     currentNomination: room.currentNomination,
     pendingExecution: room.pendingExecution,
     nominationsToday: Array.from(room.nominationsToday.entries()).map(([nominator, nominated]) => ({ nominator, nominated })),
@@ -138,6 +142,8 @@ function resetRoomForNextGame(room: Room): void {
   room.phase = 'waiting';
   room.dayNumber = 0;
   room.daySubPhase = null;
+  room.dayFlowStage = null;
+  room.dayFlowStartSeat = null;
   room.currentNomination = null;
   room.nominationsToday = new Map();
   room.skippedNominationsToday = new Set();
