@@ -202,3 +202,4 @@
 
 - **1.0**（2026-04-03）：初版 — Director / Grimoire / Seat Agent 分责、夜序单一源、阶段化 AI 玩家、验收预演与里程碑。
 - **1.1**（2026-04-03）：部分落地 — `night/runNightLoop.ts` 承载自动夜序；`decideAiPlayerNightTargets` 专用于夜晚行动；`tickFlowDirector` + `AI_DIRECTOR_LOG`；`otherNightOrder` 增补 `undertaker`（与信息发放逻辑一致）。未改 `DEV_PLAN.md`。
+- **1.2**（2026-04-23）：终局复盘增强 — 在 AI 调用详情区域补充终局统计（总调用/成功/失败/失败原因聚合）；终局问答从“仅问上帝”扩展为“可问任意玩家”，用于解释高争议行为（如爪牙提名恶魔）背后的上下文与策略动机。

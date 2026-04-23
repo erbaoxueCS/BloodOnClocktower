@@ -579,6 +579,101 @@ export async function decideAiPlayerNightTargets(
   }
 }
 
+export async function answerPostGamePlayerQuestion(
+  room: Room,
+  targetSeatIndex: number,
+  askerSeatIndex: number,
+  question: string,
+): Promise<string> {
+  const q = String(question ?? '').trim();
+  if (!q) return '该玩家：你的问题是空的，请具体一点。';
+  const target = room.players[targetSeatIndex];
+  if (!target) return '该玩家：目标座位不存在。';
+
+  const apiKey = getApiKey();
+  if (!apiKey) {
+    return '该玩家：当前未配置大模型密钥，无法生成复盘解释。';
+  }
+
+  const roleMeta = target.characterId
+    ? room.script.characters.find((c) => c.id === target.characterId)
+    : null;
+  const roleNameZh = roleMeta?.nameZh ?? target.characterId ?? '未知身份';
+  const alignment = roleMeta?.alignment ?? 'unknown';
+  const selfNightInfo = (room.storytellerDecisions.get('night_info_log_by_seat') as Map<number, string[]> | undefined)?.get(targetSeatIndex) ?? [];
+  const targetChat = room.chatLog
+    .filter((e) => e.fromSeat === targetSeatIndex || e.toSeat === targetSeatIndex)
+    .slice(-200);
+
+  const systemPrompt = [
+    '你是在复盘阶段回答问题的 AI 玩家。',
+    `你现在扮演座位 #${targetSeatIndex + 1}，真实身份是「${roleNameZh}」，阵营是「${alignment}」。`,
+    '对局已经结束。请基于真实记录解释你当时为什么这么做。',
+    '回答要像玩家复盘，不要编造不存在的事件。',
+    '请输出纯文本，不要 markdown。',
+  ].join('\n');
+
+  const userPrompt = JSON.stringify({
+    question: q,
+    askerSeatIndex,
+    targetSeatIndex,
+    scriptNameZh: room.script.nameZh,
+    finalState: {
+      status: room.status,
+      phase: room.phase,
+      dayNumber: room.dayNumber,
+    },
+    targetPlayer: {
+      seatIndex: targetSeatIndex,
+      nickname: target.nickname,
+      isAlive: target.isAlive,
+      characterId: target.characterId ?? null,
+      characterNameZh: roleNameZh,
+      alignment,
+    },
+    targetVisibleNightInfo: selfNightInfo,
+    targetRelatedChat: targetChat,
+    replayLog: room.replayLog.slice(-500),
+    votes: Array.from(room.votes.entries()).map(([seat, inFavor]) => ({ seatIndex: seat, inFavor })),
+    nominationsToday: Array.from(room.nominationsToday.entries()).map(([nominator, nominated]) => ({ nominator, nominated })),
+    requirement: [
+      '直接回答“为什么这么做”',
+      '给出1-3条关键依据（聊天、提名、投票、夜间信息）',
+      '若问题前提不成立要指出',
+    ],
+  });
+
+  const ac = new AbortController();
+  const timeoutMs = Number(process.env.AI_PLAYER_TIMEOUT_MS ?? '') || 240_000;
+  const timeout = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${OPENAI_BASE_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
+        temperature: 0.3,
+        ...fastResponseOptions(),
+      }),
+      signal: ac.signal,
+    });
+    if (!res.ok) {
+      const t = await res.text().catch(() => '');
+      return `该玩家：复盘回答失败（${res.status}）。${t.slice(0, 120)}`;
+    }
+    const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    const content = data.choices?.[0]?.message?.content?.trim();
+    if (!content) return '该玩家：我这次没能组织出有效复盘答案。';
+    return content.slice(0, 3000);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return `该玩家：复盘回答异常（${msg}）。`;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export async function decideAiPlayerAction(room: Room, seatIndex: number, ctx: AiPlayerContext, temperature: number): Promise<AiPlayerAction> {
   const apiKey = getApiKey();
   if (!apiKey || !USE_AI_PLAYER) return { type: 'noop' };

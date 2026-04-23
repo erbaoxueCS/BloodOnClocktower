@@ -450,3 +450,93 @@ export async function getStorytellerMediatedNightTargets(room, input, forceAi = 
         clearTimeout(timeout);
     }
 }
+export async function answerPostGameQuestion(room, seatIndex, question) {
+    const q = String(question ?? '').trim();
+    if (!q)
+        return '上帝：你的问题是空的，请具体描述你想复盘的环节。';
+    const apiKey = getApiKey();
+    if (!apiKey) {
+        return '上帝：当前未配置大模型密钥，无法生成复盘解释。你可以先配置 OPENAI_API_KEY 后再提问。';
+    }
+    const systemPrompt = [
+        '你是《血染钟楼》的复盘上帝。',
+        '对局已经结束，现在只做事实复盘与规则解释，不接管游戏流程。',
+        '你必须基于提供的真实身份、聊天记录、投票与复盘日志作答。',
+        '回答要具体、可核查，必要时点明“是哪一晚/哪一步/哪个座位”导致差异。',
+        '请输出纯文本，不要 markdown。',
+    ].join('\n');
+    const players = room.players.map((p) => {
+        const meta = p.characterId ? room.script.characters.find((c) => c.id === p.characterId) : null;
+        return {
+            seatIndex: p.seatIndex,
+            nickname: p.nickname,
+            isAlive: p.isAlive,
+            characterId: p.characterId ?? null,
+            characterNameZh: meta?.nameZh ?? null,
+            alignment: meta?.alignment ?? null,
+        };
+    });
+    const userPrompt = JSON.stringify({
+        question: q,
+        roomId: room.id,
+        scriptNameZh: room.script.nameZh,
+        askerSeatIndex: seatIndex,
+        endedState: {
+            status: room.status,
+            phase: room.phase,
+            dayNumber: room.dayNumber,
+        },
+        truth: {
+            players,
+            demonBluffs: room.demonBluffs ?? [],
+        },
+        fullChatLog: room.chatLog.slice(-300),
+        replayLog: room.replayLog.slice(-500),
+        voteSnapshot: {
+            currentNomination: room.currentNomination,
+            votes: Array.from(room.votes.entries()).map(([s, v]) => ({ seatIndex: s, inFavor: v })),
+            nominationsToday: Array.from(room.nominationsToday.entries()).map(([nominator, nominated]) => ({ nominator, nominated })),
+            skippedNominationsToday: Array.from(room.skippedNominationsToday.values()),
+        },
+        requirement: [
+            '先直接回答问题结论',
+            '再给出依据（关键事件/日志）',
+            '若问题前提有误，请指出并纠正',
+        ],
+    });
+    const ac = new AbortController();
+    const timeoutMs = Number(process.env.AI_STORYTELLER_TIMEOUT_MS ?? '') || 240_000;
+    const timeout = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+        const res = await fetch(`${OPENAI_BASE_URL}/v1/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify({
+                model: OPENAI_MODEL,
+                messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
+                temperature: 0.3,
+                ...fastResponseOptions(),
+            }),
+            signal: ac.signal,
+        });
+        if (!res.ok) {
+            const t = await res.text().catch(() => '');
+            return `上帝：复盘回答失败（${res.status}）。${t.slice(0, 120)}`;
+        }
+        const data = (await res.json());
+        const content = data.choices?.[0]?.message?.content?.trim();
+        if (!content)
+            return '上帝：我没有生成有效答案，请换个问法再试一次。';
+        return content.slice(0, 3000);
+    }
+    catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return `上帝：复盘回答异常（${msg}）。请稍后重试。`;
+    }
+    finally {
+        clearTimeout(timeout);
+    }
+}

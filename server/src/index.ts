@@ -5,8 +5,8 @@ import { WebSocketServer } from 'ws';
 import { createRoom, getRoom, joinRoom, getRoomView, setReady, bindConnection, unbindConnection, rooms } from './game/roomManager.js';
 import { buildYourRolePayload } from './game/yourRole.js';
 import { startGame, advanceNight, getCurrentNightStep, nominate, skipNomination, vote, tallyVotes, execute, maybeFinishDay, submitNightAction, computeChefPairsForSeat, computeEmpathCountForSeat, formatUndertakerInfoForSeat, formatWasherLibrarianInvestigator, checkWin, getShownCharacterId, resolveRavenkeeperNightInfo, finishNightAndGotoDay } from './game/gameEngine.js';
-import { getStorytellerLlmKeyInfo, storytellerLlmSelfTest, getStorytellerMediatedNightTargets } from './ai/storyteller.js';
-import { aiPlayerLlmAvailable, decideAiPlayerDayPlan, decideAiPlayerNightTargets, getAiPlayerLlmKeyInfo, aiPlayerLlmSelfTest } from './ai/playerAgent.js';
+import { getStorytellerLlmKeyInfo, storytellerLlmSelfTest, getStorytellerMediatedNightTargets, answerPostGameQuestion } from './ai/storyteller.js';
+import { aiPlayerLlmAvailable, decideAiPlayerDayPlan, decideAiPlayerNightTargets, getAiPlayerLlmKeyInfo, aiPlayerLlmSelfTest, answerPostGamePlayerQuestion } from './ai/playerAgent.js';
 import type { AiPlayerDebugEvent } from './ai/playerAgent.js';
 import { runNightLoop as runAutomatedNightLoop } from './night/runNightLoop.js';
 import { pushReplay, buildReplayBundle, seatLabel, pushPublic } from './game/replay.js';
@@ -644,6 +644,8 @@ type ClientMessage =
   | { type: 'night_action'; targets: number[] }
   | { type: 'day_action'; actionId: string; targetSeat?: number }
   | { type: 'toggle_ai_storyteller'; enabled: boolean }
+  | { type: 'post_game_ask_god'; question: string }
+  | { type: 'post_game_ask_player'; targetSeatIndex: number; question: string }
   | { type: 'ping' };
 
 async function handleDayMaybeEnterNight(roomId: string, room: import('./game/types.js').Room, phaseBefore: GamePhase, executedSeatIndex: number | null): Promise<void> {
@@ -1489,6 +1491,66 @@ wss.on('connection', (ws: any, req) => {
 
       if (msg.type === 'ping') {
         ws.send(JSON.stringify({ type: 'pong' }));
+        return;
+      }
+      if (msg.type === 'post_game_ask_god') {
+        if (isAdmin) {
+          ws.send(JSON.stringify({ type: 'error', message: 'admin_cannot_post_game_ask_god' }));
+          return;
+        }
+        if (room.status !== 'ended') {
+          ws.send(JSON.stringify({ type: 'error', message: 'post_game_ask_only_when_ended' }));
+          return;
+        }
+        const question = String(msg.question ?? '').trim();
+        if (!question) {
+          ws.send(JSON.stringify({ type: 'error', message: 'post_game_ask_empty' }));
+          return;
+        }
+        if (question.length > 1000) {
+          ws.send(JSON.stringify({ type: 'error', message: 'post_game_ask_too_long' }));
+          return;
+        }
+        const answer = await answerPostGameQuestion(room, seatIndex, question);
+        sendToSeat(roomId, seatIndex, {
+          type: 'post_game_god_answer',
+          question,
+          answer,
+          at: Date.now(),
+        });
+        return;
+      }
+      if (msg.type === 'post_game_ask_player') {
+        if (isAdmin) {
+          ws.send(JSON.stringify({ type: 'error', message: 'admin_cannot_post_game_ask_player' }));
+          return;
+        }
+        if (room.status !== 'ended') {
+          ws.send(JSON.stringify({ type: 'error', message: 'post_game_ask_player_only_when_ended' }));
+          return;
+        }
+        const targetSeatIndex = Number(msg.targetSeatIndex);
+        if (!Number.isInteger(targetSeatIndex) || !room.players[targetSeatIndex]) {
+          ws.send(JSON.stringify({ type: 'error', message: 'post_game_ask_player_invalid_target' }));
+          return;
+        }
+        const question = String(msg.question ?? '').trim();
+        if (!question) {
+          ws.send(JSON.stringify({ type: 'error', message: 'post_game_ask_player_empty' }));
+          return;
+        }
+        if (question.length > 1000) {
+          ws.send(JSON.stringify({ type: 'error', message: 'post_game_ask_player_too_long' }));
+          return;
+        }
+        const answer = await answerPostGamePlayerQuestion(room, targetSeatIndex, seatIndex, question);
+        sendToSeat(roomId, seatIndex, {
+          type: 'post_game_player_answer',
+          targetSeatIndex,
+          question,
+          answer,
+          at: Date.now(),
+        });
         return;
       }
       if (msg.type === 'toggle_ai_storyteller') {

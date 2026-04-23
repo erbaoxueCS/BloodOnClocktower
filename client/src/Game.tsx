@@ -36,6 +36,19 @@ type AiTraceEntry = {
   error?: string;
 };
 
+type PostGameGodQa = {
+  question: string;
+  answer: string;
+  at: number;
+};
+
+type PostGamePlayerQa = {
+  targetSeatIndex: number;
+  question: string;
+  answer: string;
+  at: number;
+};
+
 type FormattedTraceExportItem = {
   id: string;
   time: string;
@@ -50,6 +63,13 @@ type FormattedTraceExportItem = {
   error?: string;
 };
 
+type AiCallStats = {
+  totalCalls: number;
+  successCalls: number;
+  failedCalls: number;
+  failureReasons: Array<{ reason: string; count: number }>;
+};
+
 function parseJsonSafe<T = unknown>(v: string | undefined | null): T | null {
   if (!v) return null;
   try {
@@ -57,6 +77,38 @@ function parseJsonSafe<T = unknown>(v: string | undefined | null): T | null {
   } catch {
     return null;
   }
+}
+
+function deepParseJsonStrings(input: unknown, depth = 0): unknown {
+  if (depth > 4) return input;
+  if (typeof input === 'string') {
+    const s = input.trim();
+    if ((s.startsWith('{') && s.endsWith('}')) || (s.startsWith('[') && s.endsWith(']'))) {
+      const parsed = parseJsonSafe<unknown>(s);
+      if (parsed != null) return deepParseJsonStrings(parsed, depth + 1);
+    }
+    return input;
+  }
+  if (Array.isArray(input)) return input.map((x) => deepParseJsonStrings(x, depth + 1));
+  if (input && typeof input === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
+      out[k] = deepParseJsonStrings(v, depth + 1);
+    }
+    return out;
+  }
+  return input;
+}
+
+function toReadableJsonOrText(raw: string | undefined): { isJson: boolean; text: string } {
+  if (!raw) return { isJson: false, text: '' };
+  const parsed = parseJsonSafe<unknown>(raw);
+  if (parsed == null) return { isJson: false, text: raw };
+  const normalized = deepParseJsonStrings(parsed);
+  return {
+    isJson: true,
+    text: JSON.stringify(normalized, null, 2),
+  };
 }
 
 function phaseToText(phase: string, dayNumber?: number): string {
@@ -188,9 +240,33 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
   const [traceCurrentDayOnly, setTraceCurrentDayOnly] = useState(false);
   const [traceKeyword, setTraceKeyword] = useState('');
   const [traceNightChainView, setTraceNightChainView] = useState(false);
+  const [publicBoardMode, setPublicBoardMode] = useState<'compact' | 'detailed'>('compact');
+  const [postGameGodQuestion, setPostGameGodQuestion] = useState('');
+  const [postGameGodAsking, setPostGameGodAsking] = useState(false);
+  const [postGameGodQaList, setPostGameGodQaList] = useState<PostGameGodQa[]>([]);
+  const [postGamePlayerTargetSeat, setPostGamePlayerTargetSeat] = useState<number | null>(null);
+  const [postGamePlayerQuestion, setPostGamePlayerQuestion] = useState('');
+  const [postGamePlayerAsking, setPostGamePlayerAsking] = useState(false);
+  const [postGamePlayerQaList, setPostGamePlayerQaList] = useState<PostGamePlayerQa[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const autoAiTriedRef = useRef(false);
+  const unifiedSelectStyle = {
+    marginLeft: 6,
+    padding: '4px 8px',
+    borderRadius: 6,
+    border: '1px solid #3a3a3a',
+    background: '#0f172a',
+    color: '#e5e7eb',
+  };
+  const unifiedInputStyle = {
+    marginLeft: 6,
+    padding: '6px 8px',
+    borderRadius: 6,
+    border: '1px solid #3a3a3a',
+    background: '#0f172a',
+    color: '#e5e7eb',
+  };
 
   const copyRoomId = async () => {
     try {
@@ -268,6 +344,53 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
     });
   }, [aiTraceEntries, traceStageFilter, traceStatusFilter, traceCurrentDayOnly, traceKeyword, room.dayNumber]);
 
+  const endedAiCallStats = useMemo<AiCallStats | null>(() => {
+    if (room.status !== 'ended') return null;
+    if (aiTraceEntries.length === 0) {
+      return { totalCalls: 0, successCalls: 0, failedCalls: 0, failureReasons: [] };
+    }
+
+    // 同一调用 id 会有多次状态更新，这里按“最后一次状态”统计最终结果。
+    const latestById = new Map<string, AiTraceEntry>();
+    for (const entry of aiTraceEntries) {
+      const prev = latestById.get(entry.id);
+      if (!prev) {
+        latestById.set(entry.id, entry);
+        continue;
+      }
+      const prevTs = prev.updatedAt ?? prev.at ?? 0;
+      const curTs = entry.updatedAt ?? entry.at ?? 0;
+      if (curTs >= prevTs) latestById.set(entry.id, entry);
+    }
+
+    let successCalls = 0;
+    let failedCalls = 0;
+    const reasonCounter = new Map<string, number>();
+
+    for (const finalEntry of latestById.values()) {
+      const status = finalEntry.status;
+      if (status === 'error' || status === 'fallback') {
+        failedCalls += 1;
+        const reasonBase = String(finalEntry.error ?? finalEntry.behavior ?? 'unknown_failure').trim();
+        const reason = reasonBase || 'unknown_failure';
+        reasonCounter.set(reason, (reasonCounter.get(reason) ?? 0) + 1);
+      } else {
+        successCalls += 1;
+      }
+    }
+
+    const failureReasons = Array.from(reasonCounter.entries())
+      .map(([reason, count]) => ({ reason, count }))
+      .sort((a, b) => b.count - a.count);
+
+    return {
+      totalCalls: latestById.size,
+      successCalls,
+      failedCalls,
+      failureReasons,
+    };
+  }, [aiTraceEntries, room.status]);
+
   const nightMediationChains = useMemo(() => {
     const sorted = [...filteredAiTraceEntries]
       .filter((e) => (e.phase === 'night' || e.phase === 'first_night') && !!e.stepId && (e.stage === 'night_action' || e.stage === 'storyteller_decision'))
@@ -292,6 +415,19 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
       return tb - ta;
     });
   }, [filteredAiTraceEntries]);
+
+  const visiblePublicLog = useMemo(() => {
+    const all = room.publicLog ?? [];
+    if (publicBoardMode === 'detailed') return all.slice(-20);
+    const isCompactLine = (line: string): boolean => {
+      const t = String(line ?? '');
+      return t.startsWith('公开发言：')
+        || t.startsWith('进入白天阶段：')
+        || t.startsWith('进入夜晚。')
+        || t.includes('夜晚结束，天亮');
+    };
+    return all.filter((e) => isCompactLine(e.line)).slice(-20);
+  }, [room.publicLog, publicBoardMode]);
 
   useEffect(() => {
     const qs = new URLSearchParams({ roomId, seatIndex: String(yourSeatIndex) });
@@ -343,6 +479,13 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
             setNightConfirmedSeats([]);
             setEndedReplay(null);
             setAiTraceEntries([]);
+            setPostGameGodQaList([]);
+            setPostGameGodQuestion('');
+            setPostGameGodAsking(false);
+            setPostGamePlayerQaList([]);
+            setPostGamePlayerQuestion('');
+            setPostGamePlayerAsking(false);
+            setPostGamePlayerTargetSeat(null);
           }
           if (msg.room.phase === 'day' || msg.room.phase === 'waiting') {
             setNightPrompt(null);
@@ -389,10 +532,29 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
           console.error(msg.message);
           const raw = String(msg.message ?? '未知错误');
           setLastSendError(toZhError(raw));
+          setPostGameGodAsking(false);
+          setPostGamePlayerAsking(false);
         } else if (msg.type === 'ai_trace') {
           if (msg.entry && typeof msg.entry === 'object') {
             setAiTraceEntries((prev) => [...prev, msg.entry as AiTraceEntry].slice(-80));
           }
+        } else if (msg.type === 'post_game_god_answer') {
+          const question = String(msg.question ?? '').trim();
+          const answer = String(msg.answer ?? '').trim();
+          const at = Number(msg.at ?? Date.now());
+          if (question && answer) {
+            setPostGameGodQaList((prev) => [...prev, { question, answer, at }].slice(-20));
+          }
+          setPostGameGodAsking(false);
+        } else if (msg.type === 'post_game_player_answer') {
+          const question = String(msg.question ?? '').trim();
+          const answer = String(msg.answer ?? '').trim();
+          const targetSeatIndex = Number(msg.targetSeatIndex);
+          const at = Number(msg.at ?? Date.now());
+          if (question && answer && Number.isInteger(targetSeatIndex)) {
+            setPostGamePlayerQaList((prev) => [...prev, { targetSeatIndex, question, answer, at }].slice(-30));
+          }
+          setPostGamePlayerAsking(false);
         }
       } catch (_) {}
     };
@@ -475,6 +637,29 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
     setTimeout(() => setChatSending(false), 350);
   };
 
+  const askPostGameGod = () => {
+    const q = postGameGodQuestion.trim();
+    if (!q) return;
+    if (!canSend) return;
+    if (room.status !== 'ended') return;
+    if (postGameGodAsking) return;
+    setPostGameGodAsking(true);
+    send({ type: 'post_game_ask_god', question: q });
+    setPostGameGodQuestion('');
+  };
+
+  const askPostGamePlayer = () => {
+    const q = postGamePlayerQuestion.trim();
+    if (!q) return;
+    if (!canSend) return;
+    if (room.status !== 'ended') return;
+    if (postGamePlayerAsking) return;
+    if (!Number.isInteger(postGamePlayerTargetSeat)) return;
+    setPostGamePlayerAsking(true);
+    send({ type: 'post_game_ask_player', targetSeatIndex: postGamePlayerTargetSeat, question: q });
+    setPostGamePlayerQuestion('');
+  };
+
   return (
     <div className="page">
       <div className="header">
@@ -523,11 +708,28 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
             当前筛选后 {filteredAiTraceEntries.length} / 总计 {aiTraceEntries.length} 条
             {aiTraceEntries.length > 0 ? ` · 最近一条：${new Date(aiTraceEntries[aiTraceEntries.length - 1].at).toLocaleTimeString()}` : ''}
           </p>
+          {room.status === 'ended' && endedAiCallStats && (
+            <div style={{ marginTop: 8, border: '1px solid #333', borderRadius: 8, padding: 10, background: '#0f172a' }}>
+              <div style={{ fontSize: 13, fontWeight: 600 }}>
+                终局 AI 调用统计：总调用 {endedAiCallStats.totalCalls} 次，成功 {endedAiCallStats.successCalls} 次，失败 {endedAiCallStats.failedCalls} 次
+              </div>
+              <div className="muted" style={{ marginTop: 6, fontSize: 12 }}>
+                失败原因统计（按次数降序）
+              </div>
+              <ul style={{ margin: '6px 0 0', paddingLeft: 18, fontSize: 12, lineHeight: 1.5 }}>
+                {endedAiCallStats.failureReasons.length > 0
+                  ? endedAiCallStats.failureReasons.map((item, idx) => (
+                    <li key={`${item.reason}-${idx}`}>{item.reason} · {item.count} 次</li>
+                  ))
+                  : <li className="muted">无失败记录</li>}
+              </ul>
+            </div>
+          )}
           <div className="row" style={{ gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
             <label className="muted">
               阶段：
               <select
-                style={{ marginLeft: 6 }}
+                style={unifiedSelectStyle}
                 value={traceStageFilter}
                 onChange={(e) => setTraceStageFilter(e.target.value as 'all' | AiTraceEntry['stage'])}
               >
@@ -540,7 +742,7 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
             <label className="muted">
               状态：
               <select
-                style={{ marginLeft: 6 }}
+                style={unifiedSelectStyle}
                 value={traceStatusFilter}
                 onChange={(e) => setTraceStatusFilter(e.target.value as 'all' | AiTraceEntry['status'])}
               >
@@ -564,7 +766,7 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
             <label className="muted">
               搜索：
               <input
-                style={{ marginLeft: 6, minWidth: 180 }}
+                style={{ ...unifiedInputStyle, minWidth: 180 }}
                 value={traceKeyword}
                 onChange={(e) => setTraceKeyword(e.target.value)}
                 placeholder="关键词（prompt/behavior/error）"
@@ -630,7 +832,9 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
                               {entry.response && (
                                 <details style={{ marginTop: 6 }}>
                                   <summary style={{ cursor: 'pointer', fontSize: 12 }}>output（模型原始回复）</summary>
-                                  <pre style={{ marginTop: 6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12, lineHeight: 1.45 }}>{entry.response}</pre>
+                                  <pre style={{ marginTop: 6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12, lineHeight: 1.45 }}>
+                                    {toReadableJsonOrText(entry.response).text}
+                                  </pre>
                                 </details>
                               )}
                               {entry.error && <div style={{ marginTop: 6, fontSize: 12, color: '#ff9fa8' }}>error: {entry.error}</div>}
@@ -672,13 +876,17 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
                   {e.request && (
                     <details style={{ marginTop: 8 }}>
                       <summary style={{ cursor: 'pointer', fontSize: 12 }}>input（完整 prompt）</summary>
-                      <pre style={{ marginTop: 6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12, lineHeight: 1.45 }}>{e.request}</pre>
+                      <pre style={{ marginTop: 6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12, lineHeight: 1.45 }}>
+                        {toReadableJsonOrText(e.request).text}
+                      </pre>
                     </details>
                   )}
                   {e.response && (
                     <details style={{ marginTop: 8 }}>
                       <summary style={{ cursor: 'pointer', fontSize: 12 }}>output（模型原始回复）</summary>
-                      <pre style={{ marginTop: 6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12, lineHeight: 1.45 }}>{e.response}</pre>
+                      <pre style={{ marginTop: 6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12, lineHeight: 1.45 }}>
+                        {toReadableJsonOrText(e.response).text}
+                      </pre>
                     </details>
                   )}
                   {e.behavior && <div style={{ marginTop: 8, fontSize: 12 }}>behavior: {e.behavior}</div>}
@@ -687,6 +895,99 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
               );
             })}
           </div>
+          {room.status === 'ended' && (
+            <section style={{ marginTop: 10, borderTop: '1px solid #2a2a2a', paddingTop: 10 }}>
+              <h4 style={{ margin: '0 0 8px 0' }}>终局复盘问上帝（手动提问）</h4>
+              <p className="muted" style={{ marginTop: 4 }}>
+                仅在对局结束后可用。上帝会基于真实身份与完整对局记录回答你的问题。
+              </p>
+              <div className="row" style={{ gap: 8, marginTop: 8 }}>
+                <input
+                  style={{ ...unifiedInputStyle, marginLeft: 0, flex: 1, minWidth: 220 }}
+                  placeholder="例如：为什么图书管理员信息与最终身份不一致？"
+                  value={postGameGodQuestion}
+                  onChange={(e) => setPostGameGodQuestion(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') askPostGameGod();
+                  }}
+                  disabled={postGameGodAsking || wsStatus !== 'open'}
+                />
+                <button type="button" onClick={askPostGameGod} disabled={postGameGodAsking || wsStatus !== 'open' || room.status !== 'ended'}>
+                  {postGameGodAsking ? '提问中...' : '提问上帝'}
+                </button>
+              </div>
+              {postGameGodQaList.length > 0 && (
+                <div style={{ marginTop: 8, maxHeight: 220, overflow: 'auto', border: '1px solid #333', borderRadius: 8, padding: 8 }}>
+                  {[...postGameGodQaList].reverse().map((qa, idx) => (
+                    <article key={`${qa.at}-${idx}`} style={{ marginBottom: 10, paddingBottom: 10, borderBottom: '1px dashed #333' }}>
+                      <div style={{ fontSize: 12, color: '#b7b7b7' }}>
+                        {new Date(qa.at).toLocaleTimeString()}
+                      </div>
+                      <div style={{ marginTop: 4, fontSize: 13 }}><strong>问：</strong>{qa.question}</div>
+                      <div style={{ marginTop: 4, fontSize: 13, whiteSpace: 'pre-wrap' }}><strong>答：</strong>{qa.answer}</div>
+                    </article>
+                  ))}
+                </div>
+              )}
+              <div style={{ marginTop: 14, borderTop: '1px dashed #333', paddingTop: 10 }}>
+                <h4 style={{ margin: '0 0 8px 0' }}>终局复盘问玩家（手动提问）</h4>
+                <p className="muted" style={{ marginTop: 4 }}>
+                  你可以选择任意玩家，追问其策略动机（例如“你为什么提名你的恶魔队友？”）。
+                </p>
+                <div className="row" style={{ gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+                  <label className="muted">
+                    目标玩家：
+                    <select
+                      style={unifiedSelectStyle}
+                      value={postGamePlayerTargetSeat ?? ''}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        setPostGamePlayerTargetSeat(v === '' ? null : Number(v));
+                      }}
+                      disabled={postGamePlayerAsking || room.status !== 'ended'}
+                    >
+                      <option value="">请选择</option>
+                      {room.players.map((p) => (
+                        <option key={p.id} value={p.seatIndex}>
+                          #{p.seatIndex + 1} {p.nickname}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <input
+                    style={{ ...unifiedInputStyle, marginLeft: 0, flex: 1, minWidth: 220 }}
+                    placeholder="例如：你为什么白天提名 #3？"
+                    value={postGamePlayerQuestion}
+                    onChange={(e) => setPostGamePlayerQuestion(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') askPostGamePlayer();
+                    }}
+                    disabled={postGamePlayerAsking || wsStatus !== 'open'}
+                  />
+                  <button
+                    type="button"
+                    onClick={askPostGamePlayer}
+                    disabled={postGamePlayerAsking || wsStatus !== 'open' || room.status !== 'ended' || !Number.isInteger(postGamePlayerTargetSeat)}
+                  >
+                    {postGamePlayerAsking ? '提问中...' : '提问玩家'}
+                  </button>
+                </div>
+                {postGamePlayerQaList.length > 0 && (
+                  <div style={{ marginTop: 8, maxHeight: 220, overflow: 'auto', border: '1px solid #333', borderRadius: 8, padding: 8 }}>
+                    {[...postGamePlayerQaList].reverse().map((qa, idx) => (
+                      <article key={`${qa.at}-${idx}`} style={{ marginBottom: 10, paddingBottom: 10, borderBottom: '1px dashed #333' }}>
+                        <div style={{ fontSize: 12, color: '#b7b7b7' }}>
+                          {new Date(qa.at).toLocaleTimeString()} · 玩家 #{qa.targetSeatIndex + 1}
+                        </div>
+                        <div style={{ marginTop: 4, fontSize: 13 }}><strong>问：</strong>{qa.question}</div>
+                        <div style={{ marginTop: 4, fontSize: 13, whiteSpace: 'pre-wrap' }}><strong>答：</strong>{qa.answer}</div>
+                      </article>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </section>
+          )}
         </section>
       )}
 
@@ -733,7 +1034,7 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
                 value={String(room.aiPlayerTemperature ?? 0.5)}
                 onChange={(e) => send({ type: 'set_ai_player_temperature', temperature: parseFloat(e.target.value) })}
                 disabled={wsStatus !== 'open' || !room.aiPlayerEnabled}
-                style={{ marginLeft: 8 }}
+                style={{ ...unifiedSelectStyle, marginLeft: 8 }}
               >
                 <option value="0.2">低（更沉默）</option>
                 <option value="0.5">中性（默认）</option>
@@ -743,15 +1044,28 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
           </section>
 
           <section className="card" style={{ marginTop: 16 }}>
-            <h3>公共大屏（公开信息）</h3>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+              <h3 style={{ margin: 0 }}>公共大屏（公开信息）</h3>
+              <label className="muted">
+                展示模式：
+                <select
+                  style={unifiedSelectStyle}
+                  value={publicBoardMode}
+                  onChange={(e) => setPublicBoardMode(e.target.value as 'compact' | 'detailed')}
+                >
+                  <option value="compact">精简（仅公开发言+阶段提示）</option>
+                  <option value="detailed">详细（完整事件）</option>
+                </select>
+              </label>
+            </div>
             <p className="muted">
               存活 {room.players.filter((p) => p.isAlive).length}/{room.players.length} · 待处决：{room.pendingExecution != null ? `#${room.pendingExecution + 1}` : '无'}
             </p>
             <ol style={{ margin: 0, paddingLeft: 18, lineHeight: 1.55 }}>
-              {(room.publicLog ?? []).slice(-20).map((e) => (
+              {visiblePublicLog.map((e) => (
                 <li key={`${e.seq}-${e.at}`}>{e.line}</li>
               ))}
-              {(room.publicLog ?? []).length === 0 && <li className="muted">（暂无公开事件）</li>}
+              {visiblePublicLog.length === 0 && <li className="muted">（暂无符合当前模式的公开事件）</li>}
             </ol>
           </section>
 
