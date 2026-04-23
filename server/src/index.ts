@@ -1511,7 +1511,35 @@ wss.on('connection', (ws: any, req) => {
           ws.send(JSON.stringify({ type: 'error', message: 'post_game_ask_too_long' }));
           return;
         }
+        const trace = createInvocation(room, {
+          actor: 'storyteller',
+          stage: 'storyteller_decision',
+          roomId,
+          seatIndex,
+          phase: room.phase,
+          stepId: 'post_game_qa',
+          model: process.env.OPENAI_MODEL ?? 'qwen3.5-plus',
+          status: 'started',
+          request: toTraceText({
+            type: 'post_game_ask_god',
+            askerSeatIndex: seatIndex,
+            question,
+          }),
+        });
+        sendAiTrace(roomId, seatIndex, trace);
+        const startedAt = Date.now();
         const answer = await answerPostGameQuestion(room, seatIndex, question);
+        const responded = updateInvocation(room, trace.id, {
+          status: 'responded',
+          elapsedMs: Date.now() - startedAt,
+          response: toTraceText(answer),
+        });
+        if (responded) sendAiTrace(roomId, seatIndex, responded);
+        const applied = updateInvocation(room, trace.id, {
+          status: 'applied',
+          behavior: 'post_game_god_answer_sent',
+        });
+        if (applied) sendAiTrace(roomId, seatIndex, applied);
         sendToSeat(roomId, seatIndex, {
           type: 'post_game_god_answer',
           question,
