@@ -10,5 +10,7 @@ export function buildYourRolePayload(room, seatIndex) {
         characterName: c?.name ?? cid,
         characterNameZh: c?.nameZh ?? cid,
         ability: c?.ability ?? '',
+        alignment: (c?.alignment ?? 'good'),
+        roleType: (c?.type ?? 'townsfolk'),
     };
 }

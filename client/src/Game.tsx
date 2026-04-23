@@ -16,6 +16,135 @@ interface GameProps {
   onRoomUpdate: (room: RoomView) => void;
 }
 
+type AiTraceEntry = {
+  id: string;
+  at: number;
+  updatedAt?: number;
+  actor: 'player' | 'storyteller';
+  seatIndex: number | null;
+  roomId: string;
+  phase: string;
+  dayNumber?: number;
+  stage: 'day_plan' | 'night_action' | 'storyteller_decision';
+  status: 'started' | 'responded' | 'applied' | 'fallback' | 'error';
+  stepId?: string;
+  model: string;
+  elapsedMs?: number;
+  request?: string;
+  response?: string;
+  behavior?: string;
+  error?: string;
+};
+
+type FormattedTraceExportItem = {
+  id: string;
+  time: string;
+  actor: string;
+  stage: string;
+  status: string;
+  model: string;
+  elapsedMs?: number;
+  input: Record<string, unknown>;
+  output: Record<string, unknown>;
+  behavior?: string;
+  error?: string;
+};
+
+function parseJsonSafe<T = unknown>(v: string | undefined | null): T | null {
+  if (!v) return null;
+  try {
+    return JSON.parse(v) as T;
+  } catch {
+    return null;
+  }
+}
+
+function phaseToText(phase: string, dayNumber?: number): string {
+  if (phase === 'first_night') return '首夜';
+  if (phase === 'night') return `第 ${typeof dayNumber === 'number' ? dayNumber + 1 : '?'} 夜`;
+  if (phase === 'day') return `第 ${typeof dayNumber === 'number' ? dayNumber : '?'} 天白天`;
+  return phase;
+}
+
+function toStageText(stage: AiTraceEntry['stage']): string {
+  if (stage === 'day_plan') return '白天计划';
+  if (stage === 'night_action') return '夜晚行动';
+  return '说书人裁量';
+}
+
+function toStatusText(status: AiTraceEntry['status']): string {
+  if (status === 'started') return '请求中';
+  if (status === 'responded') return '已返回';
+  if (status === 'applied') return '已执行';
+  if (status === 'fallback') return '兜底';
+  return '错误';
+}
+
+function buildFormattedTraceItem(entry: AiTraceEntry): FormattedTraceExportItem {
+  const requestObj = parseJsonSafe<Record<string, unknown>>(entry.request);
+  const responseObj = parseJsonSafe<Record<string, unknown>>(entry.response);
+  const userPromptObj =
+    requestObj && typeof requestObj.userPrompt === 'string'
+      ? parseJsonSafe<Record<string, unknown>>(String(requestObj.userPrompt))
+      : null;
+  const contextObj = (userPromptObj?.context as Record<string, unknown> | undefined) ?? null;
+  const roomView = (contextObj?.roomView as Record<string, unknown> | undefined) ?? null;
+  const yourRole = (contextObj?.yourRole as Record<string, unknown> | undefined) ?? null;
+  const yourAlignment = (contextObj?.yourAlignment as string | undefined) ?? undefined;
+  const chatLog = (contextObj?.chatLog as unknown[] | undefined) ?? [];
+  const nightInfo = (contextObj?.nightInfo as unknown[] | undefined) ?? [];
+  const players = (roomView?.players as Array<Record<string, unknown>> | undefined) ?? [];
+  const aliveSeats = players
+    .filter((p) => p && p.isAlive === true && typeof p.seatIndex === 'number')
+    .map((p) => Number(p.seatIndex) + 1);
+  const deadSeats = players
+    .filter((p) => p && p.isAlive === false && typeof p.seatIndex === 'number')
+    .map((p) => Number(p.seatIndex) + 1);
+  const publicClaims = chatLog
+    .filter((c) => c && typeof c === 'object' && (c as any).scope === 'public')
+    .slice(-8)
+    .map((c) => `#${Number((c as any).fromSeat) + 1}: ${String((c as any).text ?? '').slice(0, 80)}`);
+
+  const input = {
+    游戏基础信息: {
+      当前游戏剧本: roomView?.scriptNameZh ?? null,
+      总玩家人数: players.length || null,
+      你的玩家编号: typeof contextObj?.yourSeatIndex === 'number' ? Number(contextObj.yourSeatIndex) + 1 : null,
+      你的身份: yourRole?.characterNameZh ?? contextObj?.yourCharacterId ?? null,
+      你的阵营: yourAlignment ?? null,
+    },
+    当前游戏状态: {
+      游戏阶段: phaseToText(entry.phase, entry.dayNumber),
+      存活玩家列表: aliveSeats.length > 0 ? aliveSeats.join(', ') : '无',
+      已死亡玩家列表: deadSeats.length > 0 ? deadSeats.join(', ') : '无',
+      当前讨论焦点: publicClaims.length > 0 ? publicClaims.slice(-3).join(' | ') : '无明显焦点',
+      最近公开声明: publicClaims.length > 0 ? publicClaims : [],
+      你的夜间信息: nightInfo.length > 0 ? nightInfo : [],
+    },
+  };
+
+  const output = {
+    当前身份: yourRole?.characterNameZh ?? contextObj?.yourCharacterId ?? null,
+    当前阵营: yourAlignment ?? null,
+    模型输出摘要: responseObj ?? (entry.response ? entry.response.slice(0, 500) : null),
+    阶段行为: entry.behavior ?? null,
+  };
+
+  return {
+    id: entry.id,
+    time: new Date(entry.at).toISOString(),
+    actor: entry.actor === 'player' ? 'AI玩家' : 'AI说书人',
+    stage: toStageText(entry.stage),
+    status: toStatusText(entry.status),
+    model: entry.model,
+    elapsedMs: entry.elapsedMs,
+    input,
+    output,
+    behavior: entry.behavior,
+    error: entry.error,
+  };
+}
+
 function toZhError(raw: string): string {
   if (raw.startsWith('night_action_failed:')) {
     return `夜晚行动无效：${raw.replace('night_action_failed:', '')}`;
@@ -53,8 +182,15 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
   const [myVoteChoice, setMyVoteChoice] = useState<boolean | null>(null);
   const [isHost, setIsHost] = useState<boolean>(false);
   const [copyTip, setCopyTip] = useState('');
+  const [aiTraceEntries, setAiTraceEntries] = useState<AiTraceEntry[]>([]);
+  const [traceStageFilter, setTraceStageFilter] = useState<'all' | AiTraceEntry['stage']>('all');
+  const [traceStatusFilter, setTraceStatusFilter] = useState<'all' | AiTraceEntry['status']>('all');
+  const [traceCurrentDayOnly, setTraceCurrentDayOnly] = useState(false);
+  const [traceKeyword, setTraceKeyword] = useState('');
+  const [traceNightChainView, setTraceNightChainView] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
+  const autoAiTriedRef = useRef(false);
 
   const copyRoomId = async () => {
     try {
@@ -65,6 +201,40 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
       setCopyTip('复制失败');
       setTimeout(() => setCopyTip(''), 1500);
     }
+  };
+
+  const exportAiTraceJson = () => {
+    if (aiTraceEntries.length === 0) return;
+    const formattedEntries = aiTraceEntries.map(buildFormattedTraceItem);
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      roomId: room.id,
+      seatIndex: yourSeatIndex,
+      summary: {
+        total: formattedEntries.length,
+        applied: formattedEntries.filter((e) => e.status === '已执行').length,
+        fallback: formattedEntries.filter((e) => e.status === '兜底').length,
+        error: formattedEntries.filter((e) => e.status === '错误').length,
+      },
+      entries: formattedEntries,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `ai-trace-room-${room.id}-seat-${yourSeatIndex + 1}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const getTraceStatusStyle = (status: AiTraceEntry['status']) => {
+    if (status === 'applied') return { bg: '#173a22', color: '#8ff0b3', label: '已执行' };
+    if (status === 'responded') return { bg: '#21404f', color: '#8fdfff', label: '已返回' };
+    if (status === 'started') return { bg: '#1f2d44', color: '#9cc6ff', label: '请求中' };
+    if (status === 'fallback') return { bg: '#45361a', color: '#ffd38a', label: '兜底' };
+    return { bg: '#4a1f24', color: '#ff9fa8', label: '错误' };
   };
 
   const replaySections = useMemo(() => {
@@ -82,6 +252,47 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
     return Array.from(map.entries()).map(([groupKey, v]) => ({ groupKey, ...v }));
   }, [endedReplay]);
 
+  const filteredAiTraceEntries = useMemo(() => {
+    const kw = traceKeyword.trim().toLowerCase();
+    return aiTraceEntries.filter((e) => {
+      const stageOk = traceStageFilter === 'all' || e.stage === traceStageFilter;
+      const statusOk = traceStatusFilter === 'all' || e.status === traceStatusFilter;
+      const dayOk = !traceCurrentDayOnly || e.dayNumber === room.dayNumber;
+      const keywordOk = !kw || [
+        e.request ?? '',
+        e.response ?? '',
+        e.behavior ?? '',
+        e.error ?? '',
+      ].join('\n').toLowerCase().includes(kw);
+      return stageOk && statusOk && dayOk && keywordOk;
+    });
+  }, [aiTraceEntries, traceStageFilter, traceStatusFilter, traceCurrentDayOnly, traceKeyword, room.dayNumber]);
+
+  const nightMediationChains = useMemo(() => {
+    const sorted = [...filteredAiTraceEntries]
+      .filter((e) => (e.phase === 'night' || e.phase === 'first_night') && !!e.stepId && (e.stage === 'night_action' || e.stage === 'storyteller_decision'))
+      .sort((a, b) => a.at - b.at);
+    const map = new Map<string, { key: string; dayNumber?: number; phase: string; seatIndex: number | null; stepId?: string; player?: AiTraceEntry; storyteller?: AiTraceEntry }>();
+    for (const e of sorted) {
+      const key = `${e.dayNumber ?? -1}|${e.phase}|${e.seatIndex ?? -1}|${e.stepId ?? 'unknown'}`;
+      const item = map.get(key) ?? {
+        key,
+        dayNumber: e.dayNumber,
+        phase: e.phase,
+        seatIndex: e.seatIndex,
+        stepId: e.stepId,
+      };
+      if (e.stage === 'night_action') item.player = e;
+      if (e.stage === 'storyteller_decision') item.storyteller = e;
+      map.set(key, item);
+    }
+    return Array.from(map.values()).sort((a, b) => {
+      const ta = Math.max(a.player?.at ?? 0, a.storyteller?.at ?? 0);
+      const tb = Math.max(b.player?.at ?? 0, b.storyteller?.at ?? 0);
+      return tb - ta;
+    });
+  }, [filteredAiTraceEntries]);
+
   useEffect(() => {
     const qs = new URLSearchParams({ roomId, seatIndex: String(yourSeatIndex) });
     if (hostSecret) qs.set('hostSecret', hostSecret);
@@ -90,7 +301,22 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
     setWsStatus('connecting');
     setLastSendError('');
     setOptimisticReady(null);
-    ws.onopen = () => setWsStatus('open');
+    ws.onopen = () => {
+      setWsStatus('open');
+      // Dev 便捷：URL 带 autoAi=1 时自动开启本座位 AI 托管
+      if (!autoAiTriedRef.current) {
+        autoAiTriedRef.current = true;
+        const qs2 = new URLSearchParams(location.search);
+        const autoAi = qs2.get('autoAi') === '1';
+        if (autoAi) {
+          try {
+            ws.send(JSON.stringify({ type: 'toggle_ai_player', enabled: true }));
+          } catch {
+            // ignore
+          }
+        }
+      }
+    };
     ws.onerror = () => setWsStatus('error');
     ws.onclose = () => setWsStatus('closed');
     ws.onmessage = (ev) => {
@@ -116,6 +342,7 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
             setAwaitingNightConfirm(false);
             setNightConfirmedSeats([]);
             setEndedReplay(null);
+            setAiTraceEntries([]);
           }
           if (msg.room.phase === 'day' || msg.room.phase === 'waiting') {
             setNightPrompt(null);
@@ -162,6 +389,10 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
           console.error(msg.message);
           const raw = String(msg.message ?? '未知错误');
           setLastSendError(toZhError(raw));
+        } else if (msg.type === 'ai_trace') {
+          if (msg.entry && typeof msg.entry === 'object') {
+            setAiTraceEntries((prev) => [...prev, msg.entry as AiTraceEntry].slice(-80));
+          }
         }
       } catch (_) {}
     };
@@ -248,7 +479,7 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
     <div className="page">
       <div className="header">
         <div>
-          <h1 className="title">血染钟楼 · {room.scriptNameZh}</h1>
+          <h1 className="title">Blood on the Clocktower · {room.scriptNameZh}</h1>
           <p className="subtitle">
             房间号：<code className="mono">{room.id}</code>
             <button type="button" style={{ marginLeft: 8 }} onClick={copyRoomId}>复制</button>
@@ -276,6 +507,188 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
         </span>
         {lastSendError && <span className="pill status-danger">{lastSendError}</span>}
       </div>
+
+      {aiTraceEntries.length > 0 && (
+        <section className="card" style={{ marginTop: 16 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+            <div>
+              <h3 style={{ margin: 0 }}>AI 调用记录（本座位）</h3>
+              <p className="muted" style={{ marginTop: 6 }}>
+                对局中所有 AI 调用都会保留；对局结束后仍可导出 JSON 用于 Prompt 复盘。
+              </p>
+            </div>
+            <button type="button" onClick={exportAiTraceJson}>导出日志 JSON</button>
+          </div>
+          <p className="muted" style={{ marginTop: 8 }}>
+            当前筛选后 {filteredAiTraceEntries.length} / 总计 {aiTraceEntries.length} 条
+            {aiTraceEntries.length > 0 ? ` · 最近一条：${new Date(aiTraceEntries[aiTraceEntries.length - 1].at).toLocaleTimeString()}` : ''}
+          </p>
+          <div className="row" style={{ gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+            <label className="muted">
+              阶段：
+              <select
+                style={{ marginLeft: 6 }}
+                value={traceStageFilter}
+                onChange={(e) => setTraceStageFilter(e.target.value as 'all' | AiTraceEntry['stage'])}
+              >
+                <option value="all">全部</option>
+                <option value="day_plan">白天计划</option>
+                <option value="night_action">夜晚行动</option>
+                <option value="storyteller_decision">说书人裁量</option>
+              </select>
+            </label>
+            <label className="muted">
+              状态：
+              <select
+                style={{ marginLeft: 6 }}
+                value={traceStatusFilter}
+                onChange={(e) => setTraceStatusFilter(e.target.value as 'all' | AiTraceEntry['status'])}
+              >
+                <option value="all">全部</option>
+                <option value="started">请求中</option>
+                <option value="responded">已返回</option>
+                <option value="applied">已执行</option>
+                <option value="fallback">兜底</option>
+                <option value="error">错误</option>
+              </select>
+            </label>
+            <label className="muted">
+              <input
+                type="checkbox"
+                checked={traceCurrentDayOnly}
+                onChange={(e) => setTraceCurrentDayOnly(e.target.checked)}
+                style={{ marginRight: 6 }}
+              />
+              仅当前天（Day {room.dayNumber}）
+            </label>
+            <label className="muted">
+              搜索：
+              <input
+                style={{ marginLeft: 6, minWidth: 180 }}
+                value={traceKeyword}
+                onChange={(e) => setTraceKeyword(e.target.value)}
+                placeholder="关键词（prompt/behavior/error）"
+              />
+            </label>
+            <label className="muted">
+              <input
+                type="checkbox"
+                checked={traceNightChainView}
+                onChange={(e) => setTraceNightChainView(e.target.checked)}
+                style={{ marginRight: 6 }}
+              />
+              夜晚中转链路视图
+            </label>
+            <button
+              type="button"
+              onClick={() => {
+                setTraceStageFilter('all');
+                setTraceStatusFilter('all');
+                setTraceCurrentDayOnly(false);
+                setTraceKeyword('');
+                setTraceNightChainView(false);
+              }}
+            >
+              清除筛选
+            </button>
+          </div>
+          <div style={{ marginTop: 8, maxHeight: 340, overflow: 'auto', border: '1px solid #333', borderRadius: 8, padding: 10 }}>
+            {traceNightChainView ? nightMediationChains.map((chain) => {
+              const p = chain.player;
+              const s = chain.storyteller;
+              return (
+                <article key={chain.key} style={{ marginBottom: 12, padding: 10, border: '1px solid #2f2f2f', borderRadius: 8, background: '#161616' }}>
+                  <div style={{ fontSize: 13 }}>
+                    <strong>夜晚中转链路</strong>
+                    <span className="muted" style={{ marginLeft: 8 }}>
+                      [{chain.phase}] · seat #{typeof chain.seatIndex === 'number' ? chain.seatIndex + 1 : '?'} · step {chain.stepId ?? 'unknown'}
+                    </span>
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 8 }}>
+                    {[{ label: '玩家模型建议', entry: p }, { label: '上帝模型裁定', entry: s }].map(({ label, entry }) => {
+                      const style = entry ? getTraceStatusStyle(entry.status) : null;
+                      return (
+                        <div key={label} style={{ border: '1px solid #333', borderRadius: 8, padding: 8, background: '#121212' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                            <strong style={{ fontSize: 12 }}>{label}</strong>
+                            {entry && style && (
+                              <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 999, background: style.bg, color: style.color }}>
+                                {style.label}
+                              </span>
+                            )}
+                          </div>
+                          {!entry && <div className="muted" style={{ marginTop: 6, fontSize: 12 }}>当前筛选条件下无记录</div>}
+                          {entry && (
+                            <>
+                              <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+                                {new Date(entry.at).toLocaleTimeString()}
+                                {' · '}
+                                model: {entry.model}
+                                {typeof entry.elapsedMs === 'number' ? ` · ${entry.elapsedMs}ms` : ''}
+                              </div>
+                              {entry.behavior && <div style={{ marginTop: 6, fontSize: 12 }}>behavior: {entry.behavior}</div>}
+                              {entry.response && (
+                                <details style={{ marginTop: 6 }}>
+                                  <summary style={{ cursor: 'pointer', fontSize: 12 }}>output（模型原始回复）</summary>
+                                  <pre style={{ marginTop: 6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12, lineHeight: 1.45 }}>{entry.response}</pre>
+                                </details>
+                              )}
+                              {entry.error && <div style={{ marginTop: 6, fontSize: 12, color: '#ff9fa8' }}>error: {entry.error}</div>}
+                            </>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </article>
+              );
+            }) : [...filteredAiTraceEntries].reverse().map((e) => {
+              const statusStyle = getTraceStatusStyle(e.status);
+              return (
+                <article key={e.id} style={{ marginBottom: 12, padding: 10, border: '1px solid #2f2f2f', borderRadius: 8, background: '#161616' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+                    <div style={{ fontSize: 13 }}>
+                      <strong>
+                        {e.stage === 'day_plan'
+                          ? '白天计划'
+                          : e.stage === 'night_action'
+                            ? '夜晚行动'
+                            : '说书人裁量'}
+                      </strong>
+                      <span className="muted" style={{ marginLeft: 8 }}>[{e.phase}] · {new Date(e.at).toLocaleTimeString()}</span>
+                    </div>
+                    <span style={{ fontSize: 12, padding: '2px 8px', borderRadius: 999, background: statusStyle.bg, color: statusStyle.color }}>
+                      {statusStyle.label}
+                    </span>
+                  </div>
+                  <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+                    actor: {e.actor === 'player' ? 'AI 玩家' : 'AI 说书人'}
+                    {e.seatIndex != null ? ` · seat #${e.seatIndex + 1}` : ''}
+                    {e.stepId ? ` · step ${e.stepId}` : ''}
+                    {' · '}
+                    model: {e.model}
+                    {typeof e.elapsedMs === 'number' ? ` · ${e.elapsedMs}ms` : ''}
+                  </div>
+                  {e.request && (
+                    <details style={{ marginTop: 8 }}>
+                      <summary style={{ cursor: 'pointer', fontSize: 12 }}>input（完整 prompt）</summary>
+                      <pre style={{ marginTop: 6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12, lineHeight: 1.45 }}>{e.request}</pre>
+                    </details>
+                  )}
+                  {e.response && (
+                    <details style={{ marginTop: 8 }}>
+                      <summary style={{ cursor: 'pointer', fontSize: 12 }}>output（模型原始回复）</summary>
+                      <pre style={{ marginTop: 6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12, lineHeight: 1.45 }}>{e.response}</pre>
+                    </details>
+                  )}
+                  {e.behavior && <div style={{ marginTop: 8, fontSize: 12 }}>behavior: {e.behavior}</div>}
+                  {e.error && <div style={{ marginTop: 8, fontSize: 12, color: '#ff9fa8' }}>error: {e.error}</div>}
+                </article>
+              );
+            })}
+          </div>
+        </section>
+      )}
 
       {room.status === 'lobby' && (
         <section className="card" style={{ marginTop: 16 }}>

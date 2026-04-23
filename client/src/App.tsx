@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Lobby } from './Lobby';
 import { Game } from './Game';
 import { AdminPanel } from './AdminPanel';
@@ -38,6 +38,50 @@ export default function App() {
     setYourSeatIndex(null);
     setYourCharacterId(null);
   }, []);
+
+  // Dev 便捷：支持通过 URL 参数自动加入/进入管理员页（便于一键开多个标签页测试）
+  useEffect(() => {
+    const qs = new URLSearchParams(location.search);
+    const autoJoin = qs.get('autoJoin') === '1';
+    const admin = qs.get('admin') === '1';
+    const rid = qs.get('roomId');
+    const hs = qs.get('hostSecret');
+    const nickname = qs.get('nickname') ?? '';
+    if (!rid) return;
+
+    if (admin && hs) {
+      enterAdmin(rid, hs);
+      return;
+    }
+    if (autoJoin && nickname.trim()) {
+      void (async () => {
+        try {
+          const r = await fetch(`/api/rooms/${encodeURIComponent(rid)}/join`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ nickname: nickname.trim() }),
+          });
+          const data = await r.json();
+          if (data.room && data.seatIndex !== undefined) {
+            enterRoom(data.room, data.seatIndex, data.yourCharacterId ?? null, data.roomId, null);
+            return;
+          }
+          // quickstart 场景：房间可能已开局，join 会失败；改为“接管已有座位”
+          const r2 = await fetch('/api/dev/take-seat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ roomId: rid, nickname: nickname.trim() }),
+          });
+          const data2 = await r2.json();
+          if (data2.room && data2.seatIndex !== undefined) {
+            enterRoom(data2.room, data2.seatIndex, null, data2.roomId ?? rid, null);
+          }
+        } catch {
+          // ignore
+        }
+      })();
+    }
+  }, [enterAdmin, enterRoom]);
 
   if (adminMode && roomId && hostSecret) {
     return <AdminPanel roomId={roomId} hostSecret={hostSecret} onLeave={leaveRoom} />;

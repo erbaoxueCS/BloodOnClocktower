@@ -37,6 +37,7 @@ export type GamePhase =
 
 /** 白天子阶段 */
 export type DaySubPhase = 'discussion' | 'nomination' | 'voting' | 'execution';
+export type DayFlowStage = 'god_dialogue' | 'private_dialogue' | 'public_speech' | 'nomination_vote';
 
 /** 玩家座位信息（公开） */
 export interface PlayerSeat {
@@ -96,6 +97,10 @@ export interface Room {
   phase: GamePhase;
   dayNumber: number;
   daySubPhase: DaySubPhase | null;
+  /** 白天固定流程阶段（导演编排） */
+  dayFlowStage: DayFlowStage | null;
+  /** 当前白天阶段的随机起始座位 */
+  dayFlowStartSeat: number | null;
   /** 当前提名：提名者 seatIndex，被提名者 seatIndex */
   currentNomination: { nominator: number; nominated: number } | null;
   /** 今日已提名记录：nominator -> nominated */
@@ -180,6 +185,8 @@ export interface RoomView {
   phase: GamePhase;
   dayNumber: number;
   daySubPhase: DaySubPhase | null;
+  dayFlowStage?: DayFlowStage | null;
+  dayFlowStartSeat?: number | null;
   currentNomination: Room['currentNomination'];
   pendingExecution: number | null;
   /** 今日提名记录（用于前端展示/判断） */
