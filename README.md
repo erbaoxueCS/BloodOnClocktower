@@ -1,40 +1,74 @@
-# 血染钟楼 · 常规功能 + AI 说书人
+# Blood on the Clocktower（暗流涌动）
 
-基于血染钟楼规则的在线对战实现：常规游戏流程 + 可选 AI 说书人决策。
+这是一个基于 React + Node.js 的《血染钟楼》在线对局原型，当前聚焦 Trouble Brewing（暗流涌动）并已接入 AI 玩家与 AI 说书人协作流程。
+
+## 当前能力
+
+- 完整大厅/房间/准备/开局流程（含管理员模式）
+- 白天四阶段编排：`god_dialogue` → `private_dialogue` → `public_speech` → `nomination_vote`
+- 夜晚双调用链：玩家先给行动建议，AI 说书人裁定最终目标
+- AI 调用全链路日志（请求/响应/行为/状态），前端可筛选与导出 JSON
+- 5 人局配比修正为：`3 镇民 + 1 爪牙 + 1 恶魔`（并补齐 5~15 人标准配比）
+- 首夜信息角色（洗衣妇/图书管理员/调查员）支持说书人 AI 裁量与兜底
+- 关键稳定性措施：夜晚互斥执行、同角色同夜信息单发、全阶段超时兜底防卡死
 
 ## 技术栈
 
-- **后端**：Node.js + Express + WebSocket (ws)，TypeScript
-- **前端**：React + Vite，TypeScript
-- **剧本**：暗流涌动（Trouble Brewing）精简版
+- 后端：Node.js + Express + ws + TypeScript
+- 前端：React + Vite + TypeScript
+- 模型调用：OpenAI 兼容接口（可配置 DashScope）
 
-## 快速开始
+## 本地启动
 
 ```bash
-# 安装依赖
+# 根目录安装
 npm install
 cd server && npm install && cd ..
 cd client && npm install && cd ..
 
-# 开发：同时启动后端与前端
+# 同时启动前后端
 npm run dev
-
-# 后端：http://localhost:3001
-# 前端：http://localhost:5173
 ```
 
-1. 打开前端，点击「创建房间」，复制房间号。
-2. 另开标签页或设备，输入房间号与昵称「加入房间」。
-3. 所有人准备后，房主点击「开始游戏」。
-4. 白天：房主可「进入提名阶段」；存活玩家可提名他人并投票；房主「结束投票」后若通过则出现「执行处决」，房主点击后进入下一夜。
+- 后端默认：`http://localhost:3001`
+- 前端默认：`http://localhost:5173`（被占用时自动切 5174）
+
+## AI 相关环境变量（后端）
+
+```bash
+USE_AI_STORYTELLER=true
+USE_AI_PLAYER=true
+OPENAI_API_KEY=your_key
+# 可选
+OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode
+OPENAI_MODEL=qwen3.5-plus
+```
+
+可用健康检查接口：
+
+- `GET /api/dev/llm/health`
+
+## 快速测试
+
+```bash
+POST /api/dev/quickstart
+body: { "playerCount": 5 }
+```
+
+返回值包含：
+
+- `joinUrls`：玩家自动入座链接（可带 autoAi）
+- `adminUrl`：管理员控制台链接
 
 ## 项目结构
 
-- `server/`：游戏服务、规则引擎、剧本数据、WebSocket 与 HTTP 接口
-- `client/`：大厅、房间、对局 UI（玩家列表、提名、投票、处决）
-- 说书人决策：首版为随机占位，Phase 2 接入 AI 模块
+- `server/src/game/*`：规则引擎、房间与流程状态机
+- `server/src/ai/*`：AI 玩家/说书人调用与日志模块
+- `server/src/night/runNightLoop.ts`：夜晚主循环
+- `server/src/index.ts`：HTTP + WS 入口与流程调度
+- `client/src/Game.tsx`：对局 UI 与 AI 调用日志面板
 
-## 后续
+## 文档
 
-- Phase 2：AI 说书人（状态适配、决策接口、洗衣妇/调查员等）
-- Phase 3：更多角色、醉酒/中毒、旅行者、复盘
+- 详细开发说明与版本演进见 `DEV_PLAN.md`
+- AI 流程设计见 `docs/DESIGN_AI_FLOW_AND_AGENTS.md`
