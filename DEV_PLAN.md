@@ -20,6 +20,15 @@
 
 ---
 
+## 1.1 开发原则（必须遵守）
+
+- **根因优先，禁止掩盖**：发现问题必须修复真实根因，不允许通过定制化分支、前端兜底、静态特判去“看起来正常”。
+- **规则优先于提示词**：先修正引擎与流程规则，再做 AI prompt 倾向调优。
+- **单点开关语义一致**：`aiStorytellerEnabled` 是自动导演总开关，任何自动推进都不得绕过该语义。
+- **可解释与可追踪**：关键动作必须可审计（裁决结果、来源、理由可追溯）。
+
+---
+
 ## 2. 技术架构（高层）
 
 - 前端：`React + Vite`（`client/`）
@@ -158,6 +167,31 @@ cd server && npm install && npm run dev
 # client
 cd ../client && npm install && npm run dev
 ```
+
+### 8.1 标准后端启动配置（默认使用，避免反复踩坑）
+
+下次启动后端请默认使用以下配置（已验证可用）：
+
+```bash
+cd server
+export OPENAI_API_KEY="你的key"
+export DASHSCOPE_API_KEY="你的key"
+export USE_AI_STORYTELLER=true
+export OPENAI_BASE_URL="https://coding.dashscope.aliyuncs.com"
+export OPENAI_MODEL="qwen3.6-plus"
+npm run dev
+```
+
+启动后务必检查：
+
+- `GET /api/dev/llm/health` 中 `useAiStoryteller=true`
+- `baseUrl=https://coding.dashscope.aliyuncs.com`
+- `model=qwen3.6-plus`
+
+说明：
+
+- `OPENAI_BASE_URL` 必须使用 `coding.dashscope.aliyuncs.com`（当前 key 在此网关稳定可用）。
+- 同时设置 `OPENAI_API_KEY` 与 `DASHSCOPE_API_KEY`，可避免不同调用路径读取变量不一致。
 
 可选 AI 说书人环境变量（server）：
 
@@ -581,4 +615,45 @@ npm run dev
 
 - 将 `storyteller_ai` 在白天提名/投票阶段补齐为“可解释、可配置”的独立裁量策略（当前仍以规则引擎镜像为主）。
 - 基于自动化对局结果继续扩展指标（发言覆盖率、有效提名率、关键角色存活关联等）。
+
+---
+
+## 12. 最近改动归档（2026-04-27）
+
+### 12.1 规则与引擎（根因修复）
+
+- 修复 Trouble Brewing 配板根因：`5` 人局由错误的 `4-0-0-1` 改为官方 `3-0-1-1`。
+- `assignRoles` 改为 `5~15` 人固定配比表，不再使用简化公式推导，避免类似偏差重复出现。
+
+### 12.2 AI 调用可见性与权限边界
+
+- 调整 `ai_trace` 分发策略为严格隔离：
+  - 玩家仅可见自己座位的 AI 调用；
+  - 管理员（上帝）仅可见说书人调用（`seatIndex=null`）；
+  - 禁止“房主看全员调用”越权路径。
+- 管理员页新增“AI 调用记录（上帝）”并做可视化增强（状态标签、时间、阶段、错误高亮）。
+
+### 12.3 模型调用链路与性能参数
+
+- 统一说书人与玩家调用为非流式：`stream=false`。
+- 对支持参数的模型关闭思考过程：`enable_thinking=false`。
+- 按最新决策，已移除本轮临时加入的 `max_tokens` 限制（说书人 + 玩家全部撤回）。
+
+### 12.4 运行配置基线（必须对齐）
+
+- 统一后端默认启动配置为：
+  - `USE_AI_STORYTELLER=true`
+  - `OPENAI_BASE_URL=https://coding.dashscope.aliyuncs.com`
+  - `OPENAI_MODEL=qwen3.6-plus`
+  - 同时设置 `OPENAI_API_KEY` 与 `DASHSCOPE_API_KEY`
+- 启动后通过 `GET /api/dev/llm/health` 校验：
+  - `useAiStoryteller=true`
+  - `baseUrl` / `model` 与启动参数一致
+
+### 12.5 本轮经验结论（避免重复踩坑）
+
+- 若出现“上帝无 AI 调用”，先检查运行进程环境而不是先改代码：
+  - `USE_AI_STORYTELLER` 是否为 `true`
+  - `OPENAI_BASE_URL` 是否退回默认
+  - `/api/dev/llm/health` 是否与预期一致
 

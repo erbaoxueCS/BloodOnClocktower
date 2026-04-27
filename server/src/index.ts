@@ -1177,11 +1177,18 @@ function toTraceText(v: unknown, maxLen = 50000): string {
 }
 
 function sendAiTrace(roomId: string, seatIndex: number | null, entry: AiInvocationRecord): void {
-  if (seatIndex == null) {
-    broadcast(roomId, { type: 'ai_trace', entry });
+  // 严格隔离：
+  // - 玩家视角：仅可见自己座位的 AI 调用记录；
+  // - 上帝管理员视角：admin 连接仅可见“说书人（seatIndex=null）”调用记录。
+  if (seatIndex != null) {
+    sendToSeat(roomId, seatIndex, { type: 'ai_trace', entry });
     return;
   }
-  sendToSeat(roomId, seatIndex, { type: 'ai_trace', entry });
+  (wss as any).clients?.forEach((ws: any) => {
+    if (ws.roomId !== roomId || ws.readyState !== 1) return;
+    if (!ws.isAdmin) return;
+    ws.send(JSON.stringify({ type: 'ai_trace', entry }));
+  });
 }
 
 function toFullPromptDebugText(e: AiPlayerDebugEvent): string {

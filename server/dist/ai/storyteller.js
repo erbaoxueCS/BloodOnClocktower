@@ -6,6 +6,14 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL ?? 'qwen3.5-plus';
 // DashScope 实测：coding 网关对部分 key 生效；兼容模式域名在部分场景会 401
 const OPENAI_BASE_URL = (process.env.OPENAI_BASE_URL ?? 'https://coding.dashscope.aliyuncs.com').replace(/\/+$/, '');
 const AI_STORYTELLER_LLM_LOG = process.env.AI_STORYTELLER_LLM_LOG === 'true' || process.env.AI_STORYTELLER_LLM_LOG === '1';
+function fastResponseOptions() {
+    return {
+        // 关闭流式输出，减少首包等待和处理开销
+        stream: false,
+        // 对支持该参数的兼容模型，关闭“思考过程”以缩短响应时间
+        enable_thinking: false,
+    };
+}
 function getApiKey() {
     return (process.env.OPENAI_API_KEY ?? process.env.DASHSCOPE_API_KEY ?? '').trim();
 }
@@ -43,6 +51,7 @@ export async function storytellerLlmSelfTest(params) {
                 ],
                 response_format: { type: 'json_object' },
                 temperature: 0,
+                ...fastResponseOptions(),
             }),
             signal: ac.signal,
         });
@@ -199,7 +208,8 @@ async function callOpenAI(req, stepId, apiKey, onDebug) {
             model: OPENAI_MODEL,
             messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
             response_format: { type: 'json_object' },
-            temperature: 0.7,
+            temperature: 0.3,
+            ...fastResponseOptions(),
         }),
         signal: ac.signal,
     });
@@ -277,6 +287,7 @@ export async function answerPostGameQuestion(room, askerSeatIndex, question) {
                     { role: 'user', content: userPrompt },
                 ],
                 temperature: 0.3,
+                ...fastResponseOptions(),
             }),
             signal: ac.signal,
         });

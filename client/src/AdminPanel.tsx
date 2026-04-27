@@ -10,6 +10,26 @@ interface AdminPanelProps {
   onLeave: () => void;
 }
 
+type AiTraceEntry = {
+  id: string;
+  at: number;
+  updatedAt?: number;
+  actor: 'player' | 'storyteller';
+  seatIndex: number | null;
+  roomId: string;
+  phase: string;
+  dayNumber?: number;
+  stage: 'day_plan' | 'night_action' | 'storyteller_decision';
+  status: 'started' | 'responded' | 'applied' | 'fallback' | 'error';
+  stepId?: string;
+  model: string;
+  elapsedMs?: number;
+  request?: string;
+  response?: string;
+  behavior?: string;
+  error?: string;
+};
+
 function phaseZh(phase?: string): string {
   if (phase === 'waiting') return '等待';
   if (phase === 'first_night') return '首夜';
@@ -27,12 +47,27 @@ function daySubPhaseZh(sub?: string | null): string {
   return sub;
 }
 
+function traceStageZh(stage: AiTraceEntry['stage']): string {
+  if (stage === 'day_plan') return '白天计划';
+  if (stage === 'night_action') return '夜晚行动';
+  return '说书人裁量';
+}
+
+function getTraceStatusStyle(status: AiTraceEntry['status']): { label: string; bg: string; color: string } {
+  if (status === 'started') return { label: '请求中', bg: '#1f2937', color: '#cbd5e1' };
+  if (status === 'responded') return { label: '已返回', bg: '#1d4ed8', color: '#dbeafe' };
+  if (status === 'applied') return { label: '已执行', bg: '#065f46', color: '#d1fae5' };
+  if (status === 'fallback') return { label: '兜底', bg: '#7c2d12', color: '#ffedd5' };
+  return { label: '错误', bg: '#7f1d1d', color: '#fee2e2' };
+}
+
 export function AdminPanel({ roomId, hostSecret, onLeave }: AdminPanelProps) {
   const [room, setRoom] = useState<RoomView | null>(null);
   const [wsStatus, setWsStatus] = useState<'connecting' | 'open' | 'closed' | 'error'>('connecting');
   const [lastError, setLastError] = useState('');
   const [isHost, setIsHost] = useState(false);
   const [copyTip, setCopyTip] = useState('');
+  const [aiTraceEntries, setAiTraceEntries] = useState<AiTraceEntry[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
 
   const copyRoomId = async () => {
@@ -64,6 +99,10 @@ export function AdminPanel({ roomId, hostSecret, onLeave }: AdminPanelProps) {
           setRoom(msg.room);
         } else if (msg.type === 'error') {
           setLastError(String(msg.message ?? '未知错误'));
+        } else if (msg.type === 'ai_trace') {
+          if (msg.entry && typeof msg.entry === 'object') {
+            setAiTraceEntries((prev) => [...prev, msg.entry as AiTraceEntry].slice(-120));
+          }
         }
       } catch {
         // ignore
@@ -168,6 +207,50 @@ export function AdminPanel({ roomId, hostSecret, onLeave }: AdminPanelProps) {
             ))}
             {(room?.chatLog ?? []).length === 0 && <li className="muted">（暂无聊天记录）</li>}
           </ol>
+        </section>
+
+        <section className="card col-12">
+          <h3>AI 调用记录（上帝）</h3>
+          <p className="muted">
+            仅展示上帝/说书人自身 AI 调用，不包含玩家私有调用。
+          </p>
+          <p className="muted" style={{ marginTop: 4 }}>
+            总计 {aiTraceEntries.length} 条
+            {aiTraceEntries.length > 0 ? ` · 最近一条：${new Date(aiTraceEntries[aiTraceEntries.length - 1].at).toLocaleTimeString()}` : ' · 暂无调用记录'}
+          </p>
+          <div style={{ marginTop: 8, maxHeight: 340, overflow: 'auto', border: '1px solid #333', borderRadius: 8, padding: 10 }}>
+            {aiTraceEntries.length === 0 ? (
+              <p className="muted">还没有收到上帝 AI 调用事件。请先开启 AI 说书人并推进流程。</p>
+            ) : (
+              [...aiTraceEntries].reverse().slice(0, 80).map((e) => {
+                const statusStyle = getTraceStatusStyle(e.status);
+                return (
+                  <article key={`${e.id}-${e.updatedAt ?? e.at}`} style={{ marginBottom: 12, padding: 10, border: '1px solid #2f2f2f', borderRadius: 8, background: '#161616' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+                      <div style={{ fontSize: 13 }}>
+                        <strong>{traceStageZh(e.stage)}</strong>
+                        <span className="muted" style={{ marginLeft: 8 }}>
+                          [{phaseZh(e.phase)}] · {new Date(e.updatedAt ?? e.at).toLocaleTimeString()}
+                        </span>
+                      </div>
+                      <span style={{ fontSize: 12, padding: '2px 8px', borderRadius: 999, background: statusStyle.bg, color: statusStyle.color }}>
+                        {statusStyle.label}
+                      </span>
+                    </div>
+                    <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+                      actor: {e.actor === 'storyteller' ? 'AI 说书人' : 'AI 玩家'}
+                      {e.stepId ? ` · step ${e.stepId}` : ''}
+                      {' · '}
+                      model: {e.model}
+                      {typeof e.elapsedMs === 'number' ? ` · ${e.elapsedMs}ms` : ''}
+                    </div>
+                    {e.behavior && <div style={{ marginTop: 8, fontSize: 12 }}>behavior: {e.behavior}</div>}
+                    {e.error && <div style={{ marginTop: 8, fontSize: 12, color: '#ff9fa8' }}>error: {e.error}</div>}
+                  </article>
+                );
+              })
+            )}
+          </div>
         </section>
 
         <section className="card col-6">

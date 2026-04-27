@@ -168,6 +168,35 @@ export function formatFortuneTellerResultForSeat(room, fortuneSeatIndex, targets
     }
     return formatFortuneTellerResult(room, targets);
 }
+function getTroubleBrewingSeatDistribution(playerCount) {
+    switch (playerCount) {
+        case 5:
+            return { townsfolk: 3, outsiders: 0, minions: 1, demons: 1 };
+        case 6:
+            return { townsfolk: 3, outsiders: 1, minions: 1, demons: 1 };
+        case 7:
+            return { townsfolk: 5, outsiders: 0, minions: 1, demons: 1 };
+        case 8:
+            return { townsfolk: 5, outsiders: 1, minions: 1, demons: 1 };
+        case 9:
+            return { townsfolk: 5, outsiders: 2, minions: 1, demons: 1 };
+        case 10:
+            return { townsfolk: 7, outsiders: 0, minions: 2, demons: 1 };
+        case 11:
+            return { townsfolk: 7, outsiders: 1, minions: 2, demons: 1 };
+        case 12:
+            return { townsfolk: 7, outsiders: 2, minions: 2, demons: 1 };
+        case 13:
+            return { townsfolk: 9, outsiders: 0, minions: 3, demons: 1 };
+        case 14:
+            return { townsfolk: 9, outsiders: 1, minions: 3, demons: 1 };
+        case 15:
+            return { townsfolk: 9, outsiders: 2, minions: 3, demons: 1 };
+        default:
+            // 兜底仅用于异常人数，常规流程应始终落在 5~15。
+            return { townsfolk: 3, outsiders: 0, minions: 1, demons: 1 };
+    }
+}
 /** 根据人数生成本局角色池（暗流涌动简化：固定比例） */
 export function assignRoles(room) {
     const n = room.players.length;
@@ -176,29 +205,20 @@ export function assignRoles(room) {
     const outsiders = script.characters.filter((c) => c.type === 'outsider');
     const minions = script.characters.filter((c) => c.type === 'minion');
     const demons = script.characters.filter((c) => c.type === 'demon');
-    let numOutsiders = 0;
-    if (n <= 6)
-        numOutsiders = 0;
-    else if (n <= 9)
-        numOutsiders = 1;
-    else if (n <= 12)
-        numOutsiders = 2;
-    else
-        numOutsiders = 3;
-    const numEvil = n <= 6 ? 1 : 2;
-    const numMinions = numEvil - 1;
-    const numTownsfolk = n - numOutsiders - numEvil;
+    const distribution = getTroubleBrewingSeatDistribution(n);
     const pool = [];
-    for (let i = 0; i < numTownsfolk; i++) {
+    for (let i = 0; i < distribution.townsfolk; i++) {
         pool.push(townsfolk[i % townsfolk.length].id);
     }
-    for (let i = 0; i < numOutsiders; i++) {
+    for (let i = 0; i < distribution.outsiders; i++) {
         pool.push(outsiders[i % outsiders.length].id);
     }
-    for (let i = 0; i < numMinions; i++) {
+    for (let i = 0; i < distribution.minions; i++) {
         pool.push(minions[i % minions.length].id);
     }
-    pool.push(demons[0].id);
+    for (let i = 0; i < distribution.demons; i++) {
+        pool.push(demons[i % demons.length].id);
+    }
     shuffle(pool);
     room.players.forEach((p, i) => {
         p.characterId = pool[i];

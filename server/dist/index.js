@@ -945,7 +945,7 @@ function tickFlowDirector(roomId, room) {
         maybeAdvanceStructuredDay(roomId, room);
         enforceProgressFallback(roomId, room);
     }
-    if (hasAiPlayerEnabled && room.phase === 'day') {
+    if (room.aiStorytellerEnabled && hasAiPlayerEnabled && room.phase === 'day') {
         maybeAiTakeoverDay(roomId, room);
     }
     if (room.aiStorytellerEnabled && (room.phase === 'night' || room.phase === 'first_night')) {
@@ -1118,11 +1118,20 @@ function toTraceText(v, maxLen = 50000) {
     }
 }
 function sendAiTrace(roomId, seatIndex, entry) {
-    if (seatIndex == null) {
-        broadcast(roomId, { type: 'ai_trace', entry });
+    // 严格隔离：
+    // - 玩家视角：仅可见自己座位的 AI 调用记录；
+    // - 上帝管理员视角：admin 连接仅可见“说书人（seatIndex=null）”调用记录。
+    if (seatIndex != null) {
+        sendToSeat(roomId, seatIndex, { type: 'ai_trace', entry });
         return;
     }
-    sendToSeat(roomId, seatIndex, { type: 'ai_trace', entry });
+    wss.clients?.forEach((ws) => {
+        if (ws.roomId !== roomId || ws.readyState !== 1)
+            return;
+        if (!ws.isAdmin)
+            return;
+        ws.send(JSON.stringify({ type: 'ai_trace', entry }));
+    });
 }
 function toFullPromptDebugText(e) {
     return JSON.stringify({
@@ -2408,6 +2417,9 @@ setInterval(async () => {
         tickFlowDirector(rid, room);
         // AI 玩家托管：按阶段编排；夜晚仅 `decideAiPlayerNightTargets`（只含 night_action）
         // - 白天：每座位每白天最多 1 次 LLM（day_plan）→ 私聊→公聊→提名/投票
+        // 关键边界：只有开启 AI 说书人接管时，才允许 AI 玩家自动推进动作。
+        if (!room.aiStorytellerEnabled)
+            continue;
         for (const p of room.players) {
             const seatIndex = p.seatIndex;
             if (!(room.aiPlayerEnabledBySeat.get(seatIndex) ?? false))
