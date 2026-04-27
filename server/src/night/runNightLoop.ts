@@ -104,7 +104,7 @@ export async function runNightLoop(roomId: string, room: Room, options: RunNight
       )) as any;
       let decision = raw;
       if (seat != null && raw && Array.isArray(raw.players) && raw.players.length === 2 && typeof raw.characterId === 'string') {
-        decision = distortWasherLibrarianInvestigatorDecision(room, stepId, seat, { players: raw.players, characterId: raw.characterId });
+        decision = distortWasherLibrarianInvestigatorDecision(room, seat, { players: raw.players, characterId: raw.characterId });
       }
       options.onStorytellerDebug?.({
         roomId,

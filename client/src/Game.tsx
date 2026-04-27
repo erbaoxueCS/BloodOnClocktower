@@ -693,21 +693,28 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
         {lastSendError && <span className="pill status-danger">{lastSendError}</span>}
       </div>
 
-      {aiTraceEntries.length > 0 && (
-        <section className="card" style={{ marginTop: 16 }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-            <div>
-              <h3 style={{ margin: 0 }}>AI 调用记录（本座位）</h3>
-              <p className="muted" style={{ marginTop: 6 }}>
-                对局中所有 AI 调用都会保留；对局结束后仍可导出 JSON 用于 Prompt 复盘。
-              </p>
-            </div>
-            <button type="button" onClick={exportAiTraceJson}>导出日志 JSON</button>
+      <section className="card" style={{ marginTop: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+          <div>
+            <h3 style={{ margin: 0 }}>AI 调用记录（本座位）</h3>
+            <p className="muted" style={{ marginTop: 6 }}>
+              对局中所有 AI 调用都会保留；对局结束后仍可导出 JSON 用于 Prompt 复盘。
+            </p>
           </div>
+          <button type="button" onClick={exportAiTraceJson} disabled={aiTraceEntries.length === 0}>
+            导出日志 JSON
+          </button>
+        </div>
+        <p className="muted" style={{ marginTop: 8 }}>
+          当前筛选后 {filteredAiTraceEntries.length} / 总计 {aiTraceEntries.length} 条
+          {aiTraceEntries.length > 0 ? ` · 最近一条：${new Date(aiTraceEntries[aiTraceEntries.length - 1].at).toLocaleTimeString()}` : ' · 暂无调用记录'}
+        </p>
+        {aiTraceEntries.length === 0 ? (
           <p className="muted" style={{ marginTop: 8 }}>
-            当前筛选后 {filteredAiTraceEntries.length} / 总计 {aiTraceEntries.length} 条
-            {aiTraceEntries.length > 0 ? ` · 最近一条：${new Date(aiTraceEntries[aiTraceEntries.length - 1].at).toLocaleTimeString()}` : ''}
+            还没有收到 AI 调用事件。先开启 AI 托管或 AI 说书人并推进一轮流程后，这里会实时出现记录。
           </p>
+        ) : (
+        <div>
           {room.status === 'ended' && endedAiCallStats && (
             <div style={{ marginTop: 8, border: '1px solid #333', borderRadius: 8, padding: 10, background: '#0f172a' }}>
               <div style={{ fontSize: 13, fontWeight: 600 }}>
@@ -988,8 +995,9 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
               </div>
             </section>
           )}
-        </section>
-      )}
+        </div>
+        )}
+      </section>
 
       {room.status === 'lobby' && (
         <section className="card" style={{ marginTop: 16 }}>

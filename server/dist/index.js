@@ -5,14 +5,17 @@ import { WebSocketServer } from 'ws';
 import { createRoom, getRoom, joinRoom, getRoomView, setReady, bindConnection, unbindConnection, rooms } from './game/roomManager.js';
 import { buildYourRolePayload } from './game/yourRole.js';
 import { startGame, getCurrentNightStep, nominate, skipNomination, vote, tallyVotes, maybeFinishDay, submitNightAction, computeChefPairsForSeat, computeEmpathCountForSeat, formatUndertakerInfoForSeat, formatWasherLibrarianInvestigator, checkWin, getShownCharacterId, resolveRavenkeeperNightInfo, finishNightAndGotoDay } from './game/gameEngine.js';
-import { getStorytellerLlmKeyInfo, storytellerLlmSelfTest, getStorytellerMediatedNightTargets, answerPostGameQuestion } from './ai/storyteller.js';
-import { aiPlayerLlmAvailable, decideAiPlayerDayPlan, decideAiPlayerNightTargets, getAiPlayerLlmKeyInfo, aiPlayerLlmSelfTest, answerPostGamePlayerQuestion } from './ai/playerAgent.js';
+import { getStorytellerLlmKeyInfo, storytellerLlmSelfTest, answerPostGameQuestion } from './ai/storyteller.js';
+import { aiPlayerLlmAvailable, decideAiPlayerDayPlan, decideAiPlayerNightTargets, getAiPlayerLlmKeyInfo, aiPlayerLlmSelfTest, answerPostGamePlayerQuestion, refineAiPlayerMemorySummary } from './ai/playerAgent.js';
 import { runNightLoop as runAutomatedNightLoop } from './night/runNightLoop.js';
 import { pushReplay, buildReplayBundle, seatLabel, pushPublic } from './game/replay.js';
 import { troubleBrewing } from './script/troubleBrewing.js';
 import { createInvocation, updateInvocation } from './ai/invocationLog.js';
 function normalizeGodQuery(text) {
     return text.trim().replace(/\s+/g, '');
+}
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
 }
 function makeDeterministicGodReply(room, seatIndex, queryRaw) {
     const query = normalizeGodQuery(queryRaw);
@@ -56,6 +59,23 @@ function pushChat(room, entry) {
     room.chatLog.push(full);
     if (room.chatLog.length > 500)
         room.chatLog = room.chatLog.slice(-500);
+    const line = full.scope === 'dm'
+        ? `私聊 #${full.fromSeat + 1}${typeof full.toSeat === 'number' ? `->#${full.toSeat + 1}` : ''}：${full.text.slice(0, 120)}`
+        : full.scope === 'god'
+            ? `上帝问答 #${full.fromSeat + 1}：${full.text.slice(0, 120)}`
+            : `公开发言 #${full.fromSeat + 1}：${full.text.slice(0, 120)}`;
+    if (full.scope === 'public') {
+        appendAiMemoryLine(room, room.players.map((p) => p.seatIndex), line);
+    }
+    else if (full.scope === 'dm') {
+        const seats = [full.fromSeat];
+        if (typeof full.toSeat === 'number')
+            seats.push(full.toSeat);
+        appendAiMemoryLine(room, seats, line);
+    }
+    else {
+        appendAiMemoryLine(room, [full.fromSeat], line);
+    }
     return full;
 }
 function broadcastChat(roomId, entry) {
@@ -115,9 +135,17 @@ app.get('/api/dev/llm/health', (_req, res) => {
     const isProd = process.env.NODE_ENV === 'production';
     if (isProd)
         return res.status(404).json({ error: 'Not found' });
+    const storytellerFlag = process.env.USE_AI_STORYTELLER === 'true' || process.env.USE_AI_STORYTELLER === '1';
+    const aiPlayerFlagRaw = String(process.env.USE_AI_PLAYER ?? '').trim().toLowerCase();
+    const aiPlayerFlag = aiPlayerFlagRaw ? (aiPlayerFlagRaw === 'true' || aiPlayerFlagRaw === '1') : true;
     res.json({
         storyteller: getStorytellerLlmKeyInfo(),
         aiPlayer: getAiPlayerLlmKeyInfo(),
+        flags: {
+            useAiStoryteller: storytellerFlag,
+            useAiPlayer: aiPlayerFlag,
+            rawUseAiPlayer: process.env.USE_AI_PLAYER ?? null,
+        },
         baseUrl: (process.env.OPENAI_BASE_URL ?? 'https://dashscope.aliyuncs.com/compatible-mode').replace(/\/+$/, ''),
         model: process.env.OPENAI_MODEL ?? 'qwen3.5-plus',
     });
@@ -210,6 +238,230 @@ app.post('/api/dev/quickstart', async (req, res) => {
     const adminUrl = `${base}/?admin=1&roomId=${encodeURIComponent(room.id)}&hostSecret=${encodeURIComponent(room.hostSecret)}`;
     res.json({ roomId: room.id, hostSecret: room.hostSecret, players, joinUrls, adminUrl, started: start });
 });
+function buildAutoTestTimeoutSnapshot(room) {
+    return {
+        phase: room.phase,
+        dayNumber: room.dayNumber,
+        daySubPhase: room.daySubPhase,
+        dayFlowStage: room.dayFlowStage,
+        directorBlock: directorBlockSummary(room),
+        currentNomination: room.currentNomination,
+        pendingNightAction: room.pendingNightAction
+            ? {
+                stepId: room.pendingNightAction.stepId,
+                actorSeatIndex: room.pendingNightAction.actorSeatIndex,
+                pick: room.pendingNightAction.pick,
+            }
+            : null,
+        awaitingNightConfirm: room.awaitingNightConfirm,
+        aliveSeats: room.players.filter((p) => p.isAlive).map((p) => p.seatIndex),
+        votesCount: room.votes.size,
+        nominationsTodayCount: room.nominationsToday.size,
+        skippedNominationsTodayCount: room.skippedNominationsToday.size,
+        lastPublicLogTail: room.publicLog.slice(-12).map((x) => x.line),
+    };
+}
+function summarizeAutoTestGame(room, durationMs, timedOut, promptStyle, timeoutSnapshot) {
+    const winner = checkWin(room);
+    const replayLines = room.replayLog.map((x) => x.line);
+    const publicLines = room.publicLog.map((x) => x.line);
+    const fallbackEvents = publicLines.filter((x) => x.includes('兜底推进')).length;
+    const noExecutionDays = replayLines.filter((x) => x.includes('今日无人被处决')).length;
+    const totalExecutions = replayLines.filter((x) => x.includes('处决执行：') && x.includes('死亡')).length;
+    const totalNightDeaths = replayLines.filter((x) => x.includes('昨夜死亡')).length;
+    const totalNominations = publicLines.filter((x) => x.includes(' 提名 ')).length;
+    const voteResultLines = publicLines.filter((x) => x.includes('投票结束：'));
+    const totalVoteRounds = voteResultLines.length;
+    const passedVoteRounds = voteResultLines.filter((x) => x.includes('达到处决条件')).length;
+    const votesForList = voteResultLines
+        .map((x) => {
+        const m = x.match(/赞成\s+(\d+)\s+票/);
+        return m ? Number(m[1]) : null;
+    })
+        .filter((x) => Number.isFinite(x));
+    const avgVotesFor = votesForList.length > 0 ? votesForList.reduce((s, n) => s + n, 0) / votesForList.length : 0;
+    const notes = [];
+    if (fallbackEvents >= 2)
+        notes.push('白天多次触发兜底推进，说明 AI 白天决策或节奏控制偏弱。');
+    if (noExecutionDays >= 2)
+        notes.push('无人处决日较多，可能导致信息推进不足。');
+    if (totalNominations <= Math.max(1, room.dayNumber - 1))
+        notes.push('提名密度偏低，白天推进略保守。');
+    if (winner === 'evil' && room.dayNumber <= 2)
+        notes.push('邪恶方过快获胜，善良信息链可能不足。');
+    if (winner === 'good' && room.dayNumber <= 2)
+        notes.push('善良方过快获胜，邪恶抗压与伪装链可能偏弱。');
+    if (timedOut)
+        notes.push('对局超时，存在流程卡顿风险。');
+    return {
+        roomId: room.id,
+        playerCount: room.players.length,
+        promptStyle,
+        winner,
+        dayNumber: room.dayNumber,
+        ended: room.status === 'ended',
+        timedOut,
+        durationMs,
+        fallbackEvents,
+        noExecutionDays,
+        totalExecutions,
+        totalNightDeaths,
+        totalNominations,
+        totalVoteRounds,
+        passedVoteRounds,
+        avgVotesFor,
+        timeoutSnapshot,
+        notes,
+    };
+}
+function buildAutoTestRecommendations(games) {
+    if (games.length === 0)
+        return ['没有可分析的对局数据。'];
+    const avgFallback = games.reduce((s, g) => s + g.fallbackEvents, 0) / games.length;
+    const avgNoExec = games.reduce((s, g) => s + g.noExecutionDays, 0) / games.length;
+    const avgNominations = games.reduce((s, g) => s + g.totalNominations, 0) / games.length;
+    const avgVoteRounds = games.reduce((s, g) => s + g.totalVoteRounds, 0) / games.length;
+    const avgVotePassRate = games.reduce((s, g) => s + (g.totalVoteRounds > 0 ? g.passedVoteRounds / g.totalVoteRounds : 0), 0) / games.length;
+    const evilWins = games.filter((g) => g.winner === 'evil').length;
+    const goodWins = games.filter((g) => g.winner === 'good').length;
+    const timedOut = games.filter((g) => g.timedOut).length;
+    const recs = [];
+    if (avgFallback >= 1.5) {
+        recs.push('优先优化 AI 白天行动计划质量（提名目标选择与投票意愿），降低兜底推进频率。');
+    }
+    if (avgNoExec >= 1.5) {
+        recs.push('提高“有证据时发起提名”的激进度，减少连续无人处决导致的低信息局。');
+    }
+    if (avgNominations < Math.max(1.5, avgVoteRounds)) {
+        recs.push('提名轮次偏少：可在提示词中提升“形成候选池并收敛目标”的优先级。');
+    }
+    if (avgVotePassRate < 0.45) {
+        recs.push('投票通过率偏低：建议在提示词中强化“围绕主推目标集中举票，避免分票”。');
+    }
+    if (evilWins >= goodWins + 2) {
+        recs.push('善良方偏弱：应加强信息位公开策略与协同投票逻辑。');
+    }
+    if (goodWins >= evilWins + 2) {
+        recs.push('邪恶方偏弱：应加强邪恶方伪装与误导策略，避免早期暴露。');
+    }
+    if (timedOut > 0) {
+        recs.push('存在超时局：建议增加夜间/白天卡点日志并缩短无效等待窗口。');
+    }
+    if (recs.length === 0) {
+        recs.push('当前自动对局总体可闭环，下一步建议聚焦角色规则一致性（Baron/Spy/Mayor/Saint）以提升真实性。');
+    }
+    return recs;
+}
+// 开发辅助：后台自动跑多局（全员 AI 托管 + AI 说书人）并输出对局分析
+app.post('/api/dev/autotest/run', async (req, res) => {
+    const isProd = process.env.NODE_ENV === 'production';
+    if (isProd)
+        return res.status(404).json({ error: 'Not found' });
+    const scriptId = req.body?.scriptId || troubleBrewing.id;
+    const roundsRaw = req.body?.rounds;
+    const rounds = Number.isInteger(roundsRaw) ? Math.max(1, Math.min(20, Number(roundsRaw))) : 3;
+    const playerCountRaw = req.body?.playerCount;
+    const playerCount = Number.isInteger(playerCountRaw) ? Math.max(5, Math.min(15, Number(playerCountRaw))) : 7;
+    const perGameTimeoutMsRaw = req.body?.perGameTimeoutMs;
+    const perGameTimeoutMs = Number.isInteger(perGameTimeoutMsRaw) ? Math.max(30_000, Math.min(15 * 60_000, Number(perGameTimeoutMsRaw))) : 3 * 60_000;
+    const promptStyleRaw = String(req.body?.playerPromptStyle ?? process.env.AI_PLAYER_PROMPT_STYLE ?? 'balanced').trim().toLowerCase();
+    const allowedStyles = new Set(['balanced', 'assertive', 'deceptive', 'chaotic', 'mixed']);
+    const promptStyle = allowedStyles.has(promptStyleRaw) ? promptStyleRaw : 'balanced';
+    const startedAt = Date.now();
+    const games = [];
+    for (let i = 0; i < rounds; i++) {
+        const room = createRoom(scriptId);
+        const styleBySeat = new Map();
+        for (let s = 0; s < playerCount; s++) {
+            const nickname = `AutoBot${i + 1}-${s + 1}`;
+            const joined = joinRoom(room.id, nickname);
+            if (!joined)
+                break;
+            setReady(room, joined.seatIndex, true);
+            room.aiPlayerEnabledBySeat.set(joined.seatIndex, true);
+            room.aiPlayerTemperatureBySeat.set(joined.seatIndex, 0.5);
+            const stylePool = ['balanced', 'assertive', 'deceptive', 'chaotic'];
+            const seatStyle = promptStyle === 'mixed'
+                ? stylePool[(joined.seatIndex + i) % stylePool.length]
+                : promptStyle;
+            styleBySeat.set(joined.seatIndex, seatStyle);
+        }
+        room.storytellerDecisions.set('ai_player_prompt_style', promptStyle);
+        room.storytellerDecisions.set('ai_player_prompt_style_by_seat', styleBySeat);
+        room.aiStorytellerEnabled = true;
+        room.aiLastActionAt = 0;
+        const ok = startGame(room);
+        if (!ok) {
+            games.push({
+                roomId: room.id,
+                playerCount: room.players.length,
+                promptStyle,
+                winner: null,
+                dayNumber: room.dayNumber,
+                ended: false,
+                timedOut: true,
+                durationMs: 0,
+                fallbackEvents: 0,
+                noExecutionDays: 0,
+                totalExecutions: 0,
+                totalNightDeaths: 0,
+                totalNominations: 0,
+                totalVoteRounds: 0,
+                passedVoteRounds: 0,
+                avgVotesFor: 0,
+                notes: ['开局失败（人数或准备状态不满足）。'],
+            });
+            continue;
+        }
+        pushReplay(room, 'setup', '自动测试', `自动测试开局：第 ${i + 1}/${rounds} 局，${room.players.length} 人。`);
+        pushPublic(room, `自动测试开局：第 ${i + 1}/${rounds} 局。`);
+        const gameStartedAt = Date.now();
+        const phaseBeforeLoop = room.phase;
+        await runNightLoopExclusive(room.id, room);
+        if (room.status !== 'ended') {
+            if (room.phase === 'first_night')
+                sendEvilInfo(room.id, room);
+            sendNightPrompt(room.id, room);
+        }
+        broadcastAfterNight(room.id, room, phaseBeforeLoop);
+        broadcastNightConfirm(room.id, room);
+        let timedOut = false;
+        while (room.status !== 'ended') {
+            if (Date.now() - gameStartedAt > perGameTimeoutMs) {
+                timedOut = true;
+                break;
+            }
+            await sleep(800);
+        }
+        const timeoutSnapshot = timedOut ? buildAutoTestTimeoutSnapshot(room) : undefined;
+        games.push(summarizeAutoTestGame(room, Date.now() - gameStartedAt, timedOut, promptStyle, timeoutSnapshot));
+    }
+    const recs = buildAutoTestRecommendations(games);
+    const aggregate = {
+        avgDurationMs: games.length > 0 ? games.reduce((s, g) => s + g.durationMs, 0) / games.length : 0,
+        avgNoExecutionDays: games.length > 0 ? games.reduce((s, g) => s + g.noExecutionDays, 0) / games.length : 0,
+        avgNominations: games.length > 0 ? games.reduce((s, g) => s + g.totalNominations, 0) / games.length : 0,
+        avgVotePassRate: games.length > 0
+            ? games.reduce((s, g) => s + (g.totalVoteRounds > 0 ? g.passedVoteRounds / g.totalVoteRounds : 0), 0) / games.length
+            : 0,
+        winners: {
+            good: games.filter((g) => g.winner === 'good').length,
+            evil: games.filter((g) => g.winner === 'evil').length,
+            unknown: games.filter((g) => g.winner == null).length,
+        },
+        timedOutRoomIds: games.filter((g) => g.timedOut).map((g) => g.roomId),
+    };
+    return res.json({
+        rounds,
+        scriptId,
+        playerCount,
+        promptStyle,
+        elapsedMs: Date.now() - startedAt,
+        aggregate,
+        games,
+        recommendations: recs,
+    });
+});
 // 开发辅助：快速“进入已存在座位”（quickstart 先加人再开局时，新标签页不能再走 /join）
 app.post('/api/dev/take-seat', (req, res) => {
     const isProd = process.env.NODE_ENV === 'production';
@@ -227,6 +479,30 @@ app.post('/api/dev/take-seat', (req, res) => {
         return res.status(404).json({ error: 'Seat not found' });
     const view = getRoomView(room);
     res.json({ roomId: rid, seatIndex, room: view });
+});
+// 开发辅助：读取裁定链路日志（intent -> adjudication -> apply）
+app.get('/api/dev/adjudication-log', (req, res) => {
+    const isProd = process.env.NODE_ENV === 'production';
+    if (isProd)
+        return res.status(404).json({ error: 'Not found' });
+    const roomId = String(req.query.roomId ?? '').trim();
+    if (!roomId)
+        return res.status(400).json({ error: 'roomId required' });
+    const room = getRoom(roomId);
+    if (!room)
+        return res.status(404).json({ error: 'Room not found' });
+    const limitRaw = Number(req.query.limit ?? 200);
+    const entries = getAdjudicationLogView(room, Number.isFinite(limitRaw) ? limitRaw : 200);
+    res.json({
+        roomId: room.id,
+        status: room.status,
+        phase: room.phase,
+        dayNumber: room.dayNumber,
+        aiStorytellerEnabled: room.aiStorytellerEnabled,
+        total: getAdjudicationLog(room).length,
+        returned: entries.length,
+        entries,
+    });
 });
 /**
  * 复盘用的「第几夜」与引擎里 dayNumber 对齐方式：
@@ -260,6 +536,7 @@ function sendNightInfo(roomId, room, seatIndex, message) {
     const prev = log.get(seatIndex) ?? [];
     prev.push(message);
     log.set(seatIndex, prev.slice(-NIGHT_INFO_LOG_LIMIT));
+    appendAiMemoryLine(room, [seatIndex], `夜间信息：${message.slice(0, 140)}`);
     sendToSeat(roomId, seatIndex, { type: 'night_info', message });
 }
 function buildNightLoopOptions(roomId, room) {
@@ -366,13 +643,14 @@ const FALLBACK_NIGHT_ACTION_TIMEOUT_MS = Number(process.env.FALLBACK_NIGHT_ACTIO
 const FALLBACK_NIGHT_CONFIRM_TIMEOUT_MS = Number(process.env.FALLBACK_NIGHT_CONFIRM_TIMEOUT_MS ?? '') || 45_000;
 const FALLBACK_DAY_VOTE_TIMEOUT_MS = Number(process.env.FALLBACK_DAY_VOTE_TIMEOUT_MS ?? '') || 60_000;
 const FALLBACK_DAY_TURN_TIMEOUT_MS = Number(process.env.FALLBACK_DAY_TURN_TIMEOUT_MS ?? '') || 60_000;
+const DAY_PUBLIC_SPEECH_WAIT_TIMEOUT_MS = Number(process.env.DAY_PUBLIC_SPEECH_WAIT_TIMEOUT_MS ?? '') || 15_000;
 const DAY_FLOW_STAGES = [
     'god_dialogue',
     'private_dialogue',
     'public_speech',
     'nomination_vote',
 ];
-const NIGHT_MEDIATED_STEP_IDS = new Set(['imp', 'monk', 'poisoner', 'fortune_teller']);
+const NIGHT_PLAYER_ACTION_STEP_IDS = new Set(['imp', 'monk', 'poisoner', 'fortune_teller']);
 function directorBlockSummary(room) {
     if (room.status !== 'playing')
         return 'not_playing';
@@ -423,6 +701,15 @@ function orderedAliveSeats(room, startSeat) {
     const idx = alive.indexOf(startSeat);
     return [...alive.slice(idx), ...alive.slice(0, idx)];
 }
+function orderedDiscussionSeats(room, startSeat) {
+    const seats = room.players.map((p) => p.seatIndex).sort((a, b) => a - b);
+    if (seats.length === 0)
+        return [];
+    if (startSeat == null || !seats.includes(startSeat))
+        return seats;
+    const idx = seats.indexOf(startSeat);
+    return [...seats.slice(idx), ...seats.slice(0, idx)];
+}
 function getDayFlowDoneSet(room, stage) {
     const key = `day_flow_done_${room.dayNumber}_${stage}`;
     const v = room.storytellerDecisions.get(key);
@@ -453,8 +740,27 @@ function appendBehavior(roomId, room, seatIndex, traceId, part) {
     if (rec)
         sendAiTrace(roomId, seatIndex, rec);
 }
-function isNightMediatedStepId(stepId) {
-    return NIGHT_MEDIATED_STEP_IDS.has(stepId);
+function isNightPlayerActionStepId(stepId) {
+    return NIGHT_PLAYER_ACTION_STEP_IDS.has(stepId);
+}
+function validateNightTargetsForPending(room, pending, targets) {
+    if (!isNightPlayerActionStepId(pending.stepId))
+        return 'unsupported_step';
+    if (!Array.isArray(targets) || targets.length !== pending.pick)
+        return 'invalid_target_count_or_type';
+    if (targets.some((t) => !Number.isInteger(t)))
+        return 'invalid_target_count_or_type';
+    const aliveSeats = new Set(room.players.filter((p) => p.isAlive).map((p) => p.seatIndex));
+    for (const t of targets) {
+        if (!aliveSeats.has(t))
+            return 'invalid_target';
+    }
+    if (pending.stepId === 'monk' && targets[0] === pending.actorSeatIndex)
+        return 'monk_cannot_target_self';
+    if (pending.stepId === 'fortune_teller' && targets.length === 2 && targets[0] === targets[1]) {
+        return 'fortune_teller_targets_must_be_distinct';
+    }
+    return null;
 }
 function moveToNextDayFlowStage(room) {
     if (room.dayFlowStage == null)
@@ -489,13 +795,44 @@ function maybeAdvanceStructuredDay(roomId, room) {
     if (room.currentNomination)
         return;
     const stage = room.dayFlowStage;
-    const queue = orderedAliveSeats(room, room.dayFlowStartSeat);
+    const queue = orderedDiscussionSeats(room, room.dayFlowStartSeat);
     const done = getDayFlowDoneSet(room, stage);
     if (queue.length === 0)
         return;
     const cursor = Math.max(0, Math.min(getDayFlowCursor(room, stage), queue.length - 1));
     const actor = queue[cursor];
     if (!done.has(actor)) {
+        if (stage === 'public_speech') {
+            const pubMarkKey = `ai_day_public_done_${room.dayNumber}_seat_${actor}`;
+            const spoken = room.storytellerDecisions.get(pubMarkKey) === true;
+            const waitKey = `day_flow_wait_since_${room.dayNumber}_${stage}_${actor}`;
+            const now = Date.now();
+            const waitSinceRaw = Number(room.storytellerDecisions.get(waitKey) ?? 0);
+            const waitSince = Number.isFinite(waitSinceRaw) && waitSinceRaw > 0 ? waitSinceRaw : now;
+            if (!spoken) {
+                room.storytellerDecisions.set(waitKey, waitSince);
+                const waited = now - waitSince;
+                if (waited < DAY_PUBLIC_SPEECH_WAIT_TIMEOUT_MS) {
+                    broadcast(roomId, { type: 'room', room: getRoomView(room) });
+                    return;
+                }
+                const fallbackText = buildForcedActiveDayPlan(room, actor).public.text;
+                if (fallbackText) {
+                    const entry = pushChat(room, {
+                        at: now,
+                        scope: 'public',
+                        phase: room.phase,
+                        dayNumber: room.dayNumber,
+                        fromSeat: actor,
+                        text: fallbackText.slice(0, 500),
+                    });
+                    pushPublic(room, `公开发言（超时兜底）：${seatLabel(room, actor)}：${fallbackText.slice(0, 500)}`);
+                    broadcastChat(roomId, entry);
+                }
+                room.storytellerDecisions.set(pubMarkKey, true);
+            }
+            room.storytellerDecisions.set(waitKey, 0);
+        }
         done.add(actor);
         if (stage === 'god_dialogue') {
             pushPublic(room, `白天流程：${seatLabel(room, actor)} 完成上帝问答。`);
@@ -555,7 +892,7 @@ function enforceProgressFallback(roomId, room) {
             targets.push(remain[Math.floor(Math.random() * remain.length)]);
         }
         if (targets.length === pending.pick) {
-            const result = submitNightAction(room, actor, targets);
+            const result = adjudicateAndApplyNightAction(room, actor, targets, 'storyteller_fallback');
             if (result.ok) {
                 pushPublic(room, `兜底推进：${seatLabel(room, actor)} 夜晚超时，系统自动提交行动。`);
                 broadcast(roomId, { type: 'room', room: getRoomView(room) });
@@ -601,13 +938,18 @@ function enforceProgressFallback(roomId, room) {
 /** 流程辅助（计时推进投票结算、无阻塞时推进夜序）：与 Grimoire LLM 说书人裁量解耦；`maybeFinishDay` 仍在各座位逻辑之后由宿主调用 */
 function tickFlowDirector(roomId, room) {
     maybeLogDirectorDebug(roomId, room);
-    maybeAdvanceStructuredDay(roomId, room);
-    enforceProgressFallback(roomId, room);
+    const hasAiPlayerEnabled = room.players.some((p) => room.aiPlayerEnabledBySeat.get(p.seatIndex) === true);
+    // 关键边界：只有“AI 说书人接管”时，系统才自动导演流程与兜底推进。
+    // 若关闭 AI 说书人，即使存在 AI 玩家，也不应由系统代替说书人自动快进。
     if (room.aiStorytellerEnabled) {
-        if (room.phase === 'day')
-            maybeAiTakeoverDay(roomId, room);
-        else if (room.phase === 'night' || room.phase === 'first_night')
-            void maybeAiTakeoverNight(roomId, room);
+        maybeAdvanceStructuredDay(roomId, room);
+        enforceProgressFallback(roomId, room);
+    }
+    if (hasAiPlayerEnabled && room.phase === 'day') {
+        maybeAiTakeoverDay(roomId, room);
+    }
+    if (room.aiStorytellerEnabled && (room.phase === 'night' || room.phase === 'first_night')) {
+        void maybeAiTakeoverNight(roomId, room);
     }
 }
 const server = createServer(app);
@@ -813,6 +1155,80 @@ function broadcastNightConfirm(roomId, room) {
     });
 }
 const NIGHT_INFO_LOG_LIMIT = 20;
+const AI_MEMORY_LIMIT = 160;
+const AI_MEMORY_SUMMARY_MAX_CHARS = Number(process.env.AI_MEMORY_SUMMARY_MAX_CHARS ?? '') || 1200;
+const AI_MEMORY_SUMMARY_MIN_DELTA = Number(process.env.AI_MEMORY_SUMMARY_MIN_DELTA ?? '') || 3;
+function getAiMemoryBySeat(room) {
+    const k = 'ai_player_memory_by_seat';
+    const v = room.storytellerDecisions.get(k);
+    if (v instanceof Map)
+        return v;
+    const m = new Map();
+    room.storytellerDecisions.set(k, m);
+    return m;
+}
+function getAiMemorySummaryBySeat(room) {
+    const k = 'ai_player_memory_summary_by_seat';
+    const v = room.storytellerDecisions.get(k);
+    if (v instanceof Map)
+        return v;
+    const m = new Map();
+    room.storytellerDecisions.set(k, m);
+    return m;
+}
+function getAiMemorySummaryCursorBySeat(room) {
+    const k = 'ai_player_memory_summary_cursor_by_seat';
+    const v = room.storytellerDecisions.get(k);
+    if (v instanceof Map)
+        return v;
+    const m = new Map();
+    room.storytellerDecisions.set(k, m);
+    return m;
+}
+function appendAiMemoryLine(room, seatIndices, line) {
+    const memory = getAiMemoryBySeat(room);
+    for (const seat of seatIndices) {
+        if (!Number.isInteger(seat) || !room.players[seat])
+            continue;
+        const prev = memory.get(seat) ?? [];
+        prev.push(`[D${room.dayNumber}|${room.phase}] ${line}`);
+        memory.set(seat, prev.slice(-AI_MEMORY_LIMIT));
+    }
+}
+async function maybeRefreshAiMemorySummary(room, seatIndex) {
+    if (!aiPlayerLlmAvailable())
+        return;
+    const memory = getAiMemoryBySeat(room);
+    const summaryBySeat = getAiMemorySummaryBySeat(room);
+    const cursorBySeat = getAiMemorySummaryCursorBySeat(room);
+    const raw = memory.get(seatIndex) ?? [];
+    const prevCursor = Number(cursorBySeat.get(seatIndex) ?? 0);
+    const delta = raw.length - prevCursor;
+    const hasSummary = String(summaryBySeat.get(seatIndex) ?? '').trim().length > 0;
+    if (delta < AI_MEMORY_SUMMARY_MIN_DELTA && hasSummary)
+        return;
+    const inflightKey = `ai_memory_summary_inflight_${seatIndex}`;
+    if (room.storytellerDecisions.get(inflightKey) === true)
+        return;
+    room.storytellerDecisions.set(inflightKey, true);
+    try {
+        const previousSummary = summaryBySeat.get(seatIndex) ?? '';
+        const recentEvents = raw.slice(-40);
+        const next = await refineAiPlayerMemorySummary({
+            seatIndex,
+            previousSummary,
+            recentEvents,
+            maxChars: AI_MEMORY_SUMMARY_MAX_CHARS,
+        });
+        if (String(next).trim()) {
+            summaryBySeat.set(seatIndex, String(next).trim());
+            cursorBySeat.set(seatIndex, raw.length);
+        }
+    }
+    finally {
+        room.storytellerDecisions.set(inflightKey, false);
+    }
+}
 function getNightInfoLogBySeat(room) {
     const k = 'night_info_log_by_seat';
     const v = room.storytellerDecisions.get(k);
@@ -1100,9 +1516,44 @@ function buildRecentVoteEvents(room) {
         .slice(-20)
         .map((e) => e.line);
 }
+function buildAiPlayerMemory(room, seatIndex) {
+    const me = room.players[seatIndex];
+    if (!me)
+        return '无有效座位信息。';
+    const aliveSeats = room.players.filter((p) => p.isAlive).map((p) => `#${p.seatIndex + 1}`);
+    const deadSeats = room.players.filter((p) => !p.isAlive).map((p) => `#${p.seatIndex + 1}`);
+    const myNightInfo = (getNightInfoLogBySeat(room).get(seatIndex) ?? []).slice(-6);
+    const visibleChat = room.chatLog
+        .filter((e) => {
+        if (e.scope === 'public')
+            return true;
+        if (e.scope === 'god')
+            return e.fromSeat === seatIndex;
+        if (e.scope === 'dm')
+            return e.fromSeat === seatIndex || e.toSeat === seatIndex;
+        return false;
+    })
+        .slice(-10)
+        .map((e) => `[${e.scope}] #${e.fromSeat + 1}${typeof e.toSeat === 'number' ? `->#${e.toSeat + 1}` : ''}: ${e.text.slice(0, 70)}`);
+    const publicTail = room.publicLog.slice(-10).map((x) => x.line.slice(0, 90));
+    const memoryTail = (getAiMemoryBySeat(room).get(seatIndex) ?? []).slice(-24);
+    const memorySummary = String(getAiMemorySummaryBySeat(room).get(seatIndex) ?? '').trim();
+    const trustTop = pickTopSuspiciousAlive(room, seatIndex, 3).map((x) => `#${x.seatIndex + 1}(${x.score.toFixed(2)})`);
+    const voteTail = buildRecentVoteEvents(room).slice(-6);
+    return [
+        `你是 #${seatIndex + 1}·${me.nickname}。当前是第 ${room.dayNumber} 天，阶段=${room.phase}/${room.daySubPhase ?? 'none'}。`,
+        `存活：${aliveSeats.join('、') || '无'}；死亡：${deadSeats.join('、') || '无'}。`,
+        `你最近夜间信息：${myNightInfo.length > 0 ? myNightInfo.join(' | ') : '暂无'}`,
+        `你的心路历程摘要（模型整理）：${memorySummary || '暂无'}`,
+        `你的近期原始事件（校验用）：${memoryTail.length > 0 ? memoryTail.join(' || ') : '暂无'}`,
+        `你可见聊天摘要：${visibleChat.length > 0 ? visibleChat.join(' || ') : '暂无'}`,
+        `公共流程摘要：${publicTail.length > 0 ? publicTail.join(' || ') : '暂无'}`,
+        `近期投票事件：${voteTail.length > 0 ? voteTail.join(' || ') : '暂无'}`,
+        `当前高嫌疑目标（内部评分）：${trustTop.length > 0 ? trustTop.join('、') : '暂无明显目标'}`,
+    ].join('\n');
+}
 function buildAiSeatContext(room, seatIndex) {
     const roomView = getRoomView(room, seatIndex, false);
-    const roomViewGlobal = getRoomView(room, seatIndex, true);
     const yourCharacterId = getShownCharacterId(room.players[seatIndex]) ?? null;
     const yourRole = buildYourRolePayload(room, seatIndex);
     const yourAlignment = yourRole?.alignment;
@@ -1113,7 +1564,7 @@ function buildAiSeatContext(room, seatIndex) {
         text: e.text,
         at: e.at,
     }));
-    const allChatLog = (roomViewGlobal.chatLog ?? []).map((e) => ({
+    const allChatLog = (roomView.chatLog ?? []).slice(-120).map((e) => ({
         scope: e.scope,
         fromSeat: e.fromSeat,
         toSeat: e.toSeat,
@@ -1123,7 +1574,16 @@ function buildAiSeatContext(room, seatIndex) {
         phase: e.phase,
     }));
     const nightInfo = (getNightInfoLogBySeat(room).get(seatIndex) ?? []).slice(-NIGHT_INFO_LOG_LIMIT);
-    return { roomView, yourCharacterId, yourRole, yourAlignment, chatLog, allChatLog, nightInfo };
+    const playerMemory = buildAiPlayerMemory(room, seatIndex);
+    const globalStyle = String(room.storytellerDecisions.get('ai_player_prompt_style') ?? process.env.AI_PLAYER_PROMPT_STYLE ?? 'balanced');
+    const styleBySeat = room.storytellerDecisions.get('ai_player_prompt_style_by_seat');
+    let promptStyle = globalStyle;
+    if (styleBySeat instanceof Map) {
+        const seatStyle = styleBySeat.get(seatIndex);
+        if (typeof seatStyle === 'string' && seatStyle.trim())
+            promptStyle = seatStyle;
+    }
+    return { roomView, yourCharacterId, yourRole, yourAlignment, chatLog, allChatLog, playerMemory, nightInfo, promptStyle };
 }
 function shouldVoteInFavorByPriority(room, seatIndex, nominatedSeat, explicitPriority) {
     const priority = explicitPriority && explicitPriority.length > 0
@@ -1135,13 +1595,188 @@ function shouldVoteInFavorByPriority(room, seatIndex, nominatedSeat, explicitPri
     const trust = getAiTrustScores(room, seatIndex).get(nominatedSeat) ?? 0;
     return trust <= threshold;
 }
+function getAdjudicationLog(room) {
+    const k = 'adjudication_log';
+    const v = room.storytellerDecisions.get(k);
+    if (Array.isArray(v))
+        return v;
+    const out = [];
+    room.storytellerDecisions.set(k, out);
+    return out;
+}
+function appendAdjudicationRecord(room, rec) {
+    const log = getAdjudicationLog(room);
+    log.push(rec);
+    if (log.length > 800)
+        log.splice(0, log.length - 800);
+}
+function getAdjudicationLogView(room, limit = 200) {
+    const n = Math.max(1, Math.min(1000, Number(limit) || 200));
+    const log = getAdjudicationLog(room);
+    if (log.length <= n)
+        return [...log];
+    return log.slice(log.length - n);
+}
+function resolveAdjudicator(room) {
+    const adjudicateNominationByRules = (params) => {
+        const ok = nominate(params.room, params.actorSeat, params.targetSeat);
+        return ok
+            ? { ok: true, appliedTargetSeat: params.targetSeat, rationale: 'rules_engine_nomination_apply_intent' }
+            : { ok: false, error: 'nomination_rejected_by_rules' };
+    };
+    const adjudicateVoteByRules = (params) => {
+        const ok = vote(params.room, params.actorSeat, params.inFavor);
+        return ok
+            ? { ok: true, appliedInFavor: params.inFavor, rationale: 'rules_engine_vote_apply_intent' }
+            : { ok: false, error: 'vote_rejected_by_rules' };
+    };
+    const adjudicateNominationByStorytellerPolicy = (params) => {
+        // 当前策略：提名按玩家意图执行，后续可扩展为“平衡局势”裁量器。
+        return adjudicateNominationByRules(params);
+    };
+    const adjudicateVoteByStorytellerPolicy = (params) => {
+        // 当前策略：投票按玩家意图执行，后续可扩展为“异常票型干预”裁量器。
+        return adjudicateVoteByRules(params);
+    };
+    const adjudicateNightActionByRules = (params) => {
+        const pending = params.room.pendingNightAction;
+        if (!pending)
+            return { ok: false, error: 'no_pending_night_action' };
+        if (pending.actorSeatIndex !== params.actorSeat)
+            return { ok: false, error: 'not_your_turn' };
+        const validationError = validateNightTargetsForPending(params.room, pending, params.targets);
+        if (validationError)
+            return { ok: false, error: validationError };
+        const result = submitNightAction(params.room, params.actorSeat, params.targets);
+        return { ...result, appliedTargets: params.targets, rationale: 'rules_engine_apply_player_intent' };
+    };
+    const adjudicateNightActionByStorytellerPolicy = (params) => {
+        const pending = params.room.pendingNightAction;
+        if (!pending)
+            return { ok: false, error: 'no_pending_night_action' };
+        if (pending.actorSeatIndex !== params.actorSeat)
+            return { ok: false, error: 'not_your_turn' };
+        const validationError = validateNightTargetsForPending(params.room, pending, params.targets);
+        if (validationError)
+            return { ok: false, error: validationError };
+        let finalTargets = params.targets.slice();
+        let rationale = 'storyteller_ai_keep_player_intent';
+        // 规则内裁量策略（可替换为更复杂策略）：恶魔夜刀默认不允许“无收益自刀”
+        // 若玩家选择自刀且当前无存活爪牙可继承，则改为随机其他存活目标。
+        if (pending.stepId === 'imp' && finalTargets.length === 1 && finalTargets[0] === params.actorSeat) {
+            const aliveMinionExists = params.room.players.some((p) => {
+                if (!p.isAlive)
+                    return false;
+                const cid = p.characterId ?? '';
+                return ['poisoner', 'spy', 'baron', 'scarlet_woman'].includes(cid);
+            });
+            if (!aliveMinionExists) {
+                const aliveOthers = params.room.players.filter((p) => p.isAlive && p.seatIndex !== params.actorSeat).map((p) => p.seatIndex);
+                if (aliveOthers.length > 0) {
+                    finalTargets = [aliveOthers[Math.floor(Math.random() * aliveOthers.length)]];
+                    rationale = 'storyteller_ai_prevent_pointless_imp_self_kill';
+                }
+            }
+        }
+        const result = submitNightAction(params.room, params.actorSeat, finalTargets);
+        return { ...result, appliedTargets: finalTargets, rationale };
+    };
+    // 第二阶段收敛骨架：当 AI 说书人开启时，动作先走 storyteller_ai 裁定器分支。
+    // 当前实现先与规则引擎保持同结果，后续可在 storyteller_ai 分支接入真实裁量策略。
+    if (room.aiStorytellerEnabled) {
+        return {
+            mode: 'storyteller_ai',
+            adjudicateNomination: ({ room, actorSeat, targetSeat }) => adjudicateNominationByStorytellerPolicy({ room, actorSeat, targetSeat }),
+            adjudicateVote: ({ room, actorSeat, inFavor }) => adjudicateVoteByStorytellerPolicy({ room, actorSeat, inFavor }),
+            adjudicateNightAction: ({ room, actorSeat, targets }) => adjudicateNightActionByStorytellerPolicy({ room, actorSeat, targets }),
+        };
+    }
+    return {
+        mode: 'rules_engine',
+        adjudicateNomination: ({ room, actorSeat, targetSeat }) => adjudicateNominationByRules({ room, actorSeat, targetSeat }),
+        adjudicateVote: ({ room, actorSeat, inFavor }) => adjudicateVoteByRules({ room, actorSeat, inFavor }),
+        adjudicateNightAction: ({ room, actorSeat, targets }) => adjudicateNightActionByRules({ room, actorSeat, targets }),
+    };
+}
+function adjudicateAndApplyNomination(room, actorSeat, targetSeat, source) {
+    const adjudicator = resolveAdjudicator(room);
+    const result = adjudicator.adjudicateNomination({ room, actorSeat, targetSeat });
+    appendAdjudicationRecord(room, {
+        at: Date.now(),
+        stage: 'nomination',
+        source,
+        actorSeat,
+        mode: adjudicator.mode,
+        intent: { targetSeat },
+        ok: result.ok,
+        error: result.error,
+        applied: result.ok
+            ? {
+                type: 'nominate',
+                requestedTargetSeat: targetSeat,
+                finalTargetSeat: result.appliedTargetSeat ?? targetSeat,
+                rationale: result.rationale ?? 'unknown',
+            }
+            : undefined,
+    });
+    return result;
+}
+function adjudicateAndApplyVote(room, actorSeat, inFavor, source) {
+    const adjudicator = resolveAdjudicator(room);
+    const result = adjudicator.adjudicateVote({ room, actorSeat, inFavor });
+    appendAdjudicationRecord(room, {
+        at: Date.now(),
+        stage: 'vote',
+        source,
+        actorSeat,
+        mode: adjudicator.mode,
+        intent: { inFavor },
+        ok: result.ok,
+        error: result.error,
+        applied: result.ok
+            ? {
+                type: 'vote',
+                requestedInFavor: inFavor,
+                finalInFavor: result.appliedInFavor ?? inFavor,
+                rationale: result.rationale ?? 'unknown',
+            }
+            : undefined,
+    });
+    return result;
+}
+function adjudicateAndApplyNightAction(room, actorSeat, targets, source) {
+    const adjudicator = resolveAdjudicator(room);
+    const result = adjudicator.adjudicateNightAction({ room, actorSeat, targets });
+    appendAdjudicationRecord(room, {
+        at: Date.now(),
+        stage: 'night_action',
+        source,
+        actorSeat,
+        mode: adjudicator.mode,
+        intent: { targets },
+        ok: result.ok,
+        error: result.error,
+        applied: result.ok
+            ? {
+                type: 'night_action',
+                playerTargets: targets,
+                finalTargets: result.appliedTargets ?? targets,
+                hasInfo: !!result.info,
+                rationale: result.rationale ?? 'unknown',
+            }
+            : undefined,
+    });
+    return result;
+}
 function shareAiNightInfoAtDawn(roomId, room) {
+    void roomId;
     if (room.status !== 'playing' || room.phase !== 'day')
         return;
     const log = getNightInfoLogBySeat(room);
     const cursors = getAiSharedNightInfoCursor(room);
     const inFallback = !aiPlayerLlmAvailable();
-    const alwaysShare = inFallback || process.env.AI_FALLBACK_ALWAYS_SHARE === 'true';
+    // 夜间信息属于私密信息，不应自动公开到公屏。
+    // 仅在兜底模式下将其作为“内部信任更新”输入，不写入 public/chat。
     for (const p of room.players) {
         const seatIndex = p.seatIndex;
         if (!(room.aiPlayerEnabledBySeat.get(seatIndex) ?? false))
@@ -1155,19 +1790,11 @@ function shareAiNightInfoAtDawn(roomId, room) {
         const pending = msgs.slice(cursor);
         const temp = room.aiPlayerTemperatureBySeat.get(seatIndex) ?? 0.5;
         for (const msg of pending) {
-            // 公开分享：以“公开发言”的形式发到公屏，避免与真人行为产生可观察差异；并按温度控制积极程度
-            if (!(alwaysShare || Math.random() < temp))
-                continue;
-            pushPublic(room, `公开发言：${seatLabel(room, seatIndex)}：${msg}`);
-            const entry = pushChat(room, { at: Date.now(), scope: 'public', phase: room.phase, dayNumber: room.dayNumber, fromSeat: seatIndex, text: msg });
-            broadcastChat(roomId, entry);
-            // 兜底模式：大家默认信任并把信息写进“好坏人表”
-            if (inFallback)
+            if (inFallback && Math.random() < temp)
                 updateAiTrustFromSharedNightInfo(room, msg);
         }
         cursors.set(seatIndex, msgs.length);
     }
-    broadcast(roomId, { type: 'room', room: getRoomView(room) });
 }
 function sendEvilInfo(roomId, room) {
     const evilSeats = room.players.filter((p) => p.isAlive && (p.characterId === 'imp' || ['poisoner', 'spy', 'baron', 'scarlet_woman'].includes(p.characterId ?? ''))).map((p) => p.seatIndex);
@@ -1175,9 +1802,12 @@ function sendEvilInfo(roomId, room) {
     // 简化：互相告知座位号（不告知具体身份）
     for (const s of evilSeats) {
         const isDemon = s === demonSeat;
+        const me = room.players[s];
+        const myChar = me?.characterId ? room.script.characters.find((c) => c.id === me.characterId) : null;
+        const abilityText = myChar?.ability ?? '（无能力描述）';
         const message = isDemon
-            ? `你是恶魔。你的爪牙座位号：${evilSeats.filter((x) => x !== s).map((x) => `#${x + 1}`).join('、') || '无'}。不在场善良身份：${room.demonBluffs?.join(',') || '无'}`
-            : `你是爪牙。恶魔座位号：${demonSeat != null ? `#${demonSeat + 1}` : '未知'}。其他邪恶座位号：${evilSeats.filter((x) => x !== s).map((x) => `#${x + 1}`).join('、') || '无'}`;
+            ? `你是恶魔。你的能力：${abilityText}。你的爪牙座位号：${evilSeats.filter((x) => x !== s).map((x) => `#${x + 1}`).join('、') || '无'}。不在场善良身份：${room.demonBluffs?.join(',') || '无'}`
+            : `你是爪牙。你的能力：${abilityText}。恶魔座位号：${demonSeat != null ? `#${demonSeat + 1}` : '未知'}。其他邪恶座位号：${evilSeats.filter((x) => x !== s).map((x) => `#${x + 1}`).join('、') || '无'}`;
         // 统一走夜间信息通道：保证兜底“信息公开+写入好坏人表”可复用。
         sendNightInfo(roomId, room, s, message);
     }
@@ -1329,16 +1959,29 @@ wss.on('connection', (ws, req) => {
                         text,
                     });
                     broadcastChat(roomId, entry);
-                    const replyText = makeDeterministicGodReply(room, seatIndex, text);
-                    const reply = pushChat(room, {
-                        at: Date.now(),
-                        scope: 'god',
-                        phase: room.phase,
-                        dayNumber: room.dayNumber,
-                        fromSeat: seatIndex,
-                        text: replyText,
-                    });
-                    broadcastChat(roomId, reply);
+                    if (room.aiStorytellerEnabled) {
+                        const replyText = makeDeterministicGodReply(room, seatIndex, text);
+                        const reply = pushChat(room, {
+                            at: Date.now(),
+                            scope: 'god',
+                            phase: room.phase,
+                            dayNumber: room.dayNumber,
+                            fromSeat: seatIndex,
+                            text: replyText,
+                        });
+                        broadcastChat(roomId, reply);
+                    }
+                    else {
+                        const reply = pushChat(room, {
+                            at: Date.now(),
+                            scope: 'god',
+                            phase: room.phase,
+                            dayNumber: room.dayNumber,
+                            fromSeat: seatIndex,
+                            text: '上帝：当前为人工说书人模式，请等待说书人回应。',
+                        });
+                        broadcastChat(roomId, reply);
+                    }
                     return;
                 }
                 if (msg.scope === 'public') {
@@ -1541,8 +2184,8 @@ wss.on('connection', (ws, req) => {
                     ws.send(JSON.stringify({ type: 'error', message: 'admin_cannot_nominate' }));
                     return;
                 }
-                const ok = nominate(room, seatIndex, msg.nominatedSeat);
-                if (!ok) {
+                const applied = adjudicateAndApplyNomination(room, seatIndex, msg.nominatedSeat, 'human_player');
+                if (!applied.ok) {
                     ws.send(JSON.stringify({ type: 'error', message: 'Nomination not allowed' }));
                     return;
                 }
@@ -1594,7 +2237,11 @@ wss.on('connection', (ws, req) => {
                     ws.send(JSON.stringify({ type: 'error', message: 'admin_cannot_vote' }));
                     return;
                 }
-                vote(room, seatIndex, msg.inFavor);
+                const applied = adjudicateAndApplyVote(room, seatIndex, msg.inFavor, 'human_player');
+                if (!applied.ok) {
+                    ws.send(JSON.stringify({ type: 'error', message: `vote_failed:${applied.error ?? 'unknown'}` }));
+                    return;
+                }
                 // 自动结束投票：所有可投票玩家都完成选择后立即结算
                 if (room.currentNomination) {
                     const eligibleVoters = room.players.filter((p) => p.isAlive || p.hasDeadVote).map((p) => p.seatIndex);
@@ -1687,25 +2334,42 @@ wss.on('connection', (ws, req) => {
                 }
                 const pendingBefore = room.pendingNightAction;
                 const targets = msg.targets ?? [];
-                const result = submitNightAction(room, seatIndex, targets);
+                if (!pendingBefore || pendingBefore.actorSeatIndex !== seatIndex) {
+                    ws.send(JSON.stringify({ type: 'error', message: 'night_action_failed:not_your_turn' }));
+                    sendNightPrompt(roomId, room);
+                    return;
+                }
+                let finalTargets = targets;
+                if (isNightPlayerActionStepId(pendingBefore.stepId) && (pendingBefore.pick === 1 || pendingBefore.pick === 2)) {
+                    const validationError = validateNightTargetsForPending(room, pendingBefore, targets);
+                    if (validationError) {
+                        ws.send(JSON.stringify({ type: 'error', message: `night_action_failed:${validationError}` }));
+                        ws.send(JSON.stringify({ type: 'error', message: `请按你的身份能力行动（${pendingBefore.stepId} 需要选择 ${pendingBefore.pick} 名目标）` }));
+                        sendNightPrompt(roomId, room);
+                        return;
+                    }
+                    finalTargets = targets;
+                }
+                const result = adjudicateAndApplyNightAction(room, seatIndex, finalTargets, 'human_player');
                 if (!result.ok) {
                     ws.send(JSON.stringify({ type: 'error', message: `night_action_failed:${result.error ?? 'unknown'}` }));
+                    ws.send(JSON.stringify({ type: 'error', message: `请按你的身份能力行动（${pendingBefore.stepId}）` }));
                     sendNightPrompt(roomId, room);
                     return;
                 }
                 if (pendingBefore) {
                     const { key, title } = nightReplayTitle(room);
-                    if (pendingBefore.stepId === 'imp' && targets[0] !== undefined) {
-                        pushReplay(room, key, title, `${seatLabel(room, pendingBefore.actorSeatIndex)}（恶魔）选择杀害 ${seatLabel(room, targets[0])}。`);
+                    if (pendingBefore.stepId === 'imp' && finalTargets[0] !== undefined) {
+                        pushReplay(room, key, title, `${seatLabel(room, pendingBefore.actorSeatIndex)}（恶魔）选择杀害 ${seatLabel(room, finalTargets[0])}。`);
                     }
-                    else if (pendingBefore.stepId === 'monk' && targets[0] !== undefined) {
-                        pushReplay(room, key, title, `${seatLabel(room, pendingBefore.actorSeatIndex)}（僧侣）选择保护 ${seatLabel(room, targets[0])}。`);
+                    else if (pendingBefore.stepId === 'monk' && finalTargets[0] !== undefined) {
+                        pushReplay(room, key, title, `${seatLabel(room, pendingBefore.actorSeatIndex)}（僧侣）选择保护 ${seatLabel(room, finalTargets[0])}。`);
                     }
-                    else if (pendingBefore.stepId === 'poisoner' && targets[0] !== undefined) {
-                        pushReplay(room, key, title, `${seatLabel(room, pendingBefore.actorSeatIndex)}（投毒者）选择毒害 ${seatLabel(room, targets[0])}。`);
+                    else if (pendingBefore.stepId === 'poisoner' && finalTargets[0] !== undefined) {
+                        pushReplay(room, key, title, `${seatLabel(room, pendingBefore.actorSeatIndex)}（投毒者）选择毒害 ${seatLabel(room, finalTargets[0])}。`);
                     }
-                    else if (pendingBefore.stepId === 'fortune_teller' && targets.length === 2) {
-                        pushReplay(room, key, title, `${seatLabel(room, pendingBefore.actorSeatIndex)}（占卜师）选择查验 ${seatLabel(room, targets[0])} 与 ${seatLabel(room, targets[1])}。`);
+                    else if (pendingBefore.stepId === 'fortune_teller' && finalTargets.length === 2) {
+                        pushReplay(room, key, title, `${seatLabel(room, pendingBefore.actorSeatIndex)}（占卜师）选择查验 ${seatLabel(room, finalTargets[0])} 与 ${seatLabel(room, finalTargets[1])}。`);
                     }
                 }
                 if (result.info) {
@@ -1774,13 +2438,14 @@ setInterval(async () => {
             // 白天：优先生成计划并发言，再进入提名/投票（避免先兜底 skip 导致“全员不提名”）
             if (room.phase === 'day') {
                 try {
+                    await maybeRefreshAiMemorySummary(room, seatIndex);
                     const tempNow = room.aiPlayerTemperatureBySeat.get(seatIndex) ?? 0.5;
                     const planKey = `ai_day_plan_${room.dayNumber}_seat_${seatIndex}`;
                     const existing = room.storytellerDecisions.get(planKey);
                     const needPlan = !existing || existing.type !== 'day_plan';
                     // 若上次是 noop/无计划，则允许下一轮继续重试（避免 dmDone/pubDone 永远卡住）
                     if (needPlan && aiPlayerLlmAvailable()) {
-                        const { roomView, yourCharacterId, yourRole, yourAlignment, chatLog, allChatLog, nightInfo, } = buildAiSeatContext(room, seatIndex);
+                        const { roomView, yourCharacterId, yourRole, yourAlignment, chatLog, allChatLog, playerMemory, nightInfo, promptStyle, } = buildAiSeatContext(room, seatIndex);
                         let dayTraceId = null;
                         const plan = await decideAiPlayerDayPlan(room, seatIndex, {
                             roomView,
@@ -1791,11 +2456,13 @@ setInterval(async () => {
                             demonBluffs: yourAlignment === 'evil' ? (room.demonBluffs ?? null) : null,
                             chatLog,
                             allChatLog,
+                            playerMemory,
                             nightInfo,
                             voteSnapshot: buildVoteSnapshot(room),
                             recentVoteEvents: buildRecentVoteEvents(room),
                             nightPrompt: null,
                             currentNomination: room.currentNomination,
+                            promptStyle,
                         }, tempNow, (event) => {
                             if (event.kind === 'request') {
                                 const rec = createInvocation(room, {
@@ -1868,7 +2535,10 @@ setInterval(async () => {
                     if (stage === 'god_dialogue' && plan && plan.type === 'day_plan' && room.storytellerDecisions.get(godMarkKey) !== true) {
                         const q = String(plan.godQuestion?.text ?? '').trim().slice(0, 200);
                         const hasNightInfo = (getNightInfoLogBySeat(room).get(seatIndex) ?? []).length > 0;
-                        if (q && hasNightInfo) {
+                        if (!room.aiStorytellerEnabled) {
+                            appendBehavior(rid, room, seatIndex, traceId, 'god_dialogue:skipped(human_storyteller_mode)');
+                        }
+                        else if (q && hasNightInfo) {
                             const ask = pushChat(room, {
                                 at: Date.now(),
                                 scope: 'god',
@@ -1958,7 +2628,12 @@ setInterval(async () => {
                             }
                         }
                         else {
-                            appendBehavior(rid, room, seatIndex, traceId, 'public_speech:skipped(empty_text)');
+                            const fallbackText = buildForcedActiveDayPlan(room, seatIndex).public.text;
+                            const entry = pushChat(room, { at: Date.now(), scope: 'public', phase: room.phase, dayNumber: room.dayNumber, fromSeat: seatIndex, text: fallbackText.slice(0, 500) });
+                            pushPublic(room, `公开发言（空文本兜底）：${seatLabel(room, seatIndex)}：${fallbackText.slice(0, 500)}`);
+                            broadcastChat(rid, entry);
+                            broadcast(rid, { type: 'room', room: getRoomView(room) });
+                            appendBehavior(rid, room, seatIndex, traceId, 'public_speech:fallback_due_to_empty_text');
                         }
                         room.storytellerDecisions.set(pubMarkKey, true);
                     }
@@ -2021,7 +2696,7 @@ setInterval(async () => {
                         targets.push(remain[Math.floor(Math.random() * remain.length)]);
                     }
                     if (targets.length === pick) {
-                        const result = submitNightAction(room, seatIndex, targets);
+                        const result = adjudicateAndApplyNightAction(room, seatIndex, targets, 'storyteller_fallback');
                         if (result.ok) {
                             if (pendingBefore) {
                                 const { key, title } = nightReplayTitle(room);
@@ -2064,7 +2739,7 @@ setInterval(async () => {
                     const aggressiveGoodInfo = shouldPushGoodInfoAggression(room, seatIndex);
                     let ok = false;
                     if (planNom && planNom.type === 'nominate' && Number.isInteger(planNom.targetSeat)) {
-                        ok = nominate(room, seatIndex, planNom.targetSeat);
+                        ok = adjudicateAndApplyNomination(room, seatIndex, planNom.targetSeat, 'ai_player').ok;
                         if (ok) {
                             const { key, title } = dayReplayTitle(room);
                             pushReplay(room, key, title, `${seatLabel(room, seatIndex)}（AI）提名 ${seatLabel(room, planNom.targetSeat)}。`);
@@ -2079,7 +2754,7 @@ setInterval(async () => {
                             if (aggressiveGoodInfo) {
                                 const target = pickMostSuspiciousAlive(room, seatIndex);
                                 if (target != null) {
-                                    ok = nominate(room, seatIndex, target);
+                                    ok = adjudicateAndApplyNomination(room, seatIndex, target, 'ai_player').ok;
                                     if (ok) {
                                         const { key, title } = dayReplayTitle(room);
                                         pushReplay(room, key, title, `${seatLabel(room, seatIndex)}（AI）根据信息位策略主动提名 ${seatLabel(room, target)}。`);
@@ -2110,7 +2785,7 @@ setInterval(async () => {
                         // 兜底：按“好坏人表”提名嫌疑最重的玩家；阈值以上则选择本轮不提名
                         const target = aiPickNominationTargetByTrust(room, seatIndex);
                         if (target != null) {
-                            ok = nominate(room, seatIndex, target);
+                            ok = adjudicateAndApplyNomination(room, seatIndex, target, 'storyteller_fallback').ok;
                             if (ok) {
                                 const { key, title } = dayReplayTitle(room);
                                 pushReplay(room, key, title, `${seatLabel(room, seatIndex)}（AI）提名 ${seatLabel(room, target)}。`);
@@ -2171,7 +2846,9 @@ setInterval(async () => {
                     else if (aggressiveGoodInfo) {
                         inFavor = shouldVoteInFavorByPriority(room, seatIndex, room.currentNomination.nominated, null);
                     }
-                    vote(room, seatIndex, inFavor);
+                    const appliedVote = adjudicateAndApplyVote(room, seatIndex, inFavor, 'ai_player');
+                    if (!appliedVote.ok)
+                        continue;
                     appendBehavior(rid, room, seatIndex, traceId, `nomination_vote:vote(${inFavor ? 'in_favor' : 'against'})`);
                     // 可能触发自动结算与白天结束
                     if (room.currentNomination) {
@@ -2195,11 +2872,12 @@ setInterval(async () => {
                 }
             }
             try {
+                await maybeRefreshAiMemorySummary(room, seatIndex);
                 // 夜晚：仅在轮到自己行动时调用 LLM（且不再先随机兜底）
                 if (!(room.pendingNightAction && room.pendingNightAction.actorSeatIndex === seatIndex))
                     continue;
                 const tempNow = room.aiPlayerTemperatureBySeat.get(seatIndex) ?? 0.5;
-                const { roomView, yourCharacterId, yourRole, yourAlignment, chatLog, allChatLog, nightInfo, } = buildAiSeatContext(room, seatIndex);
+                const { roomView, yourCharacterId, yourRole, yourAlignment, chatLog, allChatLog, playerMemory, nightInfo, promptStyle, } = buildAiSeatContext(room, seatIndex);
                 const pending = room.pendingNightAction;
                 const aliveAll = room.players.filter((x) => x.isAlive).map((x) => x.seatIndex);
                 const aliveSeatIndices = pending?.stepId === 'imp' ? aliveAll.filter((s) => s !== seatIndex) : aliveAll;
@@ -2216,11 +2894,13 @@ setInterval(async () => {
                     demonBluffs: yourAlignment === 'evil' ? (room.demonBluffs ?? null) : null,
                     chatLog,
                     allChatLog,
+                    playerMemory,
                     nightInfo,
                     voteSnapshot: buildVoteSnapshot(room),
                     recentVoteEvents: buildRecentVoteEvents(room),
                     nightPrompt,
                     currentNomination: room.currentNomination,
+                    promptStyle,
                 }, tempNow, (event) => {
                     if (event.kind === 'request') {
                         const rec = createInvocation(room, {
@@ -2270,68 +2950,28 @@ setInterval(async () => {
                 }
                 if (room.pendingNightAction?.actorSeatIndex === seatIndex) {
                     const pendingNow = room.pendingNightAction;
-                    if (!isNightMediatedStepId(pendingNow.stepId) || (pendingNow.pick !== 1 && pendingNow.pick !== 2))
+                    if (!isNightPlayerActionStepId(pendingNow.stepId) || (pendingNow.pick !== 1 && pendingNow.pick !== 2))
                         continue;
-                    let storytellerTraceId = null;
-                    const finalTargets = await getStorytellerMediatedNightTargets(room, {
-                        stepId: pendingNow.stepId,
-                        actorSeatIndex: pendingNow.actorSeatIndex,
-                        pick: pendingNow.pick,
-                        aliveSeatIndices,
-                        playerSuggestedTargets,
-                    }, false, (event) => {
-                        if (event.kind === 'request') {
-                            const rec = createInvocation(room, {
-                                actor: 'storyteller',
-                                stage: 'storyteller_decision',
-                                roomId: rid,
-                                seatIndex: pendingNow.actorSeatIndex,
-                                phase: room.phase,
-                                stepId: pendingNow.stepId,
-                                model: process.env.OPENAI_MODEL ?? 'qwen3.5-plus',
-                                status: 'started',
-                                request: toTraceText(`system:\n${event.systemPrompt ?? ''}\n\nuser:\n${event.userPrompt ?? ''}`),
-                            });
-                            storytellerTraceId = rec.id;
-                            sendAiTrace(rid, pendingNow.actorSeatIndex, rec);
-                        }
-                        else if (event.kind === 'response') {
-                            if (!storytellerTraceId)
-                                return;
-                            const rec = updateInvocation(room, storytellerTraceId, {
-                                status: 'responded',
-                                elapsedMs: event.elapsedMs,
-                                response: toTraceText(event.rawResponse ?? ''),
+                    const validationError = validateNightTargetsForPending(room, pendingNow, playerSuggestedTargets);
+                    if (validationError) {
+                        if (nightTraceId) {
+                            const rec = updateInvocation(room, nightTraceId, {
+                                status: 'fallback',
+                                behavior: `fallback_due_to_invalid_night_targets:${validationError}`,
                             });
                             if (rec)
-                                sendAiTrace(rid, pendingNow.actorSeatIndex, rec);
+                                sendAiTrace(rid, seatIndex, rec);
                         }
-                        else if (event.kind === 'error') {
-                            if (!storytellerTraceId)
-                                return;
-                            const rec = updateInvocation(room, storytellerTraceId, {
-                                status: 'error',
-                                error: event.error ?? 'unknown_error',
-                            });
-                            if (rec)
-                                sendAiTrace(rid, pendingNow.actorSeatIndex, rec);
-                        }
-                    });
+                        continue;
+                    }
+                    const finalTargets = playerSuggestedTargets;
                     const pendingBefore = room.pendingNightAction;
-                    const result = submitNightAction(room, seatIndex, finalTargets);
+                    const result = adjudicateAndApplyNightAction(room, seatIndex, finalTargets, 'ai_player');
                     if (result.ok) {
                         if (nightTraceId) {
                             const rec = updateInvocation(room, nightTraceId, {
                                 status: 'applied',
                                 behavior: `player_suggested_targets=${JSON.stringify(playerSuggestedTargets)}; storyteller_final_targets=${JSON.stringify(finalTargets)}`,
-                            });
-                            if (rec)
-                                sendAiTrace(rid, seatIndex, rec);
-                        }
-                        if (storytellerTraceId) {
-                            const rec = updateInvocation(room, storytellerTraceId, {
-                                status: 'applied',
-                                behavior: `submitNightAction(${pendingBefore?.stepId ?? 'unknown'}) targets=${JSON.stringify(finalTargets)}`,
                             });
                             if (rec)
                                 sendAiTrace(rid, seatIndex, rec);

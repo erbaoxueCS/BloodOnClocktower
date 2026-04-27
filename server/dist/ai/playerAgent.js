@@ -1,6 +1,8 @@
-// AI 玩家与 AI 说书人解耦：默认沿用 USE_AI_STORYTELLER，但可用 USE_AI_PLAYER 单独开关
-const USE_AI_PLAYER = (process.env.USE_AI_PLAYER ?? process.env.USE_AI_STORYTELLER ?? '') === 'true'
-    || (process.env.USE_AI_PLAYER ?? process.env.USE_AI_STORYTELLER ?? '') === '1';
+// AI 玩家与 AI 说书人解耦：仅由 USE_AI_PLAYER 控制；默认开启（除非显式设为 false/0）
+const USE_AI_PLAYER_RAW = (process.env.USE_AI_PLAYER ?? '').trim().toLowerCase();
+const USE_AI_PLAYER = USE_AI_PLAYER_RAW
+    ? (USE_AI_PLAYER_RAW === 'true' || USE_AI_PLAYER_RAW === '1')
+    : true;
 const OPENAI_MODEL = process.env.OPENAI_MODEL ?? 'qwen3.5-plus';
 // 不要带 /v1，否则会与默认 path /v1/chat/completions 拼成 /v1/v1/...
 /** 与 OpenAI SDK 一致：base 不含 /v1；DashScope 兼容模式为 …/compatible-mode + /v1/chat/completions */
@@ -68,6 +70,95 @@ export async function aiPlayerLlmSelfTest(params) {
         const msg = e instanceof Error ? e.message : String(e);
         return { ok: false, ms: Date.now() - startedAt, baseUrl: OPENAI_BASE_URL, model: OPENAI_MODEL, key, error: msg };
     }
+}
+function heuristicMemorySummary(previousSummary, recentEvents, maxChars) {
+    const prev = String(previousSummary ?? '').trim();
+    const tail = recentEvents.slice(-18).map((x) => String(x).trim()).filter(Boolean);
+    const merged = [
+        prev ? `【已有认知】${prev}` : '',
+        tail.length > 0 ? `【近期事件】${tail.join(' || ')}` : '【近期事件】暂无',
+        '【行动建议】优先围绕公开矛盾与票型推进可执行目标，避免长期空转。',
+    ].filter(Boolean).join('\n');
+    return merged.slice(0, Math.max(200, maxChars));
+}
+export async function refineAiPlayerMemorySummary(params) {
+    const apiKey = getApiKey();
+    const maxChars = Math.max(300, Math.min(2200, Number(params.maxChars ?? 1200)));
+    if (!apiKey || !USE_AI_PLAYER) {
+        return heuristicMemorySummary(params.previousSummary, params.recentEvents, maxChars);
+    }
+    const systemPrompt = [
+        '你是《血染钟楼》玩家记忆整理助手。',
+        '任务：把“已有摘要 + 最近事件”整理成更短、更清晰、可行动的记忆。',
+        '要求：只基于输入，不编造事实；保留关键矛盾、阵营线索、票型线索。',
+        '输出纯文本，不要 markdown，不要 JSON。',
+    ].join('\n');
+    const userPrompt = JSON.stringify({
+        seatIndex: params.seatIndex,
+        maxChars,
+        formatGuide: [
+            '事实：谁说了什么、谁提名谁、关键投票结果',
+            '关系：谁互保/对立、谁可疑',
+            '风险：可能中毒/伪装/误导点',
+            '下一步：一句可执行策略',
+        ],
+        previousSummary: String(params.previousSummary ?? '').slice(0, 3000),
+        recentEvents: (params.recentEvents ?? []).slice(-40),
+    });
+    try {
+        const ac = new AbortController();
+        const timeoutMs = Number(process.env.AI_PLAYER_TIMEOUT_MS ?? '') || 240_000;
+        const timeout = setTimeout(() => ac.abort(), timeoutMs);
+        const res = await fetch(`${OPENAI_BASE_URL}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+            body: JSON.stringify({
+                model: OPENAI_MODEL,
+                messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
+                temperature: 0.2,
+                ...fastResponseOptions(),
+            }),
+            signal: ac.signal,
+        });
+        clearTimeout(timeout);
+        if (!res.ok) {
+            return heuristicMemorySummary(params.previousSummary, params.recentEvents, maxChars);
+        }
+        const data = (await res.json());
+        const content = data.choices?.[0]?.message?.content?.trim();
+        if (!content)
+            return heuristicMemorySummary(params.previousSummary, params.recentEvents, maxChars);
+        return content.slice(0, maxChars);
+    }
+    catch {
+        return heuristicMemorySummary(params.previousSummary, params.recentEvents, maxChars);
+    }
+}
+function normalizePromptStyle(raw) {
+    const s = String(raw ?? '').trim().toLowerCase();
+    if (s === 'assertive')
+        return 'assertive';
+    if (s === 'deceptive')
+        return 'deceptive';
+    if (s === 'chaotic')
+        return 'chaotic';
+    return 'balanced';
+}
+function getPromptStyleGuidance(style, alignment) {
+    if (style === 'assertive') {
+        return alignment === 'good'
+            ? '风格=assertive：更积极推进提名与处决共识，减少空转与长期观望。'
+            : '风格=assertive：更积极主导讨论节奏，推动对己方有利的提名与票型。';
+    }
+    if (style === 'deceptive') {
+        return alignment === 'good'
+            ? '风格=deceptive：可适度保留信息与试探，但避免无意义误导己方。'
+            : '风格=deceptive：优先维持伪装一致性，通过话术与票型制造信息噪音。';
+    }
+    if (style === 'chaotic') {
+        return '风格=chaotic：允许非常规策略与反常规节奏，但行动必须自洽且不违反规则。';
+    }
+    return '风格=balanced：在信息价值、风险和节奏之间取平衡，不盲动也不长期保守。';
 }
 function buildDefaultPublicText(ctx) {
     const nightInfoLen = Array.isArray(ctx.nightInfo) ? ctx.nightInfo.length : 0;
@@ -217,6 +308,8 @@ export async function decideAiPlayerDayPlan(room, seatIndex, ctx, temperature, o
     const threadKey = `ai_player_dayplan_thread_${seatIndex}`;
     const v = room.storytellerDecisions.get(threadKey);
     const thread = Array.isArray(v) ? v : [];
+    const promptStyle = normalizePromptStyle(ctx.promptStyle);
+    const styleGuidance = getPromptStyleGuidance(promptStyle, ctx.yourAlignment);
     const systemPrompt = [
         '你是《血染钟楼（暗流涌动）》中的单座位 AI 玩家。',
         '你只代表自己的座位，不是上帝，不是裁判，不可修改游戏状态。',
@@ -231,9 +324,11 @@ export async function decideAiPlayerDayPlan(room, seatIndex, ctx, temperature, o
         'demonBluffs 是私有伪装参考，不应公开成“信息来源”。',
         '规则范围内允许多样博弈，请基于局势做收益判断，不要机械套模板。',
         '若你是有信息的好人（如占卜师/共情者/厨师/送葬者等）且已有夜间信息，默认应更主动推进：公开关键矛盾、推动提名、推动形成处决共识。',
+        styleGuidance,
     ].join('\n');
     const userPrompt = JSON.stringify({
-        instruction: '现在是白天，请输出 day_plan：先私聊(0~2条)→公开发言(1条)→提名倾向→投票倾向。信息不足时可保守。',
+        instruction: '现在是白天，请输出 day_plan：先私聊(0~2条)→公开发言(1条)→提名倾向→投票倾向。优先基于 playerMemory 决策，原始日志只做补充验证。',
+        promptStyle,
         outputSchema: {
             day_plan: {
                 type: 'day_plan',
@@ -379,6 +474,7 @@ export async function decideAiPlayerNightTargets(room, seatIndex, ctx, temperatu
         nightPrompt: ctx.nightPrompt,
         context: {
             roomView: ctx.roomView,
+            playerMemory: ctx.playerMemory ?? '',
             yourSeatIndex: ctx.yourSeatIndex,
             yourRole: ctx.yourRole,
             yourCharacterId: ctx.yourCharacterId,

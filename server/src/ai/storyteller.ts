@@ -1,33 +1,11 @@
 import type { Room } from '../game/types.js';
-import type { StorytellerRequest, StorytellerDecision, ChoiceTwoPlayersOneCharacter, LibrarianNoOutsiderChoice } from './types.js';
+import type { StorytellerRequest, StorytellerDecision, ChoiceTwoPlayersOneCharacter } from './types.js';
 import { buildStorytellerRequest } from './adapter.js';
 import { randomStorytellerDecision } from '../game/gameEngine.js';
 
 /** 供 AI 使用的请求上下文中需包含可选善良角色 id 列表 */
 export interface StorytellerContext extends StorytellerRequest {
   goodCharacterIds: string[];
-  allCharacterIds: string[];
-  townsfolkIds: string[];
-  outsiderIds: string[];
-  minionIds: string[];
-  omniscientPlayers: Array<{
-    seatIndex: number;
-    isAlive: boolean;
-    characterId: string | null;
-    alignment: 'good' | 'evil' | null;
-  }>;
-  fullChatLog: Array<{
-    scope: string;
-    fromSeat: number;
-    toSeat?: number;
-    text: string;
-    at: number;
-    dayNumber?: number;
-    phase?: string;
-  }>;
-  currentNomination: { nominator: number; nominated: number } | null;
-  nominationsToday: Array<{ nominator: number; nominated: number }>;
-  votes: Array<{ seatIndex: number; inFavor: boolean }>;
 }
 
 export interface StorytellerDebugEvent {
@@ -41,29 +19,12 @@ export interface StorytellerDebugEvent {
   error?: string;
 }
 
-export interface NightMediationInput {
-  stepId: 'imp' | 'monk' | 'poisoner' | 'fortune_teller';
-  actorSeatIndex: number;
-  pick: 1 | 2;
-  aliveSeatIndices: number[];
-  playerSuggestedTargets?: number[];
-}
-
 const USE_AI = process.env.USE_AI_STORYTELLER === 'true' || process.env.USE_AI_STORYTELLER === '1';
 const OPENAI_MODEL = process.env.OPENAI_MODEL ?? 'qwen3.5-plus';
 // 不要带 /v1，否则会与默认 path /v1/chat/completions 拼成 /v1/v1/...
 // DashScope 实测：coding 网关对部分 key 生效；兼容模式域名在部分场景会 401
 const OPENAI_BASE_URL = (process.env.OPENAI_BASE_URL ?? 'https://coding.dashscope.aliyuncs.com').replace(/\/+$/, '');
 const AI_STORYTELLER_LLM_LOG = process.env.AI_STORYTELLER_LLM_LOG === 'true' || process.env.AI_STORYTELLER_LLM_LOG === '1';
-
-function fastResponseOptions() {
-  return {
-    // 明确禁用流式，降低等待时间
-    stream: false,
-    // 对支持该参数的模型关闭思考过程
-    enable_thinking: false,
-  };
-}
 
 function getApiKey(): string {
   return (process.env.OPENAI_API_KEY ?? process.env.DASHSCOPE_API_KEY ?? '').trim();
@@ -114,7 +75,6 @@ export async function storytellerLlmSelfTest(params?: {
         ],
         response_format: { type: 'json_object' },
         temperature: 0,
-        ...fastResponseOptions(),
       }),
       signal: ac.signal,
     });
@@ -140,10 +100,6 @@ export function validateDecision(room: Room, stepId: string, decision: unknown):
   const aliveSeats = new Set(room.players.filter((p) => p.isAlive).map((p) => p.seatIndex));
 
   if (stepId === 'washerwoman' || stepId === 'librarian' || stepId === 'investigator') {
-    if (stepId === 'librarian' && d.noOutsider === true) {
-      const noOutsider: LibrarianNoOutsiderChoice = { type: 'librarian_result', noOutsider: true };
-      return noOutsider;
-    }
     const type = `${stepId}_result` as keyof ChoiceTwoPlayersOneCharacter;
     const players = d.players as number[] | undefined;
     const characterId = d.characterId as string | undefined;
@@ -152,10 +108,7 @@ export function validateDecision(room: Room, stepId: string, decision: unknown):
     if (!Number.isInteger(a) || !Number.isInteger(b) || a === b) return null;
     if (!aliveSeats.has(a) || !aliveSeats.has(b)) return null;
     const char = room.script.characters.find((c) => c.id === characterId);
-    if (!char) return null;
-    if (stepId === 'washerwoman' && !(char.alignment === 'good' && char.type === 'townsfolk')) return null;
-    if (stepId === 'librarian' && !(char.alignment === 'good' && char.type === 'outsider')) return null;
-    if (stepId === 'investigator' && !(char.alignment === 'evil' && char.type === 'minion')) return null;
+    if (!char || char.alignment !== 'good') return null;
     return { type: `${stepId}_result` as ChoiceTwoPlayersOneCharacter['type'], players: [a, b], characterId };
   }
 
@@ -172,15 +125,27 @@ export function validateDecision(room: Room, stepId: string, decision: unknown):
  * 将引擎使用的 decision 格式转为 storytellerDecisions 写入格式
  */
 export function toEngineDecision(room: Room, stepId: string, validated: StorytellerDecision): unknown {
-  if (stepId === 'librarian' && 'noOutsider' in validated && validated.noOutsider === true) {
-    return { type: 'librarian_result', noOutsider: true };
+  void room;
+  void stepId;
+  switch (validated.type) {
+    case 'imp_kill':
+      return validated.targetSeatIndex;
+    case 'librarian_result':
+      if ('noOutsider' in validated && validated.noOutsider) {
+        return { type: 'librarian_result', noOutsider: true };
+      }
+      if ('players' in validated && 'characterId' in validated) {
+        return { type: validated.type, players: validated.players, characterId: validated.characterId };
+      }
+      return { type: 'librarian_result', noOutsider: true };
+    case 'washerwoman_result':
+    case 'investigator_result':
+      return { type: validated.type, players: validated.players, characterId: validated.characterId };
+    default: {
+      const _exhaustive: never = validated;
+      return _exhaustive;
+    }
   }
-  if (validated.type === 'imp_kill') return validated.targetSeatIndex;
-  return {
-    type: validated.type,
-    players: (validated as ChoiceTwoPlayersOneCharacter).players,
-    characterId: (validated as ChoiceTwoPlayersOneCharacter).characterId,
-  };
 }
 
 /**
@@ -191,45 +156,11 @@ export async function getStorytellerDecision(
   stepId: string,
   stepNameZh: string,
   forceAi = false,
-  onDebug?: (e: StorytellerDebugEvent) => void,
+  onDebug?: (event: StorytellerDebugEvent) => void,
 ): Promise<unknown> {
   const req = buildStorytellerRequest(room, stepId, stepNameZh);
   const goodCharacterIds = room.script.characters.filter((c) => c.alignment === 'good').map((c) => c.id);
-  const allCharacterIds = room.script.characters.map((c) => c.id);
-  const townsfolkIds = room.script.characters.filter((c) => c.alignment === 'good' && c.type === 'townsfolk').map((c) => c.id);
-  const outsiderIds = room.script.characters.filter((c) => c.alignment === 'good' && c.type === 'outsider').map((c) => c.id);
-  const minionIds = room.script.characters.filter((c) => c.alignment === 'evil' && c.type === 'minion').map((c) => c.id);
-  const omniscientPlayers = room.players.map((p) => {
-    const meta = p.characterId ? room.script.characters.find((c) => c.id === p.characterId) : null;
-    return {
-      seatIndex: p.seatIndex,
-      isAlive: p.isAlive,
-      characterId: p.characterId ?? null,
-      alignment: meta?.alignment ?? null,
-    };
-  });
-  const fullChatLog = room.chatLog.slice(-200).map((e) => ({
-    scope: e.scope,
-    fromSeat: e.fromSeat,
-    toSeat: e.toSeat,
-    text: e.text,
-    at: e.at,
-    dayNumber: e.dayNumber,
-    phase: e.phase,
-  }));
-  const ctx: StorytellerContext = {
-    ...req,
-    goodCharacterIds,
-    allCharacterIds,
-    townsfolkIds,
-    outsiderIds,
-    minionIds,
-    omniscientPlayers,
-    fullChatLog,
-    currentNomination: room.currentNomination,
-    nominationsToday: Array.from(room.nominationsToday.entries()).map(([nominator, nominated]) => ({ nominator, nominated })),
-    votes: Array.from(room.votes.entries()).map(([seatIndex, inFavor]) => ({ seatIndex, inFavor })),
-  };
+  const ctx: StorytellerContext = { ...req, goodCharacterIds };
   let raw: unknown = null;
 
   const apiKey = getApiKey();
@@ -237,13 +168,9 @@ export async function getStorytellerDecision(
     try {
       raw = await callOpenAI(ctx, stepId, apiKey, onDebug);
     } catch (e) {
-      onDebug?.({
-        kind: 'error',
-        stepId,
-        model: OPENAI_MODEL,
-        error: e instanceof Error ? e.message : String(e),
-      });
-      console.warn('AI storyteller request failed, using random:', (e as Error).message);
+      const message = e instanceof Error ? e.message : String(e);
+      onDebug?.({ kind: 'error', stepId, model: OPENAI_MODEL, error: message });
+      console.warn('AI storyteller request failed, using random:', message);
     }
   }
 
@@ -271,62 +198,20 @@ async function callOpenAI(
   req: StorytellerContext,
   stepId: string,
   apiKey: string,
-  onDebug?: (e: StorytellerDebugEvent) => void,
+  onDebug?: (event: StorytellerDebugEvent) => void,
 ): Promise<unknown> {
   const isTwoPlayersOneChar = ['washerwoman', 'librarian', 'investigator'].includes(stepId);
   const schema = isTwoPlayersOneChar
     ? { type: 'object', properties: { players: { type: 'array', items: { type: 'integer' }, minItems: 2, maxItems: 2 }, characterId: { type: 'string' } }, required: ['players', 'characterId'] }
     : { type: 'object', properties: { targetSeatIndex: { type: 'integer' } }, required: ['targetSeatIndex'] };
 
-  const systemPrompt = [
-    '你是《血染钟楼》的说书人裁量助手。',
-    '你只负责当前 stepId 的裁量 JSON，不是玩家，不推进流程，不修改状态。',
-    '目标：在规则允许下平衡局势、保留悬念、提升对局体验。',
-    '规则范围内存在多种可行裁量，请结合上下文选择其一。',
-    '请输出合法 JSON，不要解释、markdown 或额外字段。',
-  ].join('');
+  const systemPrompt = `你是血染钟楼的说书人。请根据「平衡局势、增进体验、让对局更跌宕起伏」的原则做选择。只输出合法 JSON，不要解释。`;
   const poisonHint =
     req.poisonedSeatIndex != null ? `注意：座位 ${req.poisonedSeatIndex} 当晚可能因投毒而不清醒（仅据此调整叙事节奏，勿在回复中提及「中毒」字样）。` : '';
-  const typeScopedIds =
-    stepId === 'washerwoman'
-      ? req.townsfolkIds
-      : stepId === 'librarian'
-        ? req.outsiderIds
-        : stepId === 'investigator'
-          ? req.minionIds
-          : req.goodCharacterIds;
-  const userPrompt = JSON.stringify({
-    instruction: isTwoPlayersOneChar
-      ? `当前步骤：${getStepNameZh(stepId)}。请基于全场真实上下文生成首夜信息裁定。`
-      : '当前步骤：imp，请基于全场真实上下文裁定本夜击杀目标。',
-    outputSchema: isTwoPlayersOneChar
-      ? (stepId === 'librarian'
-        ? { oneOf: [{ players: '[seatA, seatB]', characterId: 'string' }, { noOutsider: true }] }
-        : { players: '[seatA, seatB]', characterId: 'string' })
-      : { targetSeatIndex: 'number' },
-    constraints: isTwoPlayersOneChar
-      ? [
-        `players 必须是两个不同且存活座位，仅可从 ${req.aliveSeatIndices.join(',')} 中选`,
-        `characterId 仅可从以下集合选择：${typeScopedIds.join(',')}`,
-        ...(stepId === 'librarian' ? ['若场上没有外来者，可返回 {"noOutsider":true}。'] : []),
-        '只返回 JSON 对象，不要解释',
-      ]
-      : [
-        `targetSeatIndex 必须是存活座位，仅可从 ${req.aliveSeatIndices.join(',')} 中选（可按规则自刀）`,
-        '只返回 JSON 对象，不要解释',
-      ],
-    poisonHint,
-    storytellerOmniscientContext: {
-      scriptNameZh: req.scriptNameZh,
-      dayNumber: req.dayNumber,
-      phase: req.phase,
-      players: req.omniscientPlayers,
-      fullChatLog: req.fullChatLog,
-      currentNomination: req.currentNomination,
-      nominationsToday: req.nominationsToday,
-      votes: req.votes,
-    },
-  });
+  const goodIdList = req.goodCharacterIds?.length ? `合法 characterId 只能从下列善良方角色中选：${req.goodCharacterIds.join(',')}。` : '';
+  const userPrompt = isTwoPlayersOneChar
+    ? `剧本：${req.scriptNameZh}。当前为第${req.dayNumber}天夜晚，步骤：${getStepNameZh(stepId)}。需要选择两名存活玩家（座位号）和其中一个善良方角色 identity（characterId）。存活座位号：${req.aliveSeatIndices.join(',')}。${goodIdList}${poisonHint}回复格式：{"players":[座位1,座位2],"characterId":"角色id"}`
+    : `剧本：${req.scriptNameZh}。恶魔选择一名存活玩家杀害（可选择自己自杀以传位爪牙）。存活座位号：${req.aliveSeatIndices.join(',')}。${poisonHint}回复格式：{"targetSeatIndex":座位号}`;
   onDebug?.({
     kind: 'request',
     stepId,
@@ -336,7 +221,7 @@ async function callOpenAI(
   });
 
   const ac = new AbortController();
-  const timeoutMs = Number(process.env.AI_STORYTELLER_TIMEOUT_MS ?? '') || 240_000;
+  const timeoutMs = Number(process.env.AI_STORYTELLER_TIMEOUT_MS ?? '') || 180_000;
   const timeout = setTimeout(() => ac.abort(), timeoutMs);
   const startedAt = Date.now();
   if (AI_STORYTELLER_LLM_LOG) {
@@ -364,7 +249,6 @@ async function callOpenAI(
       messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
       response_format: { type: 'json_object' },
       temperature: 0.7,
-      ...fastResponseOptions(),
     }),
     signal: ac.signal,
   });
@@ -392,209 +276,47 @@ async function callOpenAI(
   return JSON.parse(content) as unknown;
 }
 
-function validateNightTargets(
-  input: NightMediationInput,
-  raw: unknown,
-): number[] | null {
-  if (!raw || typeof raw !== 'object') return null;
-  const d = raw as Record<string, unknown>;
-  const targets = d.targets as number[] | undefined;
-  if (!Array.isArray(targets) || targets.length !== input.pick) return null;
-  const alive = new Set(input.aliveSeatIndices);
-  for (const t of targets) {
-    if (!Number.isInteger(t) || !alive.has(t)) return null;
-  }
-  if (input.pick === 2 && targets[0] === targets[1]) return null;
-  return targets;
-}
-
-function randomNightTargets(input: NightMediationInput): number[] {
-  const alive = [...input.aliveSeatIndices];
-  const out: number[] = [];
-  for (let i = 0; i < input.pick; i++) {
-    const remain = alive.filter((x) => !out.includes(x));
-    if (remain.length === 0) break;
-    out.push(remain[Math.floor(Math.random() * remain.length)]);
-  }
-  return out.length === input.pick ? out : alive.slice(0, input.pick);
-}
-
-export async function getStorytellerMediatedNightTargets(
-  room: Room,
-  input: NightMediationInput,
-  forceAi = false,
-  onDebug?: (e: StorytellerDebugEvent) => void,
-): Promise<number[]> {
-  const apiKey = getApiKey();
-  const enabled = (USE_AI || forceAi) && !!apiKey;
-  const fallback =
-    Array.isArray(input.playerSuggestedTargets)
-      && input.playerSuggestedTargets.length === input.pick
-      ? input.playerSuggestedTargets
-      : randomNightTargets(input);
-  if (!enabled || !apiKey) return fallback;
-
-  const systemPrompt = [
-    '你是《血染钟楼》的说书人裁定助手。',
-    '当前是夜晚玩家行动中转环节：玩家先给建议目标，你再根据规则与局势做最终裁定。',
-    '规则范围内允许多种裁定方案，请选择你认为收益更高的一种。',
-    '请只返回 JSON：{"targets":[...]}，长度等于 pick，且都在 aliveSeatIndices 中。',
-    '不要输出解释文本或额外字段。',
-  ].join('');
-  const userPrompt = JSON.stringify({
-    scriptNameZh: room.script.nameZh,
-    dayNumber: room.dayNumber,
-    phase: room.phase,
-    stepId: input.stepId,
-    actorSeatIndex: input.actorSeatIndex,
-    pick: input.pick,
-    aliveSeatIndices: input.aliveSeatIndices,
-    playerSuggestedTargets: input.playerSuggestedTargets ?? [],
-    outputSchema: { targets: `number[${input.pick}]` },
-    storytellerOmniscientContext: {
-      players: room.players.map((p) => {
-        const meta = p.characterId ? room.script.characters.find((c) => c.id === p.characterId) : null;
-        return {
-          seatIndex: p.seatIndex,
-          isAlive: p.isAlive,
-          characterId: p.characterId ?? null,
-          alignment: meta?.alignment ?? null,
-        };
-      }),
-      fullChatLog: room.chatLog.slice(-200),
-      currentNomination: room.currentNomination,
-      nominationsToday: Array.from(room.nominationsToday.entries()).map(([nominator, nominated]) => ({ nominator, nominated })),
-      votes: Array.from(room.votes.entries()).map(([seatIndex, inFavor]) => ({ seatIndex, inFavor })),
-    },
-  });
-  onDebug?.({
-    kind: 'request',
-    stepId: input.stepId,
-    model: OPENAI_MODEL,
-    systemPrompt,
-    userPrompt,
-  });
-
-  const ac = new AbortController();
-  const timeoutMs = Number(process.env.AI_STORYTELLER_TIMEOUT_MS ?? '') || 240_000;
-  const timeout = setTimeout(() => ac.abort(), timeoutMs);
-  const startedAt = Date.now();
-  try {
-    const res = await fetch(`${OPENAI_BASE_URL}/v1/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: OPENAI_MODEL,
-        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
-        response_format: { type: 'json_object' },
-        temperature: 0.4,
-        ...fastResponseOptions(),
-      }),
-      signal: ac.signal,
-    });
-    clearTimeout(timeout);
-    if (!res.ok) {
-      const t = await res.text().catch(() => '');
-      throw new Error(`${res.status} ${t}`);
-    }
-    const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
-    const content = data.choices?.[0]?.message?.content;
-    if (!content) throw new Error('Empty AI response');
-    onDebug?.({
-      kind: 'response',
-      stepId: input.stepId,
-      model: OPENAI_MODEL,
-      rawResponse: content,
-      elapsedMs: Date.now() - startedAt,
-    });
-    let parsed: unknown = null;
-    try {
-      parsed = JSON.parse(content);
-    } catch {
-      parsed = null;
-    }
-    const v = validateNightTargets(input, parsed);
-    return v ?? fallback;
-  } catch (e) {
-    onDebug?.({
-      kind: 'error',
-      stepId: input.stepId,
-      model: OPENAI_MODEL,
-      error: e instanceof Error ? e.message : String(e),
-    });
-    return fallback;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
 export async function answerPostGameQuestion(
   room: Room,
-  seatIndex: number,
+  askerSeatIndex: number,
   question: string,
 ): Promise<string> {
   const q = String(question ?? '').trim();
-  if (!q) return '上帝：你的问题是空的，请具体描述你想复盘的环节。';
+  if (!q) return '上帝：你的问题是空的，请具体一点。';
+
+  const asker = room.players[askerSeatIndex];
+  if (!asker) return '上帝：提问玩家不存在。';
 
   const apiKey = getApiKey();
-  if (!apiKey) {
-    return '上帝：当前未配置大模型密钥，无法生成复盘解释。你可以先配置 OPENAI_API_KEY 后再提问。';
-  }
+  if (!apiKey) return '上帝：当前未配置大模型密钥，无法生成复盘解释。';
 
   const systemPrompt = [
-    '你是《血染钟楼》的复盘上帝。',
-    '对局已经结束，现在只做事实复盘与规则解释，不接管游戏流程。',
-    '你必须基于提供的真实身份、聊天记录、投票与复盘日志作答。',
-    '回答要具体、可核查，必要时点明“是哪一晚/哪一步/哪个座位”导致差异。',
-    '请输出纯文本，不要 markdown。',
+    '你是血染钟楼对局结束后的上帝复盘助手。',
+    '请基于真实对局记录回答玩家问题，解释关键决策和信息流。',
+    '不要编造不存在的事件；如果记录不足就明确说明不确定。',
+    '回答风格清晰、简洁，输出纯文本，不要 markdown。',
   ].join('\n');
-
-  const players = room.players.map((p) => {
-    const meta = p.characterId ? room.script.characters.find((c) => c.id === p.characterId) : null;
-    return {
-      seatIndex: p.seatIndex,
-      nickname: p.nickname,
-      isAlive: p.isAlive,
-      characterId: p.characterId ?? null,
-      characterNameZh: meta?.nameZh ?? null,
-      alignment: meta?.alignment ?? null,
-    };
-  });
 
   const userPrompt = JSON.stringify({
     question: q,
-    roomId: room.id,
+    askerSeatIndex,
     scriptNameZh: room.script.nameZh,
-    askerSeatIndex: seatIndex,
-    endedState: {
+    finalState: {
       status: room.status,
       phase: room.phase,
       dayNumber: room.dayNumber,
     },
-    truth: {
-      players,
-      demonBluffs: room.demonBluffs ?? [],
-    },
-    fullChatLog: room.chatLog.slice(-300),
-    replayLog: room.replayLog.slice(-500),
-    voteSnapshot: {
-      currentNomination: room.currentNomination,
-      votes: Array.from(room.votes.entries()).map(([s, v]) => ({ seatIndex: s, inFavor: v })),
-      nominationsToday: Array.from(room.nominationsToday.entries()).map(([nominator, nominated]) => ({ nominator, nominated })),
-      skippedNominationsToday: Array.from(room.skippedNominationsToday.values()),
-    },
-    requirement: [
-      '先直接回答问题结论',
-      '再给出依据（关键事件/日志）',
-      '若问题前提有误，请指出并纠正',
-    ],
+    players: room.players.map((p) => ({
+      seatIndex: p.seatIndex,
+      nickname: p.nickname,
+      isAlive: p.isAlive,
+      characterId: p.characterId ?? null,
+    })),
+    chatTail: room.chatLog.slice(-300),
   });
 
   const ac = new AbortController();
-  const timeoutMs = Number(process.env.AI_STORYTELLER_TIMEOUT_MS ?? '') || 240_000;
+  const timeoutMs = Number(process.env.AI_STORYTELLER_TIMEOUT_MS ?? '') || 180_000;
   const timeout = setTimeout(() => ac.abort(), timeoutMs);
   try {
     const res = await fetch(`${OPENAI_BASE_URL}/v1/chat/completions`, {
@@ -605,23 +327,26 @@ export async function answerPostGameQuestion(
       },
       body: JSON.stringify({
         model: OPENAI_MODEL,
-        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
         temperature: 0.3,
-        ...fastResponseOptions(),
       }),
       signal: ac.signal,
     });
+
     if (!res.ok) {
       const t = await res.text().catch(() => '');
       return `上帝：复盘回答失败（${res.status}）。${t.slice(0, 120)}`;
     }
     const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
     const content = data.choices?.[0]?.message?.content?.trim();
-    if (!content) return '上帝：我没有生成有效答案，请换个问法再试一次。';
+    if (!content) return '上帝：我这次没能组织出有效复盘答案。';
     return content.slice(0, 3000);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    return `上帝：复盘回答异常（${msg}）。请稍后重试。`;
+    return `上帝：复盘回答异常（${msg}）。`;
   } finally {
     clearTimeout(timeout);
   }
