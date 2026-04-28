@@ -77,7 +77,7 @@ export interface RoomView {
     text: string;
   }>;
   aiPlayerEnabled?: boolean;
-  aiPlayerTemperature?: number;
+  aiPlayerBehaviorStyle?: 'analytical' | 'skeptical' | 'cautious' | 'empathetic' | 'deceptive' | 'chaotic';
   globalLog?: ReplayLogEntry[];
   aiStorytellerEnabled?: boolean;
   minPlayers: number;

@@ -467,8 +467,13 @@ export function submitNightAction(room: Room, actorSeatIndex: number, targets: n
 function gotoDay(room: Room): void {
   room.phase = 'day';
   room.dayNumber++;
-  // 按需求：白天不需要“进入提名阶段”按钮，天亮后直接开始提名流转
-  room.daySubPhase = 'nomination';
+  // 白天先进入讨论编排（上帝问答->私聊->公开发言），再进入提名投票。
+  room.daySubPhase = 'discussion';
+  room.dayFlowStage = 'god_dialogue';
+  const aliveSeats = room.players.filter((p) => p.isAlive).map((p) => p.seatIndex);
+  room.dayFlowStartSeat = aliveSeats.length > 0
+    ? aliveSeats[Math.floor(Math.random() * aliveSeats.length)]
+    : null;
   room.currentNomination = null;
   room.nominationsToday = new Map();
   room.skippedNominationsToday = new Set();

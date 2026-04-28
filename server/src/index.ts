@@ -182,6 +182,7 @@ app.post('/api/dev/quickstart', async (req, res) => {
   const playerCountRaw = req.body?.playerCount;
   const playerCount = Number.isInteger(playerCountRaw) ? (playerCountRaw as number) : 5;
   const start = req.body?.start === false ? false : true;
+  const aiTakeover = req.body?.aiTakeover === false ? false : true;
 
   const room = createRoom(scriptId);
   const nickPrefix = ['夜行', '钟声', '雾隐', '火漆', '预言', '静默', '迷踪', '秘钥', '月影', '余烬'];
@@ -196,6 +197,11 @@ app.post('/api/dev/quickstart', async (req, res) => {
   }
 
   if (start) {
+    if (aiTakeover) {
+      room.aiStorytellerEnabled = true;
+      room.aiLastActionAt = 0;
+      ensureAiTakeoverForUnattendedSeats(room);
+    }
     const ok = startGame(room);
     if (!ok) return res.status(400).json({ error: 'Cannot start game' });
     pushReplay(room, 'setup', '对局', `游戏开始：${room.players.length} 人，剧本「${room.script.nameZh}」。`);
@@ -243,7 +249,7 @@ app.post('/api/dev/quickstart', async (req, res) => {
   if (/:(3001)$/.test(String(req.get('host') ?? '')) && !/:(5173|5174)$/.test(base)) base = 'http://localhost:5173';
   const joinUrls = players.map((p) => `${base}/?autoJoin=1&autoAi=1&roomId=${encodeURIComponent(room.id)}&nickname=${encodeURIComponent(p.nickname)}`);
   const adminUrl = `${base}/?admin=1&roomId=${encodeURIComponent(room.id)}&hostSecret=${encodeURIComponent(room.hostSecret)}`;
-  res.json({ roomId: room.id, hostSecret: room.hostSecret, players, joinUrls, adminUrl, started: start });
+  res.json({ roomId: room.id, hostSecret: room.hostSecret, players, joinUrls, adminUrl, started: start, aiTakeover });
 });
 
 interface AutoTestGameSummary {
@@ -423,7 +429,7 @@ app.post('/api/dev/autotest/run', async (req, res) => {
       if (!joined) break;
       setReady(room, joined.seatIndex, true);
       room.aiPlayerEnabledBySeat.set(joined.seatIndex, true);
-      room.aiPlayerTemperatureBySeat.set(joined.seatIndex, 0.5);
+      ensureAiBehaviorStyle(room, joined.seatIndex);
       const stylePool = ['balanced', 'assertive', 'deceptive', 'chaotic'];
       const seatStyle = promptStyle === 'mixed'
         ? stylePool[(joined.seatIndex + i) % stylePool.length]
@@ -694,6 +700,7 @@ const FALLBACK_NIGHT_CONFIRM_TIMEOUT_MS = Number(process.env.FALLBACK_NIGHT_CONF
 const FALLBACK_DAY_VOTE_TIMEOUT_MS = Number(process.env.FALLBACK_DAY_VOTE_TIMEOUT_MS ?? '') || 60_000;
 const FALLBACK_DAY_TURN_TIMEOUT_MS = Number(process.env.FALLBACK_DAY_TURN_TIMEOUT_MS ?? '') || 60_000;
 const DAY_PUBLIC_SPEECH_WAIT_TIMEOUT_MS = Number(process.env.DAY_PUBLIC_SPEECH_WAIT_TIMEOUT_MS ?? '') || 15_000;
+const DAY_DIALOGUE_WAIT_TIMEOUT_MS = Number(process.env.DAY_DIALOGUE_WAIT_TIMEOUT_MS ?? '') || 10_000;
 const DAY_FLOW_STAGES: Array<import('./game/types.js').DayFlowStage> = [
   'god_dialogue',
   'private_dialogue',
@@ -856,6 +863,7 @@ function maybeAdvanceStructuredDay(roomId: string, room: import('./game/types.js
   const cursor = Math.max(0, Math.min(getDayFlowCursor(room, stage), queue.length - 1));
   const actor = queue[cursor];
   if (!done.has(actor)) {
+    let stageCompleted = false;
     if (stage === 'public_speech') {
       const pubMarkKey = `ai_day_public_done_${room.dayNumber}_seat_${actor}`;
       const spoken = room.storytellerDecisions.get(pubMarkKey) === true;
@@ -886,7 +894,44 @@ function maybeAdvanceStructuredDay(roomId: string, room: import('./game/types.js
         room.storytellerDecisions.set(pubMarkKey, true);
       }
       room.storytellerDecisions.set(waitKey, 0);
+      stageCompleted = room.storytellerDecisions.get(pubMarkKey) === true;
+    } else if (stage === 'god_dialogue' || stage === 'private_dialogue') {
+      const markKey = stage === 'god_dialogue'
+        ? `ai_day_god_done_${room.dayNumber}_seat_${actor}`
+        : `ai_day_dm_done_${room.dayNumber}_seat_${actor}`;
+      const completed = room.storytellerDecisions.get(markKey) === true;
+      if (completed) {
+        stageCompleted = true;
+      } else {
+        const waitKey = `day_flow_wait_since_${room.dayNumber}_${stage}_${actor}`;
+        const now = Date.now();
+        const waitSinceRaw = Number(room.storytellerDecisions.get(waitKey) ?? 0);
+        const waitSince = Number.isFinite(waitSinceRaw) && waitSinceRaw > 0 ? waitSinceRaw : now;
+        room.storytellerDecisions.set(waitKey, waitSince);
+        const waited = now - waitSince;
+        if (waited < DAY_DIALOGUE_WAIT_TIMEOUT_MS) {
+          broadcast(roomId, { type: 'room', room: getRoomView(room) });
+          return;
+        }
+        room.storytellerDecisions.set(markKey, true);
+        room.storytellerDecisions.set(waitKey, 0);
+        pushPublic(
+          room,
+          stage === 'god_dialogue'
+            ? `上帝问答（超时跳过）：${seatLabel(room, actor)} 本轮未发起问答。`
+            : `玩家私聊（超时跳过）：${seatLabel(room, actor)} 本轮未发起私聊。`,
+        );
+        stageCompleted = true;
+      }
+    } else {
+      stageCompleted = true;
     }
+
+    if (!stageCompleted) {
+      broadcast(roomId, { type: 'room', room: getRoomView(room) });
+      return;
+    }
+
     done.add(actor);
     if (stage === 'god_dialogue') {
       pushPublic(room, `白天流程：${seatLabel(room, actor)} 完成上帝问答。`);
@@ -992,16 +1037,18 @@ function enforceProgressFallback(roomId: string, room: import('./game/types.js')
 function tickFlowDirector(roomId: string, room: import('./game/types.js').Room): void {
   maybeLogDirectorDebug(roomId, room);
   const hasAiPlayerEnabled = room.players.some((p) => room.aiPlayerEnabledBySeat.get(p.seatIndex) === true);
-  // 关键边界：只有“AI 说书人接管”时，系统才自动导演流程与兜底推进。
-  // 若关闭 AI 说书人，即使存在 AI 玩家，也不应由系统代替说书人自动快进。
-  if (room.aiStorytellerEnabled) {
+  // 结构化白天流程与 AI 玩家托管解耦：只要有 AI 玩家，就推进白天讨论阶段。
+  if (hasAiPlayerEnabled) {
     maybeAdvanceStructuredDay(roomId, room);
+  }
+  // 强兜底与导演快进仍由 AI 说书人开关控制，避免手动主持时被系统硬推进。
+  if (room.aiStorytellerEnabled) {
     enforceProgressFallback(roomId, room);
   }
-  if (room.aiStorytellerEnabled && hasAiPlayerEnabled && room.phase === 'day') {
+  if (hasAiPlayerEnabled && room.phase === 'day') {
     maybeAiTakeoverDay(roomId, room);
   }
-  if (room.aiStorytellerEnabled && (room.phase === 'night' || room.phase === 'first_night')) {
+  if (hasAiPlayerEnabled && (room.phase === 'night' || room.phase === 'first_night')) {
     void maybeAiTakeoverNight(roomId, room);
   }
 }
@@ -1018,7 +1065,8 @@ type ClientMessage =
   | { type: 'vote'; inFavor: boolean }
   | { type: 'chat_send'; scope: 'god' | 'dm' | 'public'; toSeat?: number; text: string }
   | { type: 'toggle_ai_player'; enabled: boolean }
-  | { type: 'set_ai_player_temperature'; temperature: number }
+  | { type: 'set_ai_player_behavior_style'; style: import('./game/types.js').AiBehaviorStyle }
+  | { type: 'set_ai_player_temperature'; temperature: number } // deprecated
   | { type: 'night_confirm' }
   | { type: 'night_action'; targets: number[] }
   | { type: 'day_action'; actionId: string; targetSeat?: number }
@@ -1550,9 +1598,22 @@ function buildForcedActiveDayPlan(
   const altLabel = alt != null ? `，备选 #${alt + 1}` : '';
   const myInfo = summarizeMyNightInfo(room, seatIndex);
   const infoPart = rolePush && myInfo ? `我的夜间信息是：${myInfo}。` : '';
-  const publicText = rolePush
-    ? `${infoPart}基于我掌握的信息和发言矛盾，今天主推 ${targetLabel}${altLabel}，请不要分票，优先形成处决票型。`
-    : `我建议大家收敛到一个最高嫌疑目标，不要分票空转。优先推进 ${targetLabel}${altLabel}。`;
+  const voice = buildVoiceProfile(room, seatIndex);
+  const seed = `${room.id}|forced_day_plan|seat=${seatIndex}|day=${room.dayNumber}`;
+  const publicTemplates = rolePush
+    ? [
+      `${infoPart}我先把我这边信息摊出来：我目前更怀疑 ${targetLabel}${altLabel}，因为它和公开发言/票型有冲突点需要解释。建议先提名 ${targetLabel} 观察票型反应，再决定是否处决。`,
+      `${infoPart}我有个担心：${targetLabel}${altLabel} 这边信息链对不上（发言/票型里有矛盾）。我想先小步验证——先提名看票型，大家有不同信息欢迎补充。`,
+      `${infoPart}给两点理由我为什么想看 ${targetLabel}${altLabel}：①公开信息里矛盾未解释；②票型/节奏上更像关键位。先提名试探，别急着一锤定音。`,
+      `${infoPart}我先不下死结论，但 ${targetLabel}${altLabel} 值得今天优先验证。我们先提名 ${targetLabel} 看谁愿意跟票、谁在躲票，再决定是否处决。`,
+    ]
+    : [
+      `我先抛一个假设：${targetLabel}${altLabel} 可能更值得优先验证。理由来自公开发言与票型细节（欢迎反驳/补充）。建议先提名 ${targetLabel} 看票型反应。`,
+      `我暂时没有强信息，但不想空转：我倾向先看 ${targetLabel}${altLabel}。先提名 ${targetLabel} 观察票型，大家把自己的理由说清楚再做处决共识。`,
+      `我更想走“可验证”的路径：先围绕 ${targetLabel}${altLabel} 做一次提名试探，看看票型与发言的对应关系，再决定处决目标。`,
+      `我直觉上觉得 ${targetLabel}${altLabel} 值得先压一下，但我也可能错。先提名 ${targetLabel}，如果你们有更强信息请直接抛出来。`,
+    ];
+  const publicText = `${voice} ${pickBySeed(publicTemplates, seed)}`;
   const dm: Array<{ toSeat: number; text: string }> = [];
   if (target != null) {
     for (const p of room.players) {
@@ -1560,8 +1621,8 @@ function buildForcedActiveDayPlan(
       dm.push({
         toSeat: p.seatIndex,
         text: rolePush
-          ? `我根据自己的夜间信息主推 #${target + 1}${alt != null ? `（备选 #${alt + 1}）` : ''}，请你在提名与投票阶段优先配合集中票型。`
-          : `我建议今天优先推进 #${target + 1}，不要分票；你如果同意请在投票阶段配合。`,
+          ? `我这边夜间信息（可简述）：${myInfo || '有但不便全公开'}。我目前更想先验证 #${target + 1}${alt != null ? `（备选 #${alt + 1}）` : ''}，理由是它和公开发言/票型有冲突点。你昨晚有信息吗？你更怀疑谁、为什么？如果你也觉得可疑，白天可以先提名/投票观察票型。`
+          : `我目前更想先看 #${target + 1}${alt != null ? `（备选 #${alt + 1}）` : ''}，主要基于公开发言与票型的细节。你这边有信息或更强嫌疑目标吗？如果你同意，我们可以先围绕这个座位提名试探票型，再决定是否处决。`,
       });
       if (dm.length >= 3) break;
     }
@@ -1591,6 +1652,129 @@ function isWeakPublicSpeech(text: string): boolean {
     '信息不足',
   ];
   return weakPatterns.some((w) => t.includes(w));
+}
+
+function isBackgroundSystemLine(text: string): boolean {
+  const t = String(text ?? '').trim();
+  if (!t) return true;
+  return t.includes('AI 托管已开启')
+    || t.includes('AI 托管已关闭')
+    || t.includes('AI 说书人已接管流程')
+    || t.includes('AI 说书人已关闭');
+}
+
+function isHighSignalPublicLine(text: string): boolean {
+  const t = String(text ?? '').trim();
+  if (!t || isBackgroundSystemLine(t)) return false;
+  return t.includes('公开发言')
+    || t.includes('提名')
+    || t.includes('投票')
+    || t.includes('处决')
+    || t.includes('死亡')
+    || t.includes('复活')
+    || t.includes('进入夜晚')
+    || t.includes('进入白天')
+    || t.includes('夜晚结束');
+}
+
+function ensureAiTakeoverForUnattendedSeats(room: import('./game/types.js').Room): number {
+  const connectedSeats = new Set<number>(Array.from(room.connections.values()));
+  let enabledCount = 0;
+  for (const p of room.players) {
+    const seat = p.seatIndex;
+    // 已有真人在线连接的座位保持手动，不强制接管。
+    if (connectedSeats.has(seat)) continue;
+    if (!(room.aiPlayerEnabledBySeat.get(seat) ?? false)) {
+      room.aiPlayerEnabledBySeat.set(seat, true);
+      enabledCount++;
+    }
+    ensureAiBehaviorStyle(room, seat);
+    room.aiPlayerLastActionAtBySeat.set(seat, 0);
+  }
+  return enabledCount;
+}
+
+const AI_BEHAVIOR_STYLES: Array<import('./game/types.js').AiBehaviorStyle> = [
+  'analytical',
+  'skeptical',
+  'cautious',
+  'empathetic',
+  'deceptive',
+  'chaotic',
+];
+
+function temperatureFromBehaviorStyle(style: import('./game/types.js').AiBehaviorStyle): number {
+  if (style === 'analytical') return 0.35;
+  if (style === 'skeptical') return 0.45;
+  if (style === 'cautious') return 0.25;
+  if (style === 'empathetic') return 0.55;
+  if (style === 'deceptive') return 0.65;
+  return 0.8;
+}
+
+function setAiBehaviorStyle(room: import('./game/types.js').Room, seatIndex: number, style: import('./game/types.js').AiBehaviorStyle): void {
+  room.aiPlayerBehaviorStyleBySeat.set(seatIndex, style);
+  room.aiPlayerTemperatureBySeat.set(seatIndex, temperatureFromBehaviorStyle(style));
+  // 行为方式改变后，允许立即重新规划（避免继续沿用旧 day_plan）
+  room.storytellerDecisions.delete(`ai_day_plan_${room.dayNumber}_seat_${seatIndex}`);
+}
+
+function ensureAiBehaviorStyle(room: import('./game/types.js').Room, seatIndex: number): import('./game/types.js').AiBehaviorStyle {
+  const existing = room.aiPlayerBehaviorStyleBySeat.get(seatIndex);
+  if (existing) return existing;
+  // 每局固定随机：用 room.createdAt 作为一局的稳定种子，避免运行中抖动
+  const seed = `${room.id}|ai_behavior|seat=${seatIndex}|createdAt=${room.createdAt}`;
+  const style = pickBySeed(AI_BEHAVIOR_STYLES, seed);
+  setAiBehaviorStyle(room, seatIndex, style);
+  return style;
+}
+
+function hashToInt(s: string): number {
+  // 简单稳定 hash（非加密）：用于“可复现伪随机”
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function pickBySeed<T>(items: T[], seed: string): T {
+  if (items.length === 0) throw new Error('pickBySeed: empty items');
+  const idx = hashToInt(seed) % items.length;
+  return items[idx]!;
+}
+
+function buildVoiceProfile(room: import('./game/types.js').Room, seatIndex: number): string {
+  const style = ensureAiBehaviorStyle(room, seatIndex);
+  const baseSeed = `${room.id}|seat=${seatIndex}|day=${room.dayNumber}|style=${style}`;
+  const byStyle: Record<import('./game/types.js').AiBehaviorStyle, string[]> = {
+    analytical: [
+      '画像=条理型：偏好用“1/2/3点”结构，说话简洁，强调可验证事实与票型。',
+      '画像=推理型：偏好列出证据链与反证，谨慎下结论，倾向先提名验证。',
+    ],
+    skeptical: [
+      '画像=质询型：偏好反问与追问矛盾点，要求对方给出理由，但语气不过分强硬。',
+      '画像=怀疑型：更关注“谁在回避细节/谁在带节奏”，用问题逼出信息。',
+    ],
+    cautious: [
+      '画像=谨慎型：更强调不确定性与风险点（中毒/伪装），倾向先小步验证再下结论。',
+      '画像=保守型：倾向先收集信息、少做大跳跃结论，避免误处决关键好人。',
+    ],
+    empathetic: [
+      '画像=共情型：语气更友好，先认可他人观点再补充自己的理由，擅长拉共识。',
+      '画像=协调型：擅长总结分歧并提出折中验证方案，减少对立情绪。',
+    ],
+    deceptive: [
+      '画像=圆滑型：表达更委婉、模糊留余地，善于转移焦点并制造信息噪音。',
+      '画像=带节奏型：用“看似合理的理由”引导票型，但避免明显自相矛盾。',
+    ],
+    chaotic: [
+      '画像=戏剧型：适度使用比喻/讲故事式表达，但仍需落到具体可执行下一步。',
+      '画像=反常规型：允许非常规推理顺序与节奏，但行动仍需自洽。',
+    ],
+  };
+  return pickBySeed(byStyle[style], baseSeed);
 }
 
 function buildVoteSnapshot(room: import('./game/types.js').Room): {
@@ -1650,23 +1834,27 @@ function buildAiPlayerMemory(room: import('./game/types.js').Room, seatIndex: nu
       if (e.scope === 'dm') return e.fromSeat === seatIndex || e.toSeat === seatIndex;
       return false;
     })
+    .filter((e) => !isBackgroundSystemLine(e.text))
     .slice(-10)
     .map((e) => `[${e.scope}] #${e.fromSeat + 1}${typeof e.toSeat === 'number' ? `->#${e.toSeat + 1}` : ''}: ${e.text.slice(0, 70)}`);
-  const publicTail = room.publicLog.slice(-10).map((x) => x.line.slice(0, 90));
+  const publicTail = room.publicLog
+    .filter((x) => isHighSignalPublicLine(x.line))
+    .slice(-10)
+    .map((x) => x.line.slice(0, 90));
   const memoryTail = (getAiMemoryBySeat(room).get(seatIndex) ?? []).slice(-24);
   const memorySummary = String(getAiMemorySummaryBySeat(room).get(seatIndex) ?? '').trim();
   const trustTop = pickTopSuspiciousAlive(room, seatIndex, 3).map((x) => `#${x.seatIndex + 1}(${x.score.toFixed(2)})`);
   const voteTail = buildRecentVoteEvents(room).slice(-6);
   return [
-    `你是 #${seatIndex + 1}·${me.nickname}。当前是第 ${room.dayNumber} 天，阶段=${room.phase}/${room.daySubPhase ?? 'none'}。`,
-    `存活：${aliveSeats.join('、') || '无'}；死亡：${deadSeats.join('、') || '无'}。`,
-    `你最近夜间信息：${myNightInfo.length > 0 ? myNightInfo.join(' | ') : '暂无'}`,
-    `你的心路历程摘要（模型整理）：${memorySummary || '暂无'}`,
-    `你的近期原始事件（校验用）：${memoryTail.length > 0 ? memoryTail.join(' || ') : '暂无'}`,
-    `你可见聊天摘要：${visibleChat.length > 0 ? visibleChat.join(' || ') : '暂无'}`,
-    `公共流程摘要：${publicTail.length > 0 ? publicTail.join(' || ') : '暂无'}`,
-    `近期投票事件：${voteTail.length > 0 ? voteTail.join(' || ') : '暂无'}`,
-    `当前高嫌疑目标（内部评分）：${trustTop.length > 0 ? trustTop.join('、') : '暂无明显目标'}`,
+    `[核心身份] 你是 #${seatIndex + 1}·${me.nickname}。当前：第 ${room.dayNumber} 天，阶段=${room.phase}/${room.daySubPhase ?? 'none'}。`,
+    `[场上存活] 存活：${aliveSeats.join('、') || '无'}；死亡：${deadSeats.join('、') || '无'}。`,
+    `[私有信息] 最近夜间信息：${myNightInfo.length > 0 ? myNightInfo.join(' | ') : '暂无'}`,
+    `[策略摘要] 你的心路历程（模型整理）：${memorySummary || '暂无'}`,
+    `[聊天重点] 你可见聊天：${visibleChat.length > 0 ? visibleChat.join(' || ') : '暂无'}`,
+    `[流程重点] 公共流程：${publicTail.length > 0 ? publicTail.join(' || ') : '暂无'}`,
+    `[投票重点] 近期提名/投票：${voteTail.length > 0 ? voteTail.join(' || ') : '暂无'}`,
+    `[候选目标] 当前高嫌疑目标（内部评分）：${trustTop.length > 0 ? trustTop.join('、') : '暂无明显目标'}`,
+    `[校验尾部] 近期原始事件（仅校验）：${memoryTail.length > 0 ? memoryTail.join(' || ') : '暂无'}`,
   ].join('\n');
 }
 
@@ -1680,19 +1868,25 @@ function buildAiSeatContext(room: import('./game/types.js').Room, seatIndex: num
   playerMemory: string;
   nightInfo: string[];
   promptStyle: string;
+  voiceProfile: string;
 } {
   const roomView = getRoomView(room, seatIndex, false);
+  const aiRoomView = {
+    ...roomView,
+    publicLog: (roomView.publicLog ?? []).filter((x) => isHighSignalPublicLine(x.line)),
+    chatLog: (roomView.chatLog ?? []).filter((e) => !isBackgroundSystemLine(e.text)),
+  };
   const yourCharacterId = getShownCharacterId(room.players[seatIndex]) ?? null;
   const yourRole = buildYourRolePayload(room, seatIndex);
   const yourAlignment = (yourRole as any)?.alignment as ('good' | 'evil' | undefined);
-  const chatLog = (roomView.chatLog ?? []).map((e) => ({
+  const chatLog = (aiRoomView.chatLog ?? []).map((e) => ({
     scope: e.scope,
     fromSeat: e.fromSeat,
     toSeat: e.toSeat,
     text: e.text,
     at: e.at,
   }));
-  const allChatLog = (roomView.chatLog ?? []).slice(-120).map((e) => ({
+  const allChatLog = (aiRoomView.chatLog ?? []).slice(-120).map((e) => ({
     scope: e.scope,
     fromSeat: e.fromSeat,
     toSeat: e.toSeat,
@@ -1710,7 +1904,16 @@ function buildAiSeatContext(room: import('./game/types.js').Room, seatIndex: num
     const seatStyle = styleBySeat.get(seatIndex);
     if (typeof seatStyle === 'string' && seatStyle.trim()) promptStyle = seatStyle;
   }
-  return { roomView, yourCharacterId, yourRole, yourAlignment, chatLog, allChatLog, playerMemory, nightInfo, promptStyle };
+  // 行为方式模块：优先用它影响 promptStyle（减少同质化 + 与旧“积极程度”合并）
+  const behavior = ensureAiBehaviorStyle(room, seatIndex);
+  if (behavior === 'analytical') promptStyle = 'balanced';
+  else if (behavior === 'skeptical') promptStyle = 'assertive';
+  else if (behavior === 'cautious') promptStyle = 'balanced';
+  else if (behavior === 'empathetic') promptStyle = 'balanced';
+  else if (behavior === 'deceptive') promptStyle = 'deceptive';
+  else if (behavior === 'chaotic') promptStyle = 'chaotic';
+  const voiceProfile = buildVoiceProfile(room, seatIndex);
+  return { roomView: aiRoomView, yourCharacterId, yourRole, yourAlignment, chatLog, allChatLog, playerMemory, nightInfo, promptStyle, voiceProfile };
 }
 
 function shouldVoteInFavorByPriority(
@@ -2102,9 +2305,32 @@ wss.on('connection', (ws: any, req) => {
         const enabled = !!msg.enabled;
         room.aiPlayerEnabledBySeat.set(seatIndex, enabled);
         room.aiPlayerLastActionAtBySeat.set(seatIndex, 0);
-        if (enabled && !room.aiPlayerTemperatureBySeat.has(seatIndex)) room.aiPlayerTemperatureBySeat.set(seatIndex, 0.5);
-        const tip = enabled ? `AI 托管已开启：${seatLabel(room, seatIndex)}。` : `AI 托管已关闭：${seatLabel(room, seatIndex)}。`;
-        pushPublic(room, tip);
+        if (enabled) ensureAiBehaviorStyle(room, seatIndex);
+        broadcast(roomId, { type: 'room', room: getRoomView(room) });
+        return;
+      }
+
+      if (msg.type === 'set_ai_player_behavior_style') {
+        if (isAdmin) {
+          ws.send(JSON.stringify({ type: 'error', message: 'admin_cannot_set_ai_player_behavior_style' }));
+          return;
+        }
+        if (room.status !== 'playing') {
+          ws.send(JSON.stringify({ type: 'error', message: 'set_ai_player_behavior_style_not_allowed' }));
+          return;
+        }
+        const style = String((msg as any).style ?? '') as import('./game/types.js').AiBehaviorStyle;
+        if (!AI_BEHAVIOR_STYLES.includes(style)) {
+          ws.send(JSON.stringify({ type: 'error', message: 'invalid_ai_player_behavior_style' }));
+          return;
+        }
+        // 开启托管时才允许调整（避免“手动玩家被动改掉策略”）
+        if (!(room.aiPlayerEnabledBySeat.get(seatIndex) ?? false)) {
+          ws.send(JSON.stringify({ type: 'error', message: 'ai_player_not_enabled' }));
+          return;
+        }
+        setAiBehaviorStyle(room, seatIndex, style);
+        room.aiPlayerLastActionAtBySeat.set(seatIndex, 0);
         broadcast(roomId, { type: 'room', room: getRoomView(room) });
         return;
       }
@@ -2118,12 +2344,8 @@ wss.on('connection', (ws: any, req) => {
           ws.send(JSON.stringify({ type: 'error', message: 'set_ai_player_temperature_not_allowed' }));
           return;
         }
-        const t = Number(msg.temperature);
-        if (!Number.isFinite(t) || t < 0 || t > 1) {
-          ws.send(JSON.stringify({ type: 'error', message: 'invalid_ai_player_temperature' }));
-          return;
-        }
-        room.aiPlayerTemperatureBySeat.set(seatIndex, t);
+        // 兼容旧客户端：温度已合并为“行为方式”模块，不再允许手动设置。
+        ws.send(JSON.stringify({ type: 'error', message: 'ai_player_temperature_deprecated' }));
         broadcast(roomId, { type: 'room', room: getRoomView(room) });
         return;
       }
@@ -2358,10 +2580,16 @@ wss.on('connection', (ws: any, req) => {
         }
         room.aiStorytellerEnabled = !!msg.enabled;
         room.aiLastActionAt = 0;
+        if (room.aiStorytellerEnabled) {
+          const enabledCount = ensureAiTakeoverForUnattendedSeats(room);
+          if (enabledCount > 0) {
+            const section = room.phase === 'day' ? dayReplayTitle(room) : nightReplayTitle(room);
+            pushReplay(room, section.key, section.title, `AI 说书人接管后，已自动开启 ${enabledCount} 个无人在线座位的 AI 玩家托管。`);
+          }
+        }
         const tip = room.aiStorytellerEnabled ? 'AI 说书人已接管流程。' : 'AI 说书人已关闭，切回人工控制。';
         const section = room.phase === 'day' ? dayReplayTitle(room) : nightReplayTitle(room);
         pushReplay(room, section.key, section.title, tip);
-        pushPublic(room, tip);
         broadcast(roomId, { type: 'room', room: getRoomView(room) });
         return;
       }
@@ -2379,6 +2607,12 @@ wss.on('connection', (ws: any, req) => {
         if (!isHost) {
           ws.send(JSON.stringify({ type: 'error', message: 'host_only:start' }));
           return;
+        }
+        if (room.aiStorytellerEnabled) {
+          const enabledCount = ensureAiTakeoverForUnattendedSeats(room);
+          if (enabledCount > 0) {
+            pushReplay(room, 'setup', '对局', `开局前自动开启 ${enabledCount} 个无人在线座位的 AI 托管。`);
+          }
         }
         const ok = startGame(room);
         if (!ok) {
@@ -2634,8 +2868,8 @@ setInterval(async () => {
 
     // AI 玩家托管：按阶段编排；夜晚仅 `decideAiPlayerNightTargets`（只含 night_action）
     // - 白天：每座位每白天最多 1 次 LLM（day_plan）→ 私聊→公聊→提名/投票
-    // 关键边界：只有开启 AI 说书人接管时，才允许 AI 玩家自动推进动作。
-    if (!room.aiStorytellerEnabled) continue;
+    // 重要：AI 玩家托管与 AI 说书人接管解耦。
+    // 只要座位开启了 AI 托管，就允许该座位自动决策与互动。
     for (const p of room.players) {
       const seatIndex = p.seatIndex;
       if (!(room.aiPlayerEnabledBySeat.get(seatIndex) ?? false)) continue;
@@ -2684,6 +2918,7 @@ setInterval(async () => {
               playerMemory,
               nightInfo,
               promptStyle,
+              voiceProfile,
             } = buildAiSeatContext(room, seatIndex);
 
             let dayTraceId: string | null = null;
@@ -2692,6 +2927,7 @@ setInterval(async () => {
               yourSeatIndex: seatIndex,
               yourRole,
               yourCharacterId,
+              voiceProfile,
               yourAlignment,
               demonBluffs: yourAlignment === 'evil' ? (room.demonBluffs ?? null) : null,
               chatLog,
@@ -2768,9 +3004,7 @@ setInterval(async () => {
           if (stage === 'god_dialogue' && plan && plan.type === 'day_plan' && room.storytellerDecisions.get(godMarkKey) !== true) {
             const q = String(plan.godQuestion?.text ?? '').trim().slice(0, 200);
             const hasNightInfo = (getNightInfoLogBySeat(room).get(seatIndex) ?? []).length > 0;
-            if (!room.aiStorytellerEnabled) {
-              appendBehavior(rid, room, seatIndex, traceId, 'god_dialogue:skipped(human_storyteller_mode)');
-            } else if (q && hasNightInfo) {
+            if (q && hasNightInfo) {
               const ask = pushChat(room, {
                 at: Date.now(),
                 scope: 'god',
@@ -2829,6 +3063,32 @@ setInterval(async () => {
                 dayNumber: room.dayNumber,
                 fromSeat: seatIndex,
                 toSeat,
+                text,
+              });
+              broadcastChat(rid, entry);
+              dmSent++;
+            }
+            // 若模型计划里没有任何私聊，为确保“AI 与 AI 互动”可被回放，
+            // 这里至少给一个对象发出一条“有理由的询问/协作”私聊。
+            if (dmSent === 0 && peers.length > 0) {
+              const fallbackPlan = buildForcedActiveDayPlan(room, seatIndex);
+              const fallbackText = String(fallbackPlan.dm?.[0]?.text ?? '').trim();
+              const toSeat = fallbackPlan.dm?.[0]?.toSeat;
+              const pickSeat = Number.isInteger(toSeat) && room.players[toSeat as number]?.isAlive
+                ? (toSeat as number)
+                : peers[Math.floor(Math.random() * peers.length)];
+              const text =
+                (fallbackText
+                  ? fallbackText
+                  : `我在整理今天的信息：你昨晚有拿到什么信息/你更怀疑谁吗？我目前倾向先验证一两个嫌疑位，看票型再决定处决。你愿意说说你的理由吗？`
+                ).slice(0, 500);
+              const entry = pushChat(room, {
+                at: Date.now(),
+                scope: 'dm',
+                phase: room.phase,
+                dayNumber: room.dayNumber,
+                fromSeat: seatIndex,
+                toSeat: pickSeat,
                 text,
               });
               broadcastChat(rid, entry);

@@ -55,6 +55,7 @@ export function createRoom(scriptId: string): Room {
     nightConfirmations: new Set(),
     aiPlayerEnabledBySeat: new Map(),
     aiPlayerLastActionAtBySeat: new Map(),
+    aiPlayerBehaviorStyleBySeat: new Map(),
     aiPlayerTemperatureBySeat: new Map(),
   };
   rooms.set(room.id, room);
@@ -129,7 +130,7 @@ export function getRoomView(room: Room, _forSeatIndex?: number, includeGlobalLog
     nightConfirmedSeats: Array.from(room.nightConfirmations.values()),
     chatLog,
     aiPlayerEnabled: forSeatIndex === undefined ? undefined : (room.aiPlayerEnabledBySeat.get(forSeatIndex) ?? false),
-    aiPlayerTemperature: forSeatIndex === undefined ? undefined : (room.aiPlayerTemperatureBySeat.get(forSeatIndex) ?? 0.5),
+    aiPlayerBehaviorStyle: forSeatIndex === undefined ? undefined : (room.aiPlayerBehaviorStyleBySeat.get(forSeatIndex) ?? undefined),
     globalLog: includeGlobalLog ? room.replayLog : undefined,
     aiStorytellerEnabled: room.aiStorytellerEnabled,
     minPlayers: room.script.minPlayers,
@@ -172,6 +173,7 @@ function resetRoomForNextGame(room: Room): void {
   room.nightConfirmations = new Set();
   room.aiPlayerEnabledBySeat = new Map();
   room.aiPlayerLastActionAtBySeat = new Map();
+  room.aiPlayerBehaviorStyleBySeat = new Map();
   room.aiPlayerTemperatureBySeat = new Map();
   for (const p of room.players) {
     p.isReady = false;

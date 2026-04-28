@@ -223,7 +223,7 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
   const [nightTargets, setNightTargets] = useState<number[]>([]);
   const [nightLog, setNightLog] = useState<string[]>([]);
   const [chatEntries, setChatEntries] = useState<NonNullable<RoomView['chatLog']>>([]);
-  const [chatScope, setChatScope] = useState<'god' | 'dm' | 'public'>('god');
+  const [chatScope, setChatScope] = useState<'all' | 'god' | 'dm' | 'public'>('all');
   const [chatDmTarget, setChatDmTarget] = useState<number | null>(null);
   const [chatText, setChatText] = useState('');
   const [chatSending, setChatSending] = useState(false);
@@ -266,6 +266,15 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
     border: '1px solid #3a3a3a',
     background: '#0f172a',
     color: '#e5e7eb',
+  };
+  const behaviorStyleZh = (s: string | undefined | null): string => {
+    if (s === 'analytical') return '理性推理型';
+    if (s === 'skeptical') return '质询怀疑型';
+    if (s === 'cautious') return '谨慎保守型';
+    if (s === 'empathetic') return '共情拉票型';
+    if (s === 'deceptive') return '圆滑误导型';
+    if (s === 'chaotic') return '反常规搅局型';
+    return '未分配';
   };
 
   const copyRoomId = async () => {
@@ -601,6 +610,8 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
   const visibleChat = useMemo(() => {
     const base = [...(chatEntries ?? [])].sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
     const filtered = base.filter((e) => {
+      // “全部”只用于回看公开/上帝信息流；私聊请到“私聊”页查看具体对象对话
+      if (chatScope === 'all') return e.scope !== 'dm';
       if (chatScope === 'god') return e.scope === 'god';
       if (chatScope === 'public') return e.scope === 'public';
       if (e.scope !== 'dm') return false;
@@ -1037,17 +1048,24 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
             </button>
             {room.aiPlayerEnabled ? <span className="pill status-ok" style={{ marginLeft: 8 }}>已托管</span> : <span className="pill status-warn" style={{ marginLeft: 8 }}>手动</span>}
             <div style={{ marginTop: 10 }}>
-              <span className="muted">积极程度：</span>
+              <span className="muted">行为方式：</span>
               <select
-                value={String(room.aiPlayerTemperature ?? 0.5)}
-                onChange={(e) => send({ type: 'set_ai_player_temperature', temperature: parseFloat(e.target.value) })}
+                value={String(room.aiPlayerBehaviorStyle ?? '')}
+                onChange={(e) => send({ type: 'set_ai_player_behavior_style', style: e.target.value })}
                 disabled={wsStatus !== 'open' || !room.aiPlayerEnabled}
                 style={{ ...unifiedSelectStyle, marginLeft: 8 }}
               >
-                <option value="0.2">低（更沉默）</option>
-                <option value="0.5">中性（默认）</option>
-                <option value="0.8">高（更积极）</option>
+                <option value="">（随机/未分配）</option>
+                <option value="analytical">理性推理型</option>
+                <option value="skeptical">质询怀疑型</option>
+                <option value="cautious">谨慎保守型</option>
+                <option value="empathetic">共情拉票型</option>
+                <option value="deceptive">圆滑误导型</option>
+                <option value="chaotic">反常规搅局型</option>
               </select>
+              <span className="pill status-warn" style={{ marginLeft: 8 }}>
+                当前：{behaviorStyleZh(room.aiPlayerBehaviorStyle)}
+              </span>
             </div>
           </section>
 
@@ -1142,6 +1160,9 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
             <section className="card" style={{ marginTop: 16 }}>
               <h3>对话</h3>
               <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+                <button type="button" className={chatScope === 'all' ? 'btn-primary' : ''} onClick={() => setChatScope('all')}>
+                  全部
+                </button>
                 <button type="button" className={chatScope === 'god' ? 'btn-primary' : ''} onClick={() => setChatScope('god')}>
                   上帝
                 </button>
@@ -1208,6 +1229,8 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
                     {visibleChat.map((e) => (
                       <li key={e.id}>
                         <span className="muted">
+                          [{e.scope}]
+                          {' '}
                           #{(e.fromSeat ?? 0) + 1}
                           {e.scope === 'dm' && typeof e.toSeat === 'number'
                             ? ` → #${e.toSeat + 1}`
@@ -1404,6 +1427,97 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
             </section>
           )}
         </>
+      )}
+
+      {room.status === 'ended' && (
+        <section className="card" style={{ marginTop: 16 }}>
+          <h3>对话（终局回溯）</h3>
+          <p className="muted" style={{ marginTop: 6 }}>
+            对局结束后保留聊天记录，便于回溯公聊、上帝私聊与玩家私聊全过程。
+          </p>
+          <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+            <button type="button" className={chatScope === 'all' ? 'btn-primary' : ''} onClick={() => setChatScope('all')}>
+              全部
+            </button>
+            <button type="button" className={chatScope === 'god' ? 'btn-primary' : ''} onClick={() => setChatScope('god')}>
+              上帝
+            </button>
+            <button type="button" className={chatScope === 'public' ? 'btn-primary' : ''} onClick={() => setChatScope('public')}>
+              公开屏幕
+            </button>
+            <button type="button" className={chatScope === 'dm' ? 'btn-primary' : ''} onClick={() => setChatScope('dm')}>
+              私聊
+            </button>
+            {chatScope === 'dm' && (
+              <span className="muted" style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
+                对话：
+                {dmTabs.length === 0 ? (
+                  <span className="muted">（暂无私聊）</span>
+                ) : (
+                  dmTabs.map((s) => {
+                    const active = chatDmTarget === s;
+                    const nick = room.players[s]?.nickname ?? `#${s + 1}`;
+                    return (
+                      <button
+                        key={`ended-dm-tab-${s}`}
+                        type="button"
+                        className={active ? 'btn-primary' : ''}
+                        onClick={() => setChatDmTarget(s)}
+                      >
+                        #{s + 1} {nick}
+                      </button>
+                    );
+                  })
+                )}
+                <span className="muted" style={{ marginLeft: 6 }}>
+                  选择：
+                  <select
+                    value={chatDmTarget ?? ''}
+                    onChange={(e) => {
+                      const v = e.target.value ? parseInt(e.target.value, 10) : null;
+                      setChatDmTarget(v);
+                    }}
+                    style={{ marginLeft: 6 }}
+                  >
+                    <option value="">选择玩家</option>
+                    {room.players
+                      .filter((p) => p.seatIndex !== yourSeatIndex)
+                      .map((p) => (
+                        <option key={`ended-dm-opt-${p.id}`} value={p.seatIndex}>
+                          #{p.seatIndex + 1} {p.nickname}
+                        </option>
+                      ))}
+                  </select>
+                </span>
+              </span>
+            )}
+          </div>
+          <div
+            ref={chatScrollRef}
+            style={{ marginTop: 10, border: '1px solid #333', borderRadius: 8, padding: 10, maxHeight: 260, overflow: 'auto' }}
+          >
+            {visibleChat.length === 0 ? (
+              <div className="muted">（暂无对话）</div>
+            ) : (
+              <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.55 }}>
+                {visibleChat.map((e) => (
+                  <li key={e.id}>
+                    <span className="muted">
+                      [{e.scope}] #{(e.fromSeat ?? 0) + 1}
+                      {e.scope === 'dm' && typeof e.toSeat === 'number'
+                        ? ` → #${e.toSeat + 1}`
+                        : e.scope === 'god'
+                          ? '（上帝）'
+                          : ''}
+                      ：
+                    </span>{' '}
+                    {e.text}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </section>
       )}
 
       {room.status === 'ended' && (

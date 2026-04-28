@@ -39,6 +39,8 @@ export type GamePhase =
 export type DaySubPhase = 'discussion' | 'nomination' | 'voting' | 'execution';
 export type DayFlowStage = 'god_dialogue' | 'private_dialogue' | 'public_speech' | 'nomination_vote';
 
+export type AiBehaviorStyle = 'analytical' | 'skeptical' | 'cautious' | 'empathetic' | 'deceptive' | 'chaotic';
+
 /** 玩家座位信息（公开） */
 export interface PlayerSeat {
   id: string;
@@ -170,7 +172,9 @@ export interface Room {
   aiPlayerEnabledBySeat: Map<number, boolean>;
   /** AI 玩家最近一次动作时间（节流）：seatIndex -> at(ms) */
   aiPlayerLastActionAtBySeat: Map<number, number>;
-  /** AI 玩家积极程度/温度（0~1）：seatIndex -> temperature */
+  /** AI 玩家行为方式：seatIndex -> style（每局随机分配，可影响话术与策略倾向） */
+  aiPlayerBehaviorStyleBySeat: Map<number, AiBehaviorStyle>;
+  /** AI 玩家内部温度（0~1）：seatIndex -> temperature（由 behaviorStyle 映射，仅内部使用） */
   aiPlayerTemperatureBySeat: Map<number, number>;
 }
 
@@ -207,8 +211,8 @@ export interface RoomView {
   chatLog?: ChatEntry[];
   /** 当前座位是否开启 AI 托管（仅对本人显示） */
   aiPlayerEnabled?: boolean;
-  /** 当前座位 AI 积极程度/温度（仅对本人显示） */
-  aiPlayerTemperature?: number;
+  /** 当前座位 AI 行为方式（仅对本人显示） */
+  aiPlayerBehaviorStyle?: AiBehaviorStyle;
   /** 仅管理员可见：全局记录（含私密与裁定信息） */
   globalLog?: ReplayLogEntry[];
   /** 是否开启 AI 说书人接管 */
