@@ -167,6 +167,12 @@ export interface Room {
   awaitingNightConfirm: boolean;
   /** 已确认“夜晚结束”的座位集合 */
   nightConfirmations: Set<number>;
+  /** 夜间信息是否在等待确认（信息位确认后才继续推进夜序） */
+  awaitingNightInfoConfirm: boolean;
+  /** 本轮夜间信息需要确认的座位 */
+  pendingNightInfoConfirmSeats: Set<number>;
+  /** 本轮夜间信息已确认的座位 */
+  nightInfoConfirmations: Set<number>;
 
   /** AI 玩家托管开关：seatIndex -> enabled */
   aiPlayerEnabledBySeat: Map<number, boolean>;
@@ -207,6 +213,12 @@ export interface RoomView {
   awaitingNightConfirm?: boolean;
   /** 已确认夜晚结束的座位 */
   nightConfirmedSeats?: number[];
+  /** 夜间信息是否正在等待确认 */
+  awaitingNightInfoConfirm?: boolean;
+  /** 需要确认夜间信息的座位 */
+  pendingNightInfoConfirmSeats?: number[];
+  /** 已确认夜间信息的座位 */
+  nightInfoConfirmedSeats?: number[];
   /** 当前玩家可见的聊天记录（管理员可见全量） */
   chatLog?: ChatEntry[];
   /** 当前座位是否开启 AI 托管（仅对本人显示） */

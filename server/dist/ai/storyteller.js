@@ -1,5 +1,6 @@
 import { buildStorytellerRequest } from './adapter.js';
 import { randomStorytellerDecision } from '../game/gameEngine.js';
+import { acquireLlmSlot } from './llmLimiter.js';
 const USE_AI = process.env.USE_AI_STORYTELLER === 'true' || process.env.USE_AI_STORYTELLER === '1';
 const OPENAI_MODEL = process.env.OPENAI_MODEL ?? 'qwen3.5-plus';
 // 不要带 /v1，否则会与默认 path /v1/chat/completions 拼成 /v1/v1/...
@@ -13,6 +14,24 @@ function fastResponseOptions() {
         // 对支持该参数的兼容模型，关闭“思考过程”以缩短响应时间
         enable_thinking: false,
     };
+}
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+function isRetryableStatus(status) {
+    return status === 429 || status === 408 || status === 409 || status === 425 || (status >= 500 && status <= 599);
+}
+function computeBackoffMs(attemptIndex) {
+    const base = 450;
+    const cap = 5000;
+    const exp = Math.min(cap, base * 2 ** Math.max(0, attemptIndex));
+    const jitter = Math.floor(Math.random() * 220);
+    return Math.min(cap, exp + jitter);
+}
+function formatNotOk(status, body, attempt, maxAttempts, queueWaitMs) {
+    const b = String(body ?? '').replace(/\s+/g, ' ').trim();
+    const bodyPart = b ? ` body="${b.slice(0, 600)}"` : '';
+    return `http_${status}${bodyPart} attempt=${attempt}/${maxAttempts} queueWaitMs=${queueWaitMs}`;
 }
 function getApiKey() {
     return (process.env.OPENAI_API_KEY ?? process.env.DASHSCOPE_API_KEY ?? '').trim();
@@ -180,9 +199,7 @@ async function callOpenAI(req, stepId, apiKey, onDebug) {
         systemPrompt,
         userPrompt,
     });
-    const ac = new AbortController();
     const timeoutMs = Number(process.env.AI_STORYTELLER_TIMEOUT_MS ?? '') || 180_000;
-    const timeout = setTimeout(() => ac.abort(), timeoutMs);
     const startedAt = Date.now();
     if (AI_STORYTELLER_LLM_LOG) {
         const keyLast4 = apiKey.length >= 4 ? apiKey.slice(-4) : '';
@@ -198,30 +215,56 @@ async function callOpenAI(req, stepId, apiKey, onDebug) {
         });
         console.log('[ai_storyteller] llm input_prompt', userPrompt.slice(0, 2400));
     }
-    const res = await fetch(`${OPENAI_BASE_URL}/v1/chat/completions`, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-            model: OPENAI_MODEL,
-            messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
-            response_format: { type: 'json_object' },
-            temperature: 0.3,
-            ...fastResponseOptions(),
-        }),
-        signal: ac.signal,
-    });
-    clearTimeout(timeout);
-    if (!res.ok) {
-        const t = await res.text();
-        if (AI_STORYTELLER_LLM_LOG) {
-            console.log('[ai_storyteller] llm not ok', { stepId, status: res.status, ms: Date.now() - startedAt, body: t.slice(0, 600) });
+    const maxAttempts = Math.max(1, Math.min(4, Number(process.env.AI_LLM_MAX_RETRIES ?? '') || 3));
+    let lastErr = null;
+    let data = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const slot = await acquireLlmSlot();
+        const queueWaitMs = slot.waitMs;
+        const ac2 = new AbortController();
+        const t2 = setTimeout(() => ac2.abort(), timeoutMs);
+        try {
+            const res = await fetch(`${OPENAI_BASE_URL}/v1/chat/completions`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${apiKey}`,
+                },
+                body: JSON.stringify({
+                    model: OPENAI_MODEL,
+                    messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
+                    response_format: { type: 'json_object' },
+                    temperature: 0.3,
+                    ...fastResponseOptions(),
+                }),
+                signal: ac2.signal,
+            });
+            if (!res.ok) {
+                const body = await res.text().catch(() => '');
+                lastErr = { status: res.status, body, attempt, queueWaitMs };
+                if (AI_STORYTELLER_LLM_LOG) {
+                    console.log('[ai_storyteller] llm not ok', { stepId, status: res.status, attempt: `${attempt}/${maxAttempts}`, queueWaitMs, ms: Date.now() - startedAt, body: body.slice(0, 600) });
+                }
+                if (attempt < maxAttempts && isRetryableStatus(res.status)) {
+                    await sleep(computeBackoffMs(attempt - 1));
+                    continue;
+                }
+                throw new Error(formatNotOk(res.status, body, attempt, maxAttempts, queueWaitMs));
+            }
+            data = (await res.json());
+            break;
         }
-        throw new Error(`${res.status} ${t}`);
+        finally {
+            clearTimeout(t2);
+            slot.release();
+        }
     }
-    const data = (await res.json());
+    if (!data) {
+        const msg = lastErr
+            ? formatNotOk(lastErr.status, lastErr.body, lastErr.attempt, maxAttempts, lastErr.queueWaitMs)
+            : `llm_no_response attempt=0/${maxAttempts}`;
+        throw new Error(msg);
+    }
     const content = data.choices?.[0]?.message?.content;
     if (!content)
         throw new Error('Empty AI response');
@@ -270,32 +313,57 @@ export async function answerPostGameQuestion(room, askerSeatIndex, question) {
         })),
         chatTail: room.chatLog.slice(-300),
     });
-    const ac = new AbortController();
     const timeoutMs = Number(process.env.AI_STORYTELLER_TIMEOUT_MS ?? '') || 180_000;
-    const timeout = setTimeout(() => ac.abort(), timeoutMs);
     try {
-        const res = await fetch(`${OPENAI_BASE_URL}/v1/chat/completions`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                Authorization: `Bearer ${apiKey}`,
-            },
-            body: JSON.stringify({
-                model: OPENAI_MODEL,
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: userPrompt },
-                ],
-                temperature: 0.3,
-                ...fastResponseOptions(),
-            }),
-            signal: ac.signal,
-        });
-        if (!res.ok) {
-            const t = await res.text().catch(() => '');
-            return `上帝：复盘回答失败（${res.status}）。${t.slice(0, 120)}`;
+        const maxAttempts = Math.max(1, Math.min(3, Number(process.env.AI_LLM_MAX_RETRIES ?? '') || 2));
+        let lastNotOk = null;
+        let data = null;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            const slot = await acquireLlmSlot();
+            const queueWaitMs = slot.waitMs;
+            const ac2 = new AbortController();
+            const t2 = setTimeout(() => ac2.abort(), timeoutMs);
+            try {
+                const res = await fetch(`${OPENAI_BASE_URL}/v1/chat/completions`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: `Bearer ${apiKey}`,
+                    },
+                    body: JSON.stringify({
+                        model: OPENAI_MODEL,
+                        messages: [
+                            { role: 'system', content: systemPrompt },
+                            { role: 'user', content: userPrompt },
+                        ],
+                        temperature: 0.3,
+                        ...fastResponseOptions(),
+                    }),
+                    signal: ac2.signal,
+                });
+                if (!res.ok) {
+                    const body = await res.text().catch(() => '');
+                    lastNotOk = { status: res.status, body, attempt, queueWaitMs };
+                    if (attempt < maxAttempts && isRetryableStatus(res.status)) {
+                        await sleep(computeBackoffMs(attempt - 1));
+                        continue;
+                    }
+                    return `上帝：复盘回答失败（${res.status}）。${body.slice(0, 120)}`;
+                }
+                data = (await res.json());
+                break;
+            }
+            finally {
+                clearTimeout(t2);
+                slot.release();
+            }
         }
-        const data = (await res.json());
+        if (!data) {
+            const msg = lastNotOk
+                ? formatNotOk(lastNotOk.status, lastNotOk.body, lastNotOk.attempt, maxAttempts, lastNotOk.queueWaitMs)
+                : `llm_no_response attempt=0/${maxAttempts}`;
+            return `上帝：复盘回答失败（${msg}）。`;
+        }
         const content = data.choices?.[0]?.message?.content?.trim();
         if (!content)
             return '上帝：我这次没能组织出有效复盘答案。';
@@ -304,8 +372,5 @@ export async function answerPostGameQuestion(room, askerSeatIndex, question) {
     catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         return `上帝：复盘回答异常（${msg}）。`;
-    }
-    finally {
-        clearTimeout(timeout);
     }
 }

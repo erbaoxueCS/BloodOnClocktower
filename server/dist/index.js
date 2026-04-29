@@ -6,16 +6,43 @@ import { createRoom, getRoom, joinRoom, getRoomView, setReady, bindConnection, u
 import { buildYourRolePayload } from './game/yourRole.js';
 import { startGame, getCurrentNightStep, nominate, skipNomination, vote, tallyVotes, maybeFinishDay, submitNightAction, computeChefPairsForSeat, computeEmpathCountForSeat, formatUndertakerInfoForSeat, formatWasherLibrarianInvestigator, checkWin, getShownCharacterId, resolveRavenkeeperNightInfo, finishNightAndGotoDay } from './game/gameEngine.js';
 import { getStorytellerLlmKeyInfo, storytellerLlmSelfTest, answerPostGameQuestion } from './ai/storyteller.js';
-import { aiPlayerLlmAvailable, decideAiPlayerDayPlan, decideAiPlayerNightTargets, getAiPlayerLlmKeyInfo, aiPlayerLlmSelfTest, answerPostGamePlayerQuestion, refineAiPlayerMemorySummary } from './ai/playerAgent.js';
+import { aiPlayerLlmAvailable, decideAiPlayerConstrainedAction, decideAiPlayerDayPlan, decideAiPlayerNightTargets, getAiPlayerLlmKeyInfo, aiPlayerLlmSelfTest, answerPostGamePlayerQuestion, refineAiPlayerMemorySummary } from './ai/playerAgent.js';
 import { runNightLoop as runAutomatedNightLoop } from './night/runNightLoop.js';
 import { pushReplay, buildReplayBundle, seatLabel, pushPublic } from './game/replay.js';
 import { troubleBrewing } from './script/troubleBrewing.js';
-import { createInvocation, updateInvocation } from './ai/invocationLog.js';
+import { createInvocation, listInvocations, updateInvocation } from './ai/invocationLog.js';
 function normalizeGodQuery(text) {
     return text.trim().replace(/\s+/g, '');
 }
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+function getOrInitDaySeatTimer(room, key) {
+    const now = Date.now();
+    const raw = Number(room.storytellerDecisions.get(key) ?? 0);
+    if (Number.isFinite(raw) && raw > 0)
+        return raw;
+    room.storytellerDecisions.set(key, now);
+    return now;
+}
+function incDaySeatCounter(room, key) {
+    const raw = Number(room.storytellerDecisions.get(key) ?? 0);
+    const next = Number.isFinite(raw) ? Math.max(0, Math.floor(raw)) + 1 : 1;
+    room.storytellerDecisions.set(key, next);
+    return next;
+}
+function getDaySeatCounter(room, key) {
+    const raw = Number(room.storytellerDecisions.get(key) ?? 0);
+    return Number.isFinite(raw) ? Math.max(0, Math.floor(raw)) : 0;
+}
+function cooldownOk(room, key, cooldownMs) {
+    const now = Date.now();
+    const raw = Number(room.storytellerDecisions.get(key) ?? 0);
+    const last = Number.isFinite(raw) ? raw : 0;
+    if (now - last < cooldownMs)
+        return false;
+    room.storytellerDecisions.set(key, now);
+    return true;
 }
 function makeDeterministicGodReply(room, seatIndex, queryRaw) {
     const query = normalizeGodQuery(queryRaw);
@@ -54,6 +81,49 @@ function makeDeterministicGodReply(room, seatIndex, queryRaw) {
     }
     return '上帝：你现在得不到更多信息。';
 }
+function shouldRejectRoleClaimText(room, seatIndex, textRaw) {
+    const text = String(textRaw ?? '').trim();
+    if (!text)
+        return false;
+    // 编号规范：所有玩家编号必须在 1..n（展示层统一规则）
+    const n = room.players.length;
+    for (const m of text.matchAll(/#\s*(\d{1,2})\b/g)) {
+        const x = Number(m[1]);
+        if (!Number.isInteger(x) || x < 1 || x > n)
+            return true;
+    }
+    for (const m of text.matchAll(/\b(\d{1,2})\s*号\b/g)) {
+        const x = Number(m[1]);
+        if (!Number.isInteger(x) || x < 1 || x > n)
+            return true;
+    }
+    const p = room.players[seatIndex];
+    if (!p)
+        return false;
+    // 只对“善良阵营玩家的对话”做强约束：避免随口编身份造成观感灾难
+    const shownId = getShownCharacterId(p);
+    const shownNameZh = shownId ? (room.script.characters.find((c) => c.id === shownId)?.nameZh ?? '') : '';
+    if (!shownId || !shownNameZh)
+        return false;
+    const alignment = room.script.characters.find((c) => c.id === shownId)?.alignment ?? 'unknown';
+    if (alignment !== 'good')
+        return false;
+    // 检测形如“我是/我身份是/我就是 + 角色名”
+    for (const c of room.script.characters) {
+        if (!c?.nameZh)
+            continue;
+        if (c.id === shownId)
+            continue;
+        const re = new RegExp(`(我是|我身份是|我就是)\\s*${c.nameZh.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}`);
+        if (re.test(text)) {
+            return true;
+        }
+    }
+    // 同时避免“我就是恶魔/爪牙”这类明显破坏体验的自曝（善良不该这么说）
+    if (/(我是|我就是|我身份是).*(恶魔|爪牙)/.test(text))
+        return true;
+    return false;
+}
 function pushChat(room, entry) {
     const full = { ...entry, id: `${Date.now()}-${Math.random().toString(36).slice(2)}` };
     room.chatLog.push(full);
@@ -81,6 +151,7 @@ function pushChat(room, entry) {
 function broadcastChat(roomId, entry) {
     if (entry.scope === 'god') {
         sendToSeat(roomId, entry.fromSeat, { type: 'chat_event', entry });
+        sendToAdmins(roomId, { type: 'chat_event', entry });
         return;
     }
     if (entry.scope === 'dm') {
@@ -166,6 +237,23 @@ app.post('/api/dev/llm/test-ai-player', async (req, res) => {
     const timeoutMs = Number.isFinite(req.body?.timeoutMs) ? Number(req.body.timeoutMs) : undefined;
     res.json(await aiPlayerLlmSelfTest({ prompt, timeoutMs }));
 });
+// 开发辅助：拉取房间内 AI 调用追踪（用于定位 429/超时/参数错误等）
+app.get('/api/dev/rooms/:roomId/ai-traces', (req, res) => {
+    const isProd = process.env.NODE_ENV === 'production';
+    if (isProd)
+        return res.status(404).json({ error: 'Not found' });
+    const room = getRoom(req.params.roomId);
+    if (!room)
+        return res.status(404).json({ error: 'Room not found' });
+    const limitRaw = Number(req.query.limit ?? '');
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(2000, Math.floor(limitRaw))) : 500;
+    const items = listInvocations(room);
+    res.json({
+        roomId: room.id,
+        count: items.length,
+        items: items.slice(-limit),
+    });
+});
 // 开发辅助：一键创建房间并自动加入/准备 N 个玩家（可选直接开局）
 app.post('/api/dev/quickstart', async (req, res) => {
     const isProd = process.env.NODE_ENV === 'production';
@@ -175,6 +263,7 @@ app.post('/api/dev/quickstart', async (req, res) => {
     const playerCountRaw = req.body?.playerCount;
     const playerCount = Number.isInteger(playerCountRaw) ? playerCountRaw : 5;
     const start = req.body?.start === false ? false : true;
+    const aiTakeover = req.body?.aiTakeover === false ? false : true;
     const room = createRoom(scriptId);
     const nickPrefix = ['夜行', '钟声', '雾隐', '火漆', '预言', '静默', '迷踪', '秘钥', '月影', '余烬'];
     const nickSuffix = ['守夜人', '提名王', '验人师', '反转侠', '沉默狼', '谜语客', '夜鸦', '推理官', '投票手', '烛火'];
@@ -188,6 +277,11 @@ app.post('/api/dev/quickstart', async (req, res) => {
         players.push({ seatIndex: j.seatIndex, nickname });
     }
     if (start) {
+        if (aiTakeover) {
+            room.aiStorytellerEnabled = true;
+            room.aiLastActionAt = 0;
+            ensureAiTakeoverForUnattendedSeats(room);
+        }
         const ok = startGame(room);
         if (!ok)
             return res.status(400).json({ error: 'Cannot start game' });
@@ -236,7 +330,7 @@ app.post('/api/dev/quickstart', async (req, res) => {
         base = 'http://localhost:5173';
     const joinUrls = players.map((p) => `${base}/?autoJoin=1&autoAi=1&roomId=${encodeURIComponent(room.id)}&nickname=${encodeURIComponent(p.nickname)}`);
     const adminUrl = `${base}/?admin=1&roomId=${encodeURIComponent(room.id)}&hostSecret=${encodeURIComponent(room.hostSecret)}`;
-    res.json({ roomId: room.id, hostSecret: room.hostSecret, players, joinUrls, adminUrl, started: start });
+    res.json({ roomId: room.id, hostSecret: room.hostSecret, players, joinUrls, adminUrl, started: start, aiTakeover });
 });
 function buildAutoTestTimeoutSnapshot(room) {
     return {
@@ -379,7 +473,7 @@ app.post('/api/dev/autotest/run', async (req, res) => {
                 break;
             setReady(room, joined.seatIndex, true);
             room.aiPlayerEnabledBySeat.set(joined.seatIndex, true);
-            room.aiPlayerTemperatureBySeat.set(joined.seatIndex, 0.5);
+            ensureAiBehaviorStyle(room, joined.seatIndex);
             const stylePool = ['balanced', 'assertive', 'deceptive', 'chaotic'];
             const seatStyle = promptStyle === 'mixed'
                 ? stylePool[(joined.seatIndex + i) % stylePool.length]
@@ -538,6 +632,10 @@ function sendNightInfo(roomId, room, seatIndex, message) {
     log.set(seatIndex, prev.slice(-NIGHT_INFO_LOG_LIMIT));
     appendAiMemoryLine(room, [seatIndex], `夜间信息：${message.slice(0, 140)}`);
     sendToSeat(roomId, seatIndex, { type: 'night_info', message });
+    // 信息位确认：收到夜间信息后，必须由对应玩家确认，夜序才继续推进
+    room.awaitingNightInfoConfirm = true;
+    room.pendingNightInfoConfirmSeats = new Set([seatIndex]);
+    room.nightInfoConfirmations = new Set();
 }
 function buildNightLoopOptions(roomId, room) {
     const traceIdByKey = new Map();
@@ -644,6 +742,18 @@ const FALLBACK_NIGHT_CONFIRM_TIMEOUT_MS = Number(process.env.FALLBACK_NIGHT_CONF
 const FALLBACK_DAY_VOTE_TIMEOUT_MS = Number(process.env.FALLBACK_DAY_VOTE_TIMEOUT_MS ?? '') || 60_000;
 const FALLBACK_DAY_TURN_TIMEOUT_MS = Number(process.env.FALLBACK_DAY_TURN_TIMEOUT_MS ?? '') || 60_000;
 const DAY_PUBLIC_SPEECH_WAIT_TIMEOUT_MS = Number(process.env.DAY_PUBLIC_SPEECH_WAIT_TIMEOUT_MS ?? '') || 15_000;
+// 必须高于单座位上帝问答窗口，否则导演层会先判超时，导致“前几个座位总被跳过”。
+const DAY_DIALOGUE_WAIT_TIMEOUT_MS = Number(process.env.DAY_DIALOGUE_WAIT_TIMEOUT_MS ?? '') || 35_000;
+// 白天讨论阶段：允许多轮微决策，但必须有时间/轮次上限，避免无限闲聊导致对局卡住
+const DAY_GOD_DIALOGUE_MAX_MS = Number(process.env.DAY_GOD_DIALOGUE_MAX_MS ?? '') || 24_000;
+const DAY_PRIVATE_DIALOGUE_MAX_MS = Number(process.env.DAY_PRIVATE_DIALOGUE_MAX_MS ?? '') || 40_000;
+const DAY_PUBLIC_SPEECH_MAX_MS = Number(process.env.DAY_PUBLIC_SPEECH_MAX_MS ?? '') || 26_000;
+const AI_DAY_GOD_MAX_TURNS_PER_SEAT = Number(process.env.AI_DAY_GOD_MAX_TURNS_PER_SEAT ?? '') || 3;
+const AI_DAY_DM_MAX_TURNS_PER_SEAT = Number(process.env.AI_DAY_DM_MAX_TURNS_PER_SEAT ?? '') || 6;
+const AI_DAY_PUBLIC_MAX_TURNS_PER_SEAT = Number(process.env.AI_DAY_PUBLIC_MAX_TURNS_PER_SEAT ?? '') || 3;
+// 冷却做成“按阶段分开”，避免上帝问答占用冷却导致私聊/公聊没机会发生
+const AI_DAY_CHAT_COOLDOWN_MS = Number(process.env.AI_DAY_CHAT_COOLDOWN_MS ?? '') || 1200;
+const AI_DAY_DM_PAIR_COOLDOWN_MS = Number(process.env.AI_DAY_DM_PAIR_COOLDOWN_MS ?? '') || 2800;
 const DAY_FLOW_STAGES = [
     'god_dialogue',
     'private_dialogue',
@@ -657,6 +767,9 @@ function directorBlockSummary(room) {
     if (room.phase === 'night' || room.phase === 'first_night') {
         if (room.pendingNightAction) {
             return `night_action_pending:${room.pendingNightAction.stepId}@${room.pendingNightAction.actorSeatIndex}`;
+        }
+        if (room.awaitingNightInfoConfirm) {
+            return `awaiting_night_info_confirm:${Array.from(room.pendingNightInfoConfirmSeats.values()).join(',') || 'none'}`;
         }
         if (room.awaitingNightConfirm)
             return 'awaiting_night_confirm';
@@ -682,7 +795,7 @@ function maybeLogDirectorDebug(roomId, room) {
 }
 function getFallbackClock(room) {
     const now = Date.now();
-    const key = `phase=${room.phase}|sub=${room.daySubPhase}|flow=${room.dayFlowStage}|flowStart=${room.dayFlowStartSeat}|nom=${room.currentNomination ? `${room.currentNomination.nominator}-${room.currentNomination.nominated}` : 'none'}|pendingNight=${room.pendingNightAction ? `${room.pendingNightAction.stepId}@${room.pendingNightAction.actorSeatIndex}` : 'none'}|awaitingConfirm=${room.awaitingNightConfirm}`;
+    const key = `phase=${room.phase}|sub=${room.daySubPhase}|flow=${room.dayFlowStage}|flowStart=${room.dayFlowStartSeat}|nom=${room.currentNomination ? `${room.currentNomination.nominator}-${room.currentNomination.nominated}` : 'none'}|pendingNight=${room.pendingNightAction ? `${room.pendingNightAction.stepId}@${room.pendingNightAction.actorSeatIndex}` : 'none'}|awaitingInfoConfirm=${room.awaitingNightInfoConfirm ? Array.from(room.pendingNightInfoConfirmSeats.values()).sort((a, b) => a - b).join(',') : 'none'}|awaitingConfirm=${room.awaitingNightConfirm}`;
     const prevKey = String(room.storytellerDecisions.get('fallback_clock_key') ?? '');
     const prevSince = Number(room.storytellerDecisions.get('fallback_clock_since') ?? now);
     if (prevKey !== key) {
@@ -802,6 +915,7 @@ function maybeAdvanceStructuredDay(roomId, room) {
     const cursor = Math.max(0, Math.min(getDayFlowCursor(room, stage), queue.length - 1));
     const actor = queue[cursor];
     if (!done.has(actor)) {
+        let stageCompleted = false;
         if (stage === 'public_speech') {
             const pubMarkKey = `ai_day_public_done_${room.dayNumber}_seat_${actor}`;
             const spoken = room.storytellerDecisions.get(pubMarkKey) === true;
@@ -832,10 +946,54 @@ function maybeAdvanceStructuredDay(roomId, room) {
                 room.storytellerDecisions.set(pubMarkKey, true);
             }
             room.storytellerDecisions.set(waitKey, 0);
+            stageCompleted = room.storytellerDecisions.get(pubMarkKey) === true;
+        }
+        else if (stage === 'god_dialogue' || stage === 'private_dialogue') {
+            const markKey = stage === 'god_dialogue'
+                ? `ai_day_god_done_${room.dayNumber}_seat_${actor}`
+                : `ai_day_dm_done_${room.dayNumber}_seat_${actor}`;
+            const completed = room.storytellerDecisions.get(markKey) === true;
+            if (completed) {
+                stageCompleted = true;
+            }
+            else {
+                const waitKey = `day_flow_wait_since_${room.dayNumber}_${stage}_${actor}`;
+                const now = Date.now();
+                const waitSinceRaw = Number(room.storytellerDecisions.get(waitKey) ?? 0);
+                const waitSince = Number.isFinite(waitSinceRaw) && waitSinceRaw > 0 ? waitSinceRaw : now;
+                room.storytellerDecisions.set(waitKey, waitSince);
+                const waited = now - waitSince;
+                if (waited < DAY_DIALOGUE_WAIT_TIMEOUT_MS) {
+                    broadcast(roomId, { type: 'room', room: getRoomView(room) });
+                    return;
+                }
+                room.storytellerDecisions.set(markKey, true);
+                room.storytellerDecisions.set(waitKey, 0);
+                pushPublic(room, stage === 'god_dialogue'
+                    ? `上帝问答（超时跳过）：${seatLabel(room, actor)} 本轮未发起问答。`
+                    : `玩家私聊（超时跳过）：${seatLabel(room, actor)} 本轮未发起私聊。`);
+                stageCompleted = true;
+            }
+        }
+        else {
+            stageCompleted = true;
+        }
+        if (!stageCompleted) {
+            broadcast(roomId, { type: 'room', room: getRoomView(room) });
+            return;
         }
         done.add(actor);
         if (stage === 'god_dialogue') {
-            pushPublic(room, `白天流程：${seatLabel(room, actor)} 完成上帝问答。`);
+            const askedCountKey = `ai_day_god_asked_count_${room.dayNumber}_seat_${actor}`;
+            const askedCount = Number(room.storytellerDecisions.get(askedCountKey) ?? 0);
+            if (Number.isFinite(askedCount) && askedCount > 0) {
+                const lastQKey = `ai_day_god_last_q_${room.dayNumber}_seat_${actor}`;
+                const lastQ = String(room.storytellerDecisions.get(lastQKey) ?? '').trim();
+                pushPublic(room, `白天流程：${seatLabel(room, actor)} 完成上帝问答（已提问 ${Math.floor(askedCount)} 次${lastQ ? `，最近问题：${lastQ.slice(0, 40)}` : ''}）。`);
+            }
+            else {
+                pushPublic(room, `白天流程：${seatLabel(room, actor)} 完成上帝问答（未发起提问）。`);
+            }
         }
         else if (stage === 'private_dialogue') {
             pushPublic(room, `白天流程：${seatLabel(room, actor)} 完成私聊阶段。`);
@@ -900,6 +1058,17 @@ function enforceProgressFallback(roomId, room) {
         }
         return;
     }
+    if ((room.phase === 'night' || room.phase === 'first_night') && room.awaitingNightInfoConfirm && stuckMs >= FALLBACK_NIGHT_CONFIRM_TIMEOUT_MS) {
+        for (const s of room.pendingNightInfoConfirmSeats)
+            room.nightInfoConfirmations.add(s);
+        room.awaitingNightInfoConfirm = false;
+        room.pendingNightInfoConfirmSeats = new Set();
+        room.nightInfoConfirmations = new Set();
+        pushPublic(room, '兜底推进：夜间信息确认超时，系统自动继续夜晚流程。');
+        broadcast(roomId, { type: 'room', room: getRoomView(room) });
+        broadcastNightConfirm(roomId, room);
+        return;
+    }
     if ((room.phase === 'night' || room.phase === 'first_night') && room.awaitingNightConfirm && stuckMs >= FALLBACK_NIGHT_CONFIRM_TIMEOUT_MS) {
         const allSeats = room.players.map((p) => p.seatIndex);
         for (const s of allSeats)
@@ -939,16 +1108,18 @@ function enforceProgressFallback(roomId, room) {
 function tickFlowDirector(roomId, room) {
     maybeLogDirectorDebug(roomId, room);
     const hasAiPlayerEnabled = room.players.some((p) => room.aiPlayerEnabledBySeat.get(p.seatIndex) === true);
-    // 关键边界：只有“AI 说书人接管”时，系统才自动导演流程与兜底推进。
-    // 若关闭 AI 说书人，即使存在 AI 玩家，也不应由系统代替说书人自动快进。
-    if (room.aiStorytellerEnabled) {
+    // 结构化白天流程与 AI 玩家托管解耦：只要有 AI 玩家，就推进白天讨论阶段。
+    if (hasAiPlayerEnabled) {
         maybeAdvanceStructuredDay(roomId, room);
+    }
+    // 强兜底与导演快进仍由 AI 说书人开关控制，避免手动主持时被系统硬推进。
+    if (room.aiStorytellerEnabled) {
         enforceProgressFallback(roomId, room);
     }
-    if (room.aiStorytellerEnabled && hasAiPlayerEnabled && room.phase === 'day') {
+    if (hasAiPlayerEnabled && room.phase === 'day') {
         maybeAiTakeoverDay(roomId, room);
     }
-    if (room.aiStorytellerEnabled && (room.phase === 'night' || room.phase === 'first_night')) {
+    if (hasAiPlayerEnabled && (room.phase === 'night' || room.phase === 'first_night')) {
         void maybeAiTakeoverNight(roomId, room);
     }
 }
@@ -1021,6 +1192,8 @@ async function maybeAiTakeoverNight(roomId, room) {
     // 严格边界：夜晚若轮到玩家行动，AI 说书人只等待，不代替玩家提交目标
     if (room.pendingNightAction)
         return;
+    if (room.awaitingNightInfoConfirm)
+        return;
     if (room.awaitingNightConfirm)
         return;
     const phaseBeforeLoop = room.phase;
@@ -1046,7 +1219,7 @@ async function runNightLoopExclusive(roomId, room) {
                 break;
             if (room.phase !== 'night' && room.phase !== 'first_night')
                 break;
-            if (room.pendingNightAction || room.awaitingNightConfirm)
+            if (room.pendingNightAction || room.awaitingNightInfoConfirm || room.awaitingNightConfirm)
                 break;
         }
     })().finally(() => {
@@ -1108,6 +1281,15 @@ function sendToSeat(roomId, seatIndex, payload) {
         ws.send(JSON.stringify(p));
     });
 }
+function sendToAdmins(roomId, payload) {
+    wss.clients?.forEach((ws) => {
+        if (ws.roomId !== roomId || ws.readyState !== 1)
+            return;
+        if (!ws.isAdmin)
+            return;
+        ws.send(JSON.stringify(payload));
+    });
+}
 function toTraceText(v, maxLen = 50000) {
     try {
         const s = typeof v === 'string' ? v : JSON.stringify(v);
@@ -1123,6 +1305,16 @@ function sendAiTrace(roomId, seatIndex, entry) {
     // - 上帝管理员视角：admin 连接仅可见“说书人（seatIndex=null）”调用记录。
     if (seatIndex != null) {
         sendToSeat(roomId, seatIndex, { type: 'ai_trace', entry });
+        const godDialogueTrace = entry.stage === 'day_dialogue' && String(entry.stepId ?? '').includes('god');
+        if (!godDialogueTrace)
+            return;
+        wss.clients?.forEach((ws) => {
+            if (ws.roomId !== roomId || ws.readyState !== 1)
+                return;
+            if (!ws.isAdmin)
+                return;
+            ws.send(JSON.stringify({ type: 'ai_trace', entry }));
+        });
         return;
     }
     wss.clients?.forEach((ws) => {
@@ -1132,6 +1324,24 @@ function sendAiTrace(roomId, seatIndex, entry) {
             return;
         ws.send(JSON.stringify({ type: 'ai_trace', entry }));
     });
+}
+function emitGodConversationTrace(roomId, room, seatIndex, playerText, godText) {
+    const rec = createInvocation(room, {
+        actor: 'storyteller',
+        stage: 'day_dialogue',
+        roomId,
+        seatIndex,
+        phase: room.phase,
+        stepId: 'god_chat',
+        model: process.env.OPENAI_MODEL ?? 'qwen3.5-plus',
+        status: 'applied',
+        request: toTraceText({ role: 'player', seat: seatIndex + 1, text: playerText }),
+        response: toTraceText({ role: 'god', text: godText }),
+        behavior: 'god_dialogue_exchange',
+    });
+    // 玩家侧可见自己的上帝问答；管理员侧也可在“AI对话”中看到同一条记录。
+    sendAiTrace(roomId, seatIndex, rec);
+    sendAiTrace(roomId, null, rec);
 }
 function toFullPromptDebugText(e) {
     return JSON.stringify({
@@ -1161,6 +1371,9 @@ function broadcastNightConfirm(roomId, room) {
         type: 'night_confirm_update',
         awaiting: room.awaitingNightConfirm,
         confirmedSeats: Array.from(room.nightConfirmations.values()),
+        awaitingInfo: room.awaitingNightInfoConfirm,
+        pendingInfoSeats: Array.from(room.pendingNightInfoConfirmSeats.values()),
+        infoConfirmedSeats: Array.from(room.nightInfoConfirmations.values()),
     });
 }
 const NIGHT_INFO_LOG_LIMIT = 20;
@@ -1463,9 +1676,22 @@ function buildForcedActiveDayPlan(room, seatIndex) {
     const altLabel = alt != null ? `，备选 #${alt + 1}` : '';
     const myInfo = summarizeMyNightInfo(room, seatIndex);
     const infoPart = rolePush && myInfo ? `我的夜间信息是：${myInfo}。` : '';
-    const publicText = rolePush
-        ? `${infoPart}基于我掌握的信息和发言矛盾，今天主推 ${targetLabel}${altLabel}，请不要分票，优先形成处决票型。`
-        : `我建议大家收敛到一个最高嫌疑目标，不要分票空转。优先推进 ${targetLabel}${altLabel}。`;
+    const voice = buildVoiceProfile(room, seatIndex);
+    const seed = `${room.id}|forced_day_plan|seat=${seatIndex}|day=${room.dayNumber}`;
+    const publicTemplates = rolePush
+        ? [
+            `${infoPart}我先把我这边信息摊出来：我目前更怀疑 ${targetLabel}${altLabel}，因为它和公开发言/票型有冲突点需要解释。建议先提名 ${targetLabel} 观察票型反应，再决定是否处决。`,
+            `${infoPart}我有个担心：${targetLabel}${altLabel} 这边信息链对不上（发言/票型里有矛盾）。我想先小步验证——先提名看票型，大家有不同信息欢迎补充。`,
+            `${infoPart}给两点理由我为什么想看 ${targetLabel}${altLabel}：①公开信息里矛盾未解释；②票型/节奏上更像关键位。先提名试探，别急着一锤定音。`,
+            `${infoPart}我先不下死结论，但 ${targetLabel}${altLabel} 值得今天优先验证。我们先提名 ${targetLabel} 看谁愿意跟票、谁在躲票，再决定是否处决。`,
+        ]
+        : [
+            `我先抛一个假设：${targetLabel}${altLabel} 可能更值得优先验证。理由来自公开发言与票型细节（欢迎反驳/补充）。建议先提名 ${targetLabel} 看票型反应。`,
+            `我暂时没有强信息，但不想空转：我倾向先看 ${targetLabel}${altLabel}。先提名 ${targetLabel} 观察票型，大家把自己的理由说清楚再做处决共识。`,
+            `我更想走“可验证”的路径：先围绕 ${targetLabel}${altLabel} 做一次提名试探，看看票型与发言的对应关系，再决定处决目标。`,
+            `我直觉上觉得 ${targetLabel}${altLabel} 值得先压一下，但我也可能错。先提名 ${targetLabel}，如果你们有更强信息请直接抛出来。`,
+        ];
+    const publicText = `${voice} ${pickBySeed(publicTemplates, seed)}`;
     const dm = [];
     if (target != null) {
         for (const p of room.players) {
@@ -1474,8 +1700,8 @@ function buildForcedActiveDayPlan(room, seatIndex) {
             dm.push({
                 toSeat: p.seatIndex,
                 text: rolePush
-                    ? `我根据自己的夜间信息主推 #${target + 1}${alt != null ? `（备选 #${alt + 1}）` : ''}，请你在提名与投票阶段优先配合集中票型。`
-                    : `我建议今天优先推进 #${target + 1}，不要分票；你如果同意请在投票阶段配合。`,
+                    ? `我这边夜间信息（可简述）：${myInfo || '有但不便全公开'}。我目前更想先验证 #${target + 1}${alt != null ? `（备选 #${alt + 1}）` : ''}，理由是它和公开发言/票型有冲突点。你昨晚有信息吗？你更怀疑谁、为什么？如果你也觉得可疑，白天可以先提名/投票观察票型。`
+                    : `我目前更想先看 #${target + 1}${alt != null ? `（备选 #${alt + 1}）` : ''}，主要基于公开发言与票型的细节。你这边有信息或更强嫌疑目标吗？如果你同意，我们可以先围绕这个座位提名试探票型，再决定是否处决。`,
             });
             if (dm.length >= 3)
                 break;
@@ -1507,6 +1733,129 @@ function isWeakPublicSpeech(text) {
         '信息不足',
     ];
     return weakPatterns.some((w) => t.includes(w));
+}
+function isBackgroundSystemLine(text) {
+    const t = String(text ?? '').trim();
+    if (!t)
+        return true;
+    return t.includes('AI 托管已开启')
+        || t.includes('AI 托管已关闭')
+        || t.includes('AI 说书人已接管流程')
+        || t.includes('AI 说书人已关闭');
+}
+function isHighSignalPublicLine(text) {
+    const t = String(text ?? '').trim();
+    if (!t || isBackgroundSystemLine(t))
+        return false;
+    return t.includes('公开发言')
+        || t.includes('提名')
+        || t.includes('投票')
+        || t.includes('处决')
+        || t.includes('死亡')
+        || t.includes('复活')
+        || t.includes('进入夜晚')
+        || t.includes('进入白天')
+        || t.includes('夜晚结束');
+}
+function ensureAiTakeoverForUnattendedSeats(room) {
+    const connectedSeats = new Set(Array.from(room.connections.values()));
+    let enabledCount = 0;
+    for (const p of room.players) {
+        const seat = p.seatIndex;
+        // 已有真人在线连接的座位保持手动，不强制接管。
+        if (connectedSeats.has(seat))
+            continue;
+        if (!(room.aiPlayerEnabledBySeat.get(seat) ?? false)) {
+            room.aiPlayerEnabledBySeat.set(seat, true);
+            enabledCount++;
+        }
+        ensureAiBehaviorStyle(room, seat);
+        room.aiPlayerLastActionAtBySeat.set(seat, 0);
+    }
+    return enabledCount;
+}
+const AI_BEHAVIOR_STYLES = [
+    'analytical',
+    'skeptical',
+    'cautious',
+    'empathetic',
+    'deceptive',
+    'chaotic',
+];
+function temperatureFromBehaviorStyle(style) {
+    if (style === 'analytical')
+        return 0.35;
+    if (style === 'skeptical')
+        return 0.45;
+    if (style === 'cautious')
+        return 0.25;
+    if (style === 'empathetic')
+        return 0.55;
+    if (style === 'deceptive')
+        return 0.65;
+    return 0.8;
+}
+function setAiBehaviorStyle(room, seatIndex, style) {
+    room.aiPlayerBehaviorStyleBySeat.set(seatIndex, style);
+    room.aiPlayerTemperatureBySeat.set(seatIndex, temperatureFromBehaviorStyle(style));
+    // 行为方式改变后，允许立即重新规划（避免继续沿用旧 day_plan）
+    room.storytellerDecisions.delete(`ai_day_plan_${room.dayNumber}_seat_${seatIndex}`);
+}
+function ensureAiBehaviorStyle(room, seatIndex) {
+    const existing = room.aiPlayerBehaviorStyleBySeat.get(seatIndex);
+    if (existing)
+        return existing;
+    // 每局固定随机：用 room.createdAt 作为一局的稳定种子，避免运行中抖动
+    const seed = `${room.id}|ai_behavior|seat=${seatIndex}|createdAt=${room.createdAt}`;
+    const style = pickBySeed(AI_BEHAVIOR_STYLES, seed);
+    setAiBehaviorStyle(room, seatIndex, style);
+    return style;
+}
+function hashToInt(s) {
+    // 简单稳定 hash（非加密）：用于“可复现伪随机”
+    let h = 2166136261;
+    for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+}
+function pickBySeed(items, seed) {
+    if (items.length === 0)
+        throw new Error('pickBySeed: empty items');
+    const idx = hashToInt(seed) % items.length;
+    return items[idx];
+}
+function buildVoiceProfile(room, seatIndex) {
+    const style = ensureAiBehaviorStyle(room, seatIndex);
+    const baseSeed = `${room.id}|seat=${seatIndex}|day=${room.dayNumber}|style=${style}`;
+    const byStyle = {
+        analytical: [
+            '画像=条理型：偏好用“1/2/3点”结构，说话简洁，强调可验证事实与票型。',
+            '画像=推理型：偏好列出证据链与反证，谨慎下结论，倾向先提名验证。',
+        ],
+        skeptical: [
+            '画像=质询型：偏好反问与追问矛盾点，要求对方给出理由，但语气不过分强硬。',
+            '画像=怀疑型：更关注“谁在回避细节/谁在带节奏”，用问题逼出信息。',
+        ],
+        cautious: [
+            '画像=谨慎型：更强调不确定性与风险点（中毒/伪装），倾向先小步验证再下结论。',
+            '画像=保守型：倾向先收集信息、少做大跳跃结论，避免误处决关键好人。',
+        ],
+        empathetic: [
+            '画像=共情型：语气更友好，先认可他人观点再补充自己的理由，擅长拉共识。',
+            '画像=协调型：擅长总结分歧并提出折中验证方案，减少对立情绪。',
+        ],
+        deceptive: [
+            '画像=圆滑型：表达更委婉、模糊留余地，善于转移焦点并制造信息噪音。',
+            '画像=带节奏型：用“看似合理的理由”引导票型，但避免明显自相矛盾。',
+        ],
+        chaotic: [
+            '画像=戏剧型：适度使用比喻/讲故事式表达，但仍需落到具体可执行下一步。',
+            '画像=反常规型：允许非常规推理顺序与节奏，但行动仍需自洽。',
+        ],
+    };
+    return pickBySeed(byStyle[style], baseSeed);
 }
 function buildVoteSnapshot(room) {
     return {
@@ -1542,38 +1891,47 @@ function buildAiPlayerMemory(room, seatIndex) {
             return e.fromSeat === seatIndex || e.toSeat === seatIndex;
         return false;
     })
+        .filter((e) => !isBackgroundSystemLine(e.text))
         .slice(-10)
         .map((e) => `[${e.scope}] #${e.fromSeat + 1}${typeof e.toSeat === 'number' ? `->#${e.toSeat + 1}` : ''}: ${e.text.slice(0, 70)}`);
-    const publicTail = room.publicLog.slice(-10).map((x) => x.line.slice(0, 90));
+    const publicTail = room.publicLog
+        .filter((x) => isHighSignalPublicLine(x.line))
+        .slice(-10)
+        .map((x) => x.line.slice(0, 90));
     const memoryTail = (getAiMemoryBySeat(room).get(seatIndex) ?? []).slice(-24);
     const memorySummary = String(getAiMemorySummaryBySeat(room).get(seatIndex) ?? '').trim();
     const trustTop = pickTopSuspiciousAlive(room, seatIndex, 3).map((x) => `#${x.seatIndex + 1}(${x.score.toFixed(2)})`);
     const voteTail = buildRecentVoteEvents(room).slice(-6);
     return [
-        `你是 #${seatIndex + 1}·${me.nickname}。当前是第 ${room.dayNumber} 天，阶段=${room.phase}/${room.daySubPhase ?? 'none'}。`,
-        `存活：${aliveSeats.join('、') || '无'}；死亡：${deadSeats.join('、') || '无'}。`,
-        `你最近夜间信息：${myNightInfo.length > 0 ? myNightInfo.join(' | ') : '暂无'}`,
-        `你的心路历程摘要（模型整理）：${memorySummary || '暂无'}`,
-        `你的近期原始事件（校验用）：${memoryTail.length > 0 ? memoryTail.join(' || ') : '暂无'}`,
-        `你可见聊天摘要：${visibleChat.length > 0 ? visibleChat.join(' || ') : '暂无'}`,
-        `公共流程摘要：${publicTail.length > 0 ? publicTail.join(' || ') : '暂无'}`,
-        `近期投票事件：${voteTail.length > 0 ? voteTail.join(' || ') : '暂无'}`,
-        `当前高嫌疑目标（内部评分）：${trustTop.length > 0 ? trustTop.join('、') : '暂无明显目标'}`,
+        `[核心身份] 你是 #${seatIndex + 1}·${me.nickname}。当前：第 ${room.dayNumber} 天，阶段=${room.phase}/${room.daySubPhase ?? 'none'}。`,
+        `[场上存活] 存活：${aliveSeats.join('、') || '无'}；死亡：${deadSeats.join('、') || '无'}。`,
+        `[私有信息] 最近夜间信息：${myNightInfo.length > 0 ? myNightInfo.join(' | ') : '暂无'}`,
+        `[策略摘要] 你的心路历程（模型整理）：${memorySummary || '暂无'}`,
+        `[聊天重点] 你可见聊天：${visibleChat.length > 0 ? visibleChat.join(' || ') : '暂无'}`,
+        `[流程重点] 公共流程：${publicTail.length > 0 ? publicTail.join(' || ') : '暂无'}`,
+        `[投票重点] 近期提名/投票：${voteTail.length > 0 ? voteTail.join(' || ') : '暂无'}`,
+        `[候选目标] 当前高嫌疑目标（内部评分）：${trustTop.length > 0 ? trustTop.join('、') : '暂无明显目标'}`,
+        `[校验尾部] 近期原始事件（仅校验）：${memoryTail.length > 0 ? memoryTail.join(' || ') : '暂无'}`,
     ].join('\n');
 }
 function buildAiSeatContext(room, seatIndex) {
     const roomView = getRoomView(room, seatIndex, false);
+    const aiRoomView = {
+        ...roomView,
+        publicLog: (roomView.publicLog ?? []).filter((x) => isHighSignalPublicLine(x.line)),
+        chatLog: (roomView.chatLog ?? []).filter((e) => !isBackgroundSystemLine(e.text)),
+    };
     const yourCharacterId = getShownCharacterId(room.players[seatIndex]) ?? null;
     const yourRole = buildYourRolePayload(room, seatIndex);
     const yourAlignment = yourRole?.alignment;
-    const chatLog = (roomView.chatLog ?? []).map((e) => ({
+    const chatLog = (aiRoomView.chatLog ?? []).map((e) => ({
         scope: e.scope,
         fromSeat: e.fromSeat,
         toSeat: e.toSeat,
         text: e.text,
         at: e.at,
     }));
-    const allChatLog = (roomView.chatLog ?? []).slice(-120).map((e) => ({
+    const allChatLog = (aiRoomView.chatLog ?? []).slice(-120).map((e) => ({
         scope: e.scope,
         fromSeat: e.fromSeat,
         toSeat: e.toSeat,
@@ -1592,7 +1950,22 @@ function buildAiSeatContext(room, seatIndex) {
         if (typeof seatStyle === 'string' && seatStyle.trim())
             promptStyle = seatStyle;
     }
-    return { roomView, yourCharacterId, yourRole, yourAlignment, chatLog, allChatLog, playerMemory, nightInfo, promptStyle };
+    // 行为方式模块：优先用它影响 promptStyle（减少同质化 + 与旧“积极程度”合并）
+    const behavior = ensureAiBehaviorStyle(room, seatIndex);
+    if (behavior === 'analytical')
+        promptStyle = 'balanced';
+    else if (behavior === 'skeptical')
+        promptStyle = 'assertive';
+    else if (behavior === 'cautious')
+        promptStyle = 'balanced';
+    else if (behavior === 'empathetic')
+        promptStyle = 'balanced';
+    else if (behavior === 'deceptive')
+        promptStyle = 'deceptive';
+    else if (behavior === 'chaotic')
+        promptStyle = 'chaotic';
+    const voiceProfile = buildVoiceProfile(room, seatIndex);
+    return { roomView: aiRoomView, yourCharacterId, yourRole, yourAlignment, chatLog, allChatLog, playerMemory, nightInfo, promptStyle, voiceProfile };
 }
 function shouldVoteInFavorByPriority(room, seatIndex, nominatedSeat, explicitPriority) {
     const priority = explicitPriority && explicitPriority.length > 0
@@ -1889,10 +2262,32 @@ wss.on('connection', (ws, req) => {
                 const enabled = !!msg.enabled;
                 room.aiPlayerEnabledBySeat.set(seatIndex, enabled);
                 room.aiPlayerLastActionAtBySeat.set(seatIndex, 0);
-                if (enabled && !room.aiPlayerTemperatureBySeat.has(seatIndex))
-                    room.aiPlayerTemperatureBySeat.set(seatIndex, 0.5);
-                const tip = enabled ? `AI 托管已开启：${seatLabel(room, seatIndex)}。` : `AI 托管已关闭：${seatLabel(room, seatIndex)}。`;
-                pushPublic(room, tip);
+                if (enabled)
+                    ensureAiBehaviorStyle(room, seatIndex);
+                broadcast(roomId, { type: 'room', room: getRoomView(room) });
+                return;
+            }
+            if (msg.type === 'set_ai_player_behavior_style') {
+                if (isAdmin) {
+                    ws.send(JSON.stringify({ type: 'error', message: 'admin_cannot_set_ai_player_behavior_style' }));
+                    return;
+                }
+                if (room.status !== 'playing') {
+                    ws.send(JSON.stringify({ type: 'error', message: 'set_ai_player_behavior_style_not_allowed' }));
+                    return;
+                }
+                const style = String(msg.style ?? '');
+                if (!AI_BEHAVIOR_STYLES.includes(style)) {
+                    ws.send(JSON.stringify({ type: 'error', message: 'invalid_ai_player_behavior_style' }));
+                    return;
+                }
+                // 开启托管时才允许调整（避免“手动玩家被动改掉策略”）
+                if (!(room.aiPlayerEnabledBySeat.get(seatIndex) ?? false)) {
+                    ws.send(JSON.stringify({ type: 'error', message: 'ai_player_not_enabled' }));
+                    return;
+                }
+                setAiBehaviorStyle(room, seatIndex, style);
+                room.aiPlayerLastActionAtBySeat.set(seatIndex, 0);
                 broadcast(roomId, { type: 'room', room: getRoomView(room) });
                 return;
             }
@@ -1905,12 +2300,8 @@ wss.on('connection', (ws, req) => {
                     ws.send(JSON.stringify({ type: 'error', message: 'set_ai_player_temperature_not_allowed' }));
                     return;
                 }
-                const t = Number(msg.temperature);
-                if (!Number.isFinite(t) || t < 0 || t > 1) {
-                    ws.send(JSON.stringify({ type: 'error', message: 'invalid_ai_player_temperature' }));
-                    return;
-                }
-                room.aiPlayerTemperatureBySeat.set(seatIndex, t);
+                // 兼容旧客户端：温度已合并为“行为方式”模块，不再允许手动设置。
+                ws.send(JSON.stringify({ type: 'error', message: 'ai_player_temperature_deprecated' }));
                 broadcast(roomId, { type: 'room', room: getRoomView(room) });
                 return;
             }
@@ -1968,8 +2359,10 @@ wss.on('connection', (ws, req) => {
                         text,
                     });
                     broadcastChat(roomId, entry);
+                    let godReplyText = '';
                     if (room.aiStorytellerEnabled) {
                         const replyText = makeDeterministicGodReply(room, seatIndex, text);
+                        godReplyText = replyText;
                         const reply = pushChat(room, {
                             at: Date.now(),
                             scope: 'god',
@@ -1981,16 +2374,18 @@ wss.on('connection', (ws, req) => {
                         broadcastChat(roomId, reply);
                     }
                     else {
+                        godReplyText = '上帝：当前为人工说书人模式，请等待说书人回应。';
                         const reply = pushChat(room, {
                             at: Date.now(),
                             scope: 'god',
                             phase: room.phase,
                             dayNumber: room.dayNumber,
                             fromSeat: seatIndex,
-                            text: '上帝：当前为人工说书人模式，请等待说书人回应。',
+                            text: godReplyText,
                         });
                         broadcastChat(roomId, reply);
                     }
+                    emitGodConversationTrace(roomId, room, seatIndex, text, godReplyText);
                     return;
                 }
                 if (msg.scope === 'public') {
@@ -2018,6 +2413,29 @@ wss.on('connection', (ws, req) => {
                 }
                 if (room.status !== 'playing' || (room.phase !== 'night' && room.phase !== 'first_night')) {
                     ws.send(JSON.stringify({ type: 'error', message: 'night_confirm_not_in_night' }));
+                    return;
+                }
+                if (room.awaitingNightInfoConfirm) {
+                    if (!room.pendingNightInfoConfirmSeats.has(seatIndex)) {
+                        ws.send(JSON.stringify({ type: 'error', message: 'night_info_confirm_not_required_for_you' }));
+                        return;
+                    }
+                    room.nightInfoConfirmations.add(seatIndex);
+                    broadcastNightConfirm(roomId, room);
+                    const done = Array.from(room.pendingNightInfoConfirmSeats.values()).every((s) => room.nightInfoConfirmations.has(s));
+                    if (done) {
+                        const { key, title } = nightReplayTitle(room);
+                        const labels = Array.from(room.pendingNightInfoConfirmSeats.values()).map((s) => seatLabel(room, s)).join('、');
+                        pushReplay(room, key, title, `${labels || '信息位'} 已确认夜间信息，继续推进夜晚。`);
+                        room.awaitingNightInfoConfirm = false;
+                        room.pendingNightInfoConfirmSeats = new Set();
+                        room.nightInfoConfirmations = new Set();
+                        const phaseBeforeLoop = room.phase;
+                        await runNightLoopExclusive(roomId, room);
+                        sendNightPrompt(roomId, room);
+                        broadcastAfterNight(roomId, room, phaseBeforeLoop);
+                        broadcastNightConfirm(roomId, room);
+                    }
                     return;
                 }
                 if (!room.awaitingNightConfirm) {
@@ -2145,10 +2563,16 @@ wss.on('connection', (ws, req) => {
                 }
                 room.aiStorytellerEnabled = !!msg.enabled;
                 room.aiLastActionAt = 0;
+                if (room.aiStorytellerEnabled) {
+                    const enabledCount = ensureAiTakeoverForUnattendedSeats(room);
+                    if (enabledCount > 0) {
+                        const section = room.phase === 'day' ? dayReplayTitle(room) : nightReplayTitle(room);
+                        pushReplay(room, section.key, section.title, `AI 说书人接管后，已自动开启 ${enabledCount} 个无人在线座位的 AI 玩家托管。`);
+                    }
+                }
                 const tip = room.aiStorytellerEnabled ? 'AI 说书人已接管流程。' : 'AI 说书人已关闭，切回人工控制。';
                 const section = room.phase === 'day' ? dayReplayTitle(room) : nightReplayTitle(room);
                 pushReplay(room, section.key, section.title, tip);
-                pushPublic(room, tip);
                 broadcast(roomId, { type: 'room', room: getRoomView(room) });
                 return;
             }
@@ -2166,6 +2590,12 @@ wss.on('connection', (ws, req) => {
                 if (!isHost) {
                     ws.send(JSON.stringify({ type: 'error', message: 'host_only:start' }));
                     return;
+                }
+                if (room.aiStorytellerEnabled) {
+                    const enabledCount = ensureAiTakeoverForUnattendedSeats(room);
+                    if (enabledCount > 0) {
+                        pushReplay(room, 'setup', '对局', `开局前自动开启 ${enabledCount} 个无人在线座位的 AI 托管。`);
+                    }
                 }
                 const ok = startGame(room);
                 if (!ok) {
@@ -2407,6 +2837,16 @@ wss.on('connection', (ws, req) => {
             unbindConnection(room, connectionId);
     });
 });
+server.on('error', (e) => {
+    const code = e && typeof e === 'object' ? e.code : undefined;
+    if (code === 'EADDRINUSE') {
+        console.error(`[server] PORT ${HTTP_PORT} already in use. Another dev server instance is running.`);
+        console.error(`[server] Fix: stop the other process, or start this one with PORT=<otherPort>.`);
+        process.exit(1);
+    }
+    console.error('[server] fatal server error', e);
+    process.exit(1);
+});
 server.listen(HTTP_PORT, () => {
     console.log(`HTTP + WS server on http://localhost:${HTTP_PORT}`);
 });
@@ -2417,9 +2857,8 @@ setInterval(async () => {
         tickFlowDirector(rid, room);
         // AI 玩家托管：按阶段编排；夜晚仅 `decideAiPlayerNightTargets`（只含 night_action）
         // - 白天：每座位每白天最多 1 次 LLM（day_plan）→ 私聊→公聊→提名/投票
-        // 关键边界：只有开启 AI 说书人接管时，才允许 AI 玩家自动推进动作。
-        if (!room.aiStorytellerEnabled)
-            continue;
+        // 重要：AI 玩家托管与 AI 说书人接管解耦。
+        // 只要座位开启了 AI 托管，就允许该座位自动决策与互动。
         for (const p of room.players) {
             const seatIndex = p.seatIndex;
             if (!(room.aiPlayerEnabledBySeat.get(seatIndex) ?? false))
@@ -2457,13 +2896,14 @@ setInterval(async () => {
                     const needPlan = !existing || existing.type !== 'day_plan';
                     // 若上次是 noop/无计划，则允许下一轮继续重试（避免 dmDone/pubDone 永远卡住）
                     if (needPlan && aiPlayerLlmAvailable()) {
-                        const { roomView, yourCharacterId, yourRole, yourAlignment, chatLog, allChatLog, playerMemory, nightInfo, promptStyle, } = buildAiSeatContext(room, seatIndex);
+                        const { roomView, yourCharacterId, yourRole, yourAlignment, chatLog, allChatLog, playerMemory, nightInfo, promptStyle, voiceProfile, } = buildAiSeatContext(room, seatIndex);
                         let dayTraceId = null;
                         const plan = await decideAiPlayerDayPlan(room, seatIndex, {
                             roomView,
                             yourSeatIndex: seatIndex,
                             yourRole,
                             yourCharacterId,
+                            voiceProfile,
                             yourAlignment,
                             demonBluffs: yourAlignment === 'evil' ? (room.demonBluffs ?? null) : null,
                             chatLog,
@@ -2523,9 +2963,11 @@ setInterval(async () => {
                                     sendAiTrace(rid, seatIndex, rec);
                             }
                         }
-                        // 若模型仍给 noop，则落一个最小可用计划，保证白天不会卡死
+                        // 若模型给出有效 plan，直接存；否则允许短重试，减少“看起来像兜底”的比例
                         if (plan && plan.type === 'day_plan') {
                             room.storytellerDecisions.set(planKey, plan);
+                            room.storytellerDecisions.set(`ai_day_plan_fail_${room.dayNumber}_seat_${seatIndex}`, 0);
+                            room.storytellerDecisions.set(`ai_day_plan_fail_since_${room.dayNumber}_seat_${seatIndex}`, 0);
                             if (dayTraceId) {
                                 const rec = updateInvocation(room, dayTraceId, {
                                     status: 'applied',
@@ -2536,118 +2978,696 @@ setInterval(async () => {
                             }
                         }
                         else {
-                            room.storytellerDecisions.set(planKey, buildForcedActiveDayPlan(room, seatIndex));
+                            const failKey = `ai_day_plan_fail_${room.dayNumber}_seat_${seatIndex}`;
+                            const sinceKey = `ai_day_plan_fail_since_${room.dayNumber}_seat_${seatIndex}`;
+                            const failCount = incDaySeatCounter(room, failKey);
+                            const since = getOrInitDaySeatTimer(room, sinceKey);
+                            const waited = Date.now() - since;
+                            // 允许短重试窗口：减少强塞计划的“兜底感”
+                            const allowRetryMs = Number(process.env.AI_DAY_PLAN_RETRY_WINDOW_MS ?? '') || 18_000;
+                            const maxFailsBeforeFallback = Number(process.env.AI_DAY_PLAN_MAX_FAILS_BEFORE_FALLBACK ?? '') || 2;
+                            if (failCount >= maxFailsBeforeFallback || waited >= allowRetryMs) {
+                                room.storytellerDecisions.set(planKey, buildForcedActiveDayPlan(room, seatIndex));
+                                room.storytellerDecisions.set(failKey, 0);
+                                room.storytellerDecisions.set(sinceKey, 0);
+                            }
                         }
                     }
                     const plan = room.storytellerDecisions.get(planKey);
                     const stage = room.dayFlowStage;
                     const traceId = String(room.storytellerDecisions.get(dayPlanTraceKey(room.dayNumber, seatIndex)) ?? '') || null;
-                    // 上帝问答阶段：每名 AI 玩家执行一次（无夜间信息可直接跳过）
+                    // 上帝问答阶段：允许多轮“微决策”（每次最多一句 chat_god），不再要求由 day_plan 一次性给出。
                     const godMarkKey = `ai_day_god_done_${room.dayNumber}_seat_${seatIndex}`;
-                    if (stage === 'god_dialogue' && plan && plan.type === 'day_plan' && room.storytellerDecisions.get(godMarkKey) !== true) {
-                        const q = String(plan.godQuestion?.text ?? '').trim().slice(0, 200);
+                    if (stage === 'god_dialogue' && room.storytellerDecisions.get(godMarkKey) !== true) {
+                        const sinceKey = `ai_day_god_since_${room.dayNumber}_seat_${seatIndex}`;
+                        const turnsKey = `ai_day_god_turns_${room.dayNumber}_seat_${seatIndex}`;
+                        const since = getOrInitDaySeatTimer(room, sinceKey);
+                        const turns = getDaySeatCounter(room, turnsKey);
+                        const elapsed = Date.now() - since;
                         const hasNightInfo = (getNightInfoLogBySeat(room).get(seatIndex) ?? []).length > 0;
-                        if (!room.aiStorytellerEnabled) {
-                            appendBehavior(rid, room, seatIndex, traceId, 'god_dialogue:skipped(human_storyteller_mode)');
-                        }
-                        else if (q && hasNightInfo) {
-                            const ask = pushChat(room, {
-                                at: Date.now(),
-                                scope: 'god',
-                                phase: room.phase,
-                                dayNumber: room.dayNumber,
-                                fromSeat: seatIndex,
-                                text: q,
-                            });
-                            broadcastChat(rid, ask);
-                            const replyText = makeDeterministicGodReply(room, seatIndex, q);
-                            const reply = pushChat(room, {
-                                at: Date.now(),
-                                scope: 'god',
-                                phase: room.phase,
-                                dayNumber: room.dayNumber,
-                                fromSeat: seatIndex,
-                                text: replyText,
-                            });
-                            broadcastChat(rid, reply);
-                            appendBehavior(rid, room, seatIndex, traceId, `god_dialogue:asked="${q}" replied="${replyText.slice(0, 80)}"`);
+                        if (elapsed >= DAY_GOD_DIALOGUE_MAX_MS || turns >= AI_DAY_GOD_MAX_TURNS_PER_SEAT || !hasNightInfo) {
+                            room.storytellerDecisions.set(godMarkKey, true);
+                            appendBehavior(rid, room, seatIndex, traceId, !hasNightInfo
+                                ? 'god_dialogue:done(no_night_info)'
+                                : `god_dialogue:done(turns=${turns}; elapsedMs=${elapsed})`);
                         }
                         else {
-                            appendBehavior(rid, room, seatIndex, traceId, 'god_dialogue:skipped(no_question_or_no_night_info)');
+                            const cdKey = `ai_day_chat_cd_${room.dayNumber}_god_${seatIndex}`;
+                            if (cooldownOk(room, cdKey, AI_DAY_CHAT_COOLDOWN_MS)) {
+                                const tempNow = room.aiPlayerTemperatureBySeat.get(seatIndex) ?? 0.5;
+                                const { roomView, yourCharacterId, yourRole, yourAlignment, chatLog, allChatLog, playerMemory, nightInfo, promptStyle, voiceProfile } = buildAiSeatContext(room, seatIndex);
+                                let dialogueTraceId = null;
+                                const mustAskThisTurn = hasNightInfo && turns === 0;
+                                const godAllowedActions = mustAskThisTurn ? ['chat_god'] : ['noop', 'chat_god'];
+                                const act = await decideAiPlayerConstrainedAction(room, seatIndex, {
+                                    roomView,
+                                    yourSeatIndex: seatIndex,
+                                    yourRole,
+                                    yourCharacterId,
+                                    voiceProfile,
+                                    yourAlignment,
+                                    demonBluffs: yourAlignment === 'evil' ? (room.demonBluffs ?? null) : null,
+                                    chatLog,
+                                    allChatLog,
+                                    playerMemory,
+                                    nightInfo,
+                                    voteSnapshot: buildVoteSnapshot(room),
+                                    recentVoteEvents: buildRecentVoteEvents(room),
+                                    nightPrompt: null,
+                                    currentNomination: room.currentNomination,
+                                    promptStyle,
+                                }, tempNow, {
+                                    allowedActions: godAllowedActions,
+                                    stageHint: 'god_dialogue',
+                                    instruction: mustAskThisTurn
+                                        ? '你现在处于上帝问答阶段。你有夜间信息，必须向上帝发起一次具体提问（禁止 noop）。'
+                                        : '你现在处于上帝问答阶段：若你确实有夜间信息需要确认/澄清，可向上帝提一个具体问题；否则输出 noop。',
+                                    outputSchema: {
+                                        chat_god: { type: 'chat_god', text: 'string' },
+                                        noop: { type: 'noop' },
+                                    },
+                                }, (event) => {
+                                    if (event.kind === 'request') {
+                                        const rec = createInvocation(room, {
+                                            actor: 'player',
+                                            stage: 'day_dialogue',
+                                            roomId: rid,
+                                            seatIndex,
+                                            phase: room.phase,
+                                            stepId: 'god_dialogue',
+                                            model: process.env.OPENAI_MODEL ?? 'qwen3.5-plus',
+                                            status: 'started',
+                                            request: toTraceText(toFullPromptDebugText(event)),
+                                        });
+                                        dialogueTraceId = rec.id;
+                                        sendAiTrace(rid, seatIndex, rec);
+                                    }
+                                    else if (event.kind === 'response') {
+                                        if (!dialogueTraceId)
+                                            return;
+                                        const rec = updateInvocation(room, dialogueTraceId, {
+                                            status: 'responded',
+                                            elapsedMs: event.elapsedMs,
+                                            response: toTraceText(event.rawResponse ?? ''),
+                                        });
+                                        if (rec)
+                                            sendAiTrace(rid, seatIndex, rec);
+                                    }
+                                    else if (event.kind === 'error') {
+                                        if (!dialogueTraceId)
+                                            return;
+                                        const rec = updateInvocation(room, dialogueTraceId, {
+                                            status: 'error',
+                                            error: event.error ?? 'unknown_error',
+                                        });
+                                        if (rec)
+                                            sendAiTrace(rid, seatIndex, rec);
+                                    }
+                                });
+                                // 关键：无论是提问还是 noop，都计入一次“上帝问答尝试”。
+                                // 否则若持续 noop，会一直不涨 turns，最终只能被导演层超时跳过。
+                                const attemptTurns = incDaySeatCounter(room, turnsKey);
+                                const askedText = (() => {
+                                    if (act.type === 'chat_god') {
+                                        const q = String(act.text ?? '').trim().slice(0, 200);
+                                        if (q)
+                                            return q;
+                                    }
+                                    // 有夜间信息且首轮必须提问时，若模型未给出有效问题，补一条标准问句，保证不“空转完成”。
+                                    if (mustAskThisTurn)
+                                        return '今晚信息';
+                                    return '';
+                                })();
+                                if (askedText) {
+                                    const ask = pushChat(room, { at: Date.now(), scope: 'god', phase: room.phase, dayNumber: room.dayNumber, fromSeat: seatIndex, text: askedText });
+                                    broadcastChat(rid, ask);
+                                    const replyText = makeDeterministicGodReply(room, seatIndex, askedText);
+                                    const reply = pushChat(room, { at: Date.now(), scope: 'god', phase: room.phase, dayNumber: room.dayNumber, fromSeat: seatIndex, text: replyText });
+                                    broadcastChat(rid, reply);
+                                    const askedCountKey = `ai_day_god_asked_count_${room.dayNumber}_seat_${seatIndex}`;
+                                    const prevAsked = Number(room.storytellerDecisions.get(askedCountKey) ?? 0);
+                                    room.storytellerDecisions.set(askedCountKey, Number.isFinite(prevAsked) ? Math.max(0, Math.floor(prevAsked)) + 1 : 1);
+                                    room.storytellerDecisions.set(`ai_day_god_last_q_${room.dayNumber}_seat_${seatIndex}`, askedText.slice(0, 120));
+                                    appendBehavior(rid, room, seatIndex, traceId, `god_dialogue:asked="${askedText}" replied="${replyText.slice(0, 80)}" turns=${attemptTurns}`);
+                                    if (dialogueTraceId) {
+                                        const rec = updateInvocation(room, dialogueTraceId, {
+                                            status: 'applied',
+                                            behavior: `chat_god asked="${askedText.slice(0, 80)}"${mustAskThisTurn && act.type !== 'chat_god' ? ' (forced_default)' : ''}`,
+                                        });
+                                        if (rec)
+                                            sendAiTrace(rid, seatIndex, rec);
+                                    }
+                                }
+                                else if (dialogueTraceId) {
+                                    const rec = updateInvocation(room, dialogueTraceId, {
+                                        status: 'applied',
+                                        behavior: `noop turns=${attemptTurns}`,
+                                    });
+                                    if (rec)
+                                        sendAiTrace(rid, seatIndex, rec);
+                                }
+                            }
                         }
-                        room.storytellerDecisions.set(godMarkKey, true);
                     }
-                    // 私聊
+                    // 私聊：允许多轮“微决策”（每次最多一条 chat_dm），允许自然出现“试探-回应-再试探”。
                     const dmMarkKey = `ai_day_dm_done_${room.dayNumber}_seat_${seatIndex}`;
-                    if (stage === 'private_dialogue' && plan && plan.type === 'day_plan' && room.storytellerDecisions.get(dmMarkKey) !== true) {
-                        const dmList = Array.isArray(plan.dm) ? plan.dm : [];
-                        const dmMap = new Map();
-                        for (const d of dmList) {
-                            if (!d || typeof d !== 'object')
-                                continue;
-                            const toSeat = d.toSeat;
-                            const text = String(d.text ?? '').trim();
-                            if (!Number.isInteger(toSeat) || !text)
-                                continue;
-                            if (!room.players[toSeat])
-                                continue;
-                            dmMap.set(toSeat, text.slice(0, 500));
-                        }
-                        const peers = room.players
-                            .filter((p) => p.isAlive && p.seatIndex !== seatIndex)
-                            .map((p) => p.seatIndex)
-                            .sort((a, b) => a - b);
-                        let dmSent = 0;
-                        let dmSkipped = 0;
-                        for (const toSeat of peers) {
-                            const text = dmMap.get(toSeat);
-                            if (!text) {
-                                dmSkipped++;
-                                continue;
-                            }
-                            const entry = pushChat(room, {
-                                at: Date.now(),
-                                scope: 'dm',
-                                phase: room.phase,
-                                dayNumber: room.dayNumber,
-                                fromSeat: seatIndex,
-                                toSeat,
-                                text,
-                            });
-                            broadcastChat(rid, entry);
-                            dmSent++;
-                        }
-                        appendBehavior(rid, room, seatIndex, traceId, `private_dialogue:peer_loop=${peers.length}; sent_dm=${dmSent}; skipped_dm=${dmSkipped}`);
-                        room.storytellerDecisions.set(dmMarkKey, true);
-                    }
-                    // 公聊（每天至少 1 条）
-                    const pubMarkKey = `ai_day_public_done_${room.dayNumber}_seat_${seatIndex}`;
-                    if (stage === 'public_speech' && plan && plan.type === 'day_plan' && room.storytellerDecisions.get(pubMarkKey) !== true) {
-                        const aggressiveGoodInfo = shouldPushGoodInfoAggression(room, seatIndex);
-                        const rawText = String(plan.public?.text ?? '').trim();
-                        const replacedByForcedPush = aggressiveGoodInfo && isWeakPublicSpeech(rawText);
-                        const text = replacedByForcedPush
-                            ? buildForcedActiveDayPlan(room, seatIndex).public.text
-                            : rawText;
-                        if (text) {
-                            const entry = pushChat(room, { at: Date.now(), scope: 'public', phase: room.phase, dayNumber: room.dayNumber, fromSeat: seatIndex, text: text.slice(0, 500) });
-                            pushPublic(room, `公开发言：${seatLabel(room, seatIndex)}：${text.slice(0, 500)}`);
-                            broadcastChat(rid, entry);
-                            broadcast(rid, { type: 'room', room: getRoomView(room) });
-                            appendBehavior(rid, room, seatIndex, traceId, `public_speech:spoken="${text.slice(0, 80)}"`);
-                            if (replacedByForcedPush) {
-                                appendBehavior(rid, room, seatIndex, traceId, `public_speech:forced_push_rewrite(from="${rawText.slice(0, 60)}")`);
-                            }
+                    if (stage === 'private_dialogue' && room.storytellerDecisions.get(dmMarkKey) !== true) {
+                        const sinceKey = `ai_day_dm_since_${room.dayNumber}_seat_${seatIndex}`;
+                        const turnsKey = `ai_day_dm_turns_${room.dayNumber}_seat_${seatIndex}`;
+                        const since = getOrInitDaySeatTimer(room, sinceKey);
+                        const turns = getDaySeatCounter(room, turnsKey);
+                        const elapsed = Date.now() - since;
+                        if (elapsed >= DAY_PRIVATE_DIALOGUE_MAX_MS || turns >= AI_DAY_DM_MAX_TURNS_PER_SEAT) {
+                            room.storytellerDecisions.set(dmMarkKey, true);
+                            appendBehavior(rid, room, seatIndex, traceId, `private_dialogue:done(turns=${turns}; elapsedMs=${elapsed})`);
                         }
                         else {
-                            const fallbackText = buildForcedActiveDayPlan(room, seatIndex).public.text;
-                            const entry = pushChat(room, { at: Date.now(), scope: 'public', phase: room.phase, dayNumber: room.dayNumber, fromSeat: seatIndex, text: fallbackText.slice(0, 500) });
-                            pushPublic(room, `公开发言（空文本兜底）：${seatLabel(room, seatIndex)}：${fallbackText.slice(0, 500)}`);
-                            broadcastChat(rid, entry);
-                            broadcast(rid, { type: 'room', room: getRoomView(room) });
-                            appendBehavior(rid, room, seatIndex, traceId, 'public_speech:fallback_due_to_empty_text');
+                            const cdKey = `ai_day_chat_cd_${room.dayNumber}_dm_${seatIndex}`;
+                            if (cooldownOk(room, cdKey, AI_DAY_CHAT_COOLDOWN_MS)) {
+                                const tempNow = room.aiPlayerTemperatureBySeat.get(seatIndex) ?? 0.5;
+                                const { roomView, yourCharacterId, yourRole, yourAlignment, chatLog, allChatLog, playerMemory, nightInfo, promptStyle, voiceProfile } = buildAiSeatContext(room, seatIndex);
+                                let dialogueTraceId = null;
+                                const act = await decideAiPlayerConstrainedAction(room, seatIndex, {
+                                    roomView,
+                                    yourSeatIndex: seatIndex,
+                                    yourRole,
+                                    yourCharacterId,
+                                    voiceProfile,
+                                    yourAlignment,
+                                    demonBluffs: yourAlignment === 'evil' ? (room.demonBluffs ?? null) : null,
+                                    chatLog,
+                                    allChatLog,
+                                    playerMemory,
+                                    nightInfo,
+                                    voteSnapshot: buildVoteSnapshot(room),
+                                    recentVoteEvents: buildRecentVoteEvents(room),
+                                    nightPrompt: null,
+                                    currentNomination: room.currentNomination,
+                                    promptStyle,
+                                }, tempNow, {
+                                    allowedActions: ['noop', 'chat_dm'],
+                                    stageHint: 'private_dialogue',
+                                    instruction: '你现在处于私聊阶段：你可以选择私聊一个对象进行试探/交换信息（只发一条），或输出 noop。',
+                                    outputSchema: {
+                                        chat_dm: { type: 'chat_dm', toSeat: 'number', text: 'string' },
+                                        noop: { type: 'noop' },
+                                    },
+                                }, (event) => {
+                                    if (event.kind === 'request') {
+                                        const rec = createInvocation(room, {
+                                            actor: 'player',
+                                            stage: 'day_dialogue',
+                                            roomId: rid,
+                                            seatIndex,
+                                            phase: room.phase,
+                                            stepId: 'private_dialogue',
+                                            model: process.env.OPENAI_MODEL ?? 'qwen3.5-plus',
+                                            status: 'started',
+                                            request: toTraceText(toFullPromptDebugText(event)),
+                                        });
+                                        dialogueTraceId = rec.id;
+                                        sendAiTrace(rid, seatIndex, rec);
+                                    }
+                                    else if (event.kind === 'response') {
+                                        if (!dialogueTraceId)
+                                            return;
+                                        const rec = updateInvocation(room, dialogueTraceId, {
+                                            status: 'responded',
+                                            elapsedMs: event.elapsedMs,
+                                            response: toTraceText(event.rawResponse ?? ''),
+                                        });
+                                        if (rec)
+                                            sendAiTrace(rid, seatIndex, rec);
+                                    }
+                                    else if (event.kind === 'error') {
+                                        if (!dialogueTraceId)
+                                            return;
+                                        const rec = updateInvocation(room, dialogueTraceId, {
+                                            status: 'error',
+                                            error: event.error ?? 'unknown_error',
+                                        });
+                                        if (rec)
+                                            sendAiTrace(rid, seatIndex, rec);
+                                    }
+                                });
+                                if (act.type === 'chat_dm') {
+                                    const toSeat = Number(act.toSeat);
+                                    const text = String(act.text ?? '').trim().slice(0, 500);
+                                    if (Number.isInteger(toSeat) && toSeat !== seatIndex && room.players[toSeat]?.isAlive && text) {
+                                        if (shouldRejectRoleClaimText(room, seatIndex, text)) {
+                                            appendBehavior(rid, room, seatIndex, traceId, 'private_dialogue:rejected_role_claim_text');
+                                            if (dialogueTraceId) {
+                                                const rec = updateInvocation(room, dialogueTraceId, { status: 'applied', behavior: 'rejected_role_claim_text' });
+                                                if (rec)
+                                                    sendAiTrace(rid, seatIndex, rec);
+                                            }
+                                            // 选项 1：被拦截后立刻重试一次（同轮内），不给下一轮冷却“吞掉”这次机会
+                                            let dialogueRetryTraceId = null;
+                                            const retryAct = await decideAiPlayerConstrainedAction(room, seatIndex, {
+                                                roomView,
+                                                yourSeatIndex: seatIndex,
+                                                yourRole,
+                                                yourCharacterId,
+                                                voiceProfile,
+                                                yourAlignment,
+                                                demonBluffs: yourAlignment === 'evil' ? (room.demonBluffs ?? null) : null,
+                                                chatLog,
+                                                allChatLog,
+                                                playerMemory,
+                                                nightInfo,
+                                                voteSnapshot: buildVoteSnapshot(room),
+                                                recentVoteEvents: buildRecentVoteEvents(room),
+                                                nightPrompt: null,
+                                                currentNomination: room.currentNomination,
+                                                promptStyle,
+                                            }, tempNow, {
+                                                allowedActions: ['noop', 'chat_dm'],
+                                                stageHint: 'private_dialogue',
+                                                instruction: '你刚才的表达因身份宣称不一致被拒绝。请重写：不要声称“我是某角色/昨晚查到…”，改为提问或试探（例如“你昨晚有信息吗？”），只发一条私聊或 noop。',
+                                                outputSchema: {
+                                                    chat_dm: { type: 'chat_dm', toSeat: 'number', text: 'string' },
+                                                    noop: { type: 'noop' },
+                                                },
+                                            }, (event) => {
+                                                if (event.kind === 'request') {
+                                                    const rec = createInvocation(room, {
+                                                        actor: 'player',
+                                                        stage: 'day_dialogue',
+                                                        roomId: rid,
+                                                        seatIndex,
+                                                        phase: room.phase,
+                                                        stepId: 'private_dialogue_retry',
+                                                        model: process.env.OPENAI_MODEL ?? 'qwen3.5-plus',
+                                                        status: 'started',
+                                                        request: toTraceText(toFullPromptDebugText(event)),
+                                                    });
+                                                    dialogueRetryTraceId = rec.id;
+                                                    sendAiTrace(rid, seatIndex, rec);
+                                                }
+                                                else if (event.kind === 'response') {
+                                                    if (!dialogueRetryTraceId)
+                                                        return;
+                                                    const rec = updateInvocation(room, dialogueRetryTraceId, {
+                                                        status: 'responded',
+                                                        elapsedMs: event.elapsedMs,
+                                                        response: toTraceText(event.rawResponse ?? ''),
+                                                    });
+                                                    if (rec)
+                                                        sendAiTrace(rid, seatIndex, rec);
+                                                }
+                                                else if (event.kind === 'error') {
+                                                    if (!dialogueRetryTraceId)
+                                                        return;
+                                                    const rec = updateInvocation(room, dialogueRetryTraceId, {
+                                                        status: 'error',
+                                                        error: event.error ?? 'unknown_error',
+                                                    });
+                                                    if (rec)
+                                                        sendAiTrace(rid, seatIndex, rec);
+                                                }
+                                            });
+                                            if (retryAct.type === 'chat_dm') {
+                                                const retryToSeat = Number(retryAct.toSeat);
+                                                const retryText = String(retryAct.text ?? '').trim().slice(0, 500);
+                                                if (Number.isInteger(retryToSeat)
+                                                    && retryToSeat !== seatIndex
+                                                    && room.players[retryToSeat]?.isAlive
+                                                    && retryText
+                                                    && !shouldRejectRoleClaimText(room, seatIndex, retryText)) {
+                                                    const entry = pushChat(room, {
+                                                        at: Date.now(),
+                                                        scope: 'dm',
+                                                        phase: room.phase,
+                                                        dayNumber: room.dayNumber,
+                                                        fromSeat: seatIndex,
+                                                        toSeat: retryToSeat,
+                                                        text: retryText,
+                                                    });
+                                                    broadcastChat(rid, entry);
+                                                    const t2 = incDaySeatCounter(room, turnsKey);
+                                                    appendBehavior(rid, room, seatIndex, traceId, `private_dialogue:dm_retry(to=${retryToSeat}) turns=${t2}`);
+                                                    if (dialogueRetryTraceId) {
+                                                        const rec = updateInvocation(room, dialogueRetryTraceId, {
+                                                            status: 'applied',
+                                                            behavior: `chat_dm_retry toSeat=${retryToSeat + 1} text="${retryText.slice(0, 80)}"`,
+                                                        });
+                                                        if (rec)
+                                                            sendAiTrace(rid, seatIndex, rec);
+                                                    }
+                                                }
+                                                else if (dialogueRetryTraceId) {
+                                                    const rec = updateInvocation(room, dialogueRetryTraceId, {
+                                                        status: 'applied',
+                                                        behavior: 'retry_invalid_or_rejected',
+                                                    });
+                                                    if (rec)
+                                                        sendAiTrace(rid, seatIndex, rec);
+                                                }
+                                            }
+                                            else if (dialogueRetryTraceId) {
+                                                const rec = updateInvocation(room, dialogueRetryTraceId, { status: 'applied', behavior: 'noop' });
+                                                if (rec)
+                                                    sendAiTrace(rid, seatIndex, rec);
+                                            }
+                                            continue;
+                                        }
+                                        const pairCdKey = `ai_day_dm_pair_cd_${room.dayNumber}_${seatIndex}_${toSeat}`;
+                                        if (cooldownOk(room, pairCdKey, AI_DAY_DM_PAIR_COOLDOWN_MS)) {
+                                            const entry = pushChat(room, { at: Date.now(), scope: 'dm', phase: room.phase, dayNumber: room.dayNumber, fromSeat: seatIndex, toSeat, text });
+                                            broadcastChat(rid, entry);
+                                            const t2 = incDaySeatCounter(room, turnsKey);
+                                            appendBehavior(rid, room, seatIndex, traceId, `private_dialogue:dm(to=${toSeat}) turns=${t2}`);
+                                            if (dialogueTraceId) {
+                                                const rec = updateInvocation(room, dialogueTraceId, {
+                                                    status: 'applied',
+                                                    behavior: `chat_dm toSeat=${toSeat + 1} text="${text.slice(0, 80)}"`,
+                                                });
+                                                if (rec)
+                                                    sendAiTrace(rid, seatIndex, rec);
+                                            }
+                                        }
+                                    }
+                                }
+                                else if (dialogueTraceId) {
+                                    const rec = updateInvocation(room, dialogueTraceId, {
+                                        status: 'applied',
+                                        behavior: `noop`,
+                                    });
+                                    if (rec)
+                                        sendAiTrace(rid, seatIndex, rec);
+                                }
+                            }
                         }
-                        room.storytellerDecisions.set(pubMarkKey, true);
+                    }
+                    // 公聊：允许多轮“微决策”（每次最多一条 chat_public），并保留超时兜底以保证流程可持续。
+                    const pubMarkKey = `ai_day_public_done_${room.dayNumber}_seat_${seatIndex}`;
+                    if (stage === 'public_speech' && room.storytellerDecisions.get(pubMarkKey) !== true) {
+                        const sinceKey = `ai_day_pub_since_${room.dayNumber}_seat_${seatIndex}`;
+                        const turnsKey = `ai_day_pub_turns_${room.dayNumber}_seat_${seatIndex}`;
+                        const since = getOrInitDaySeatTimer(room, sinceKey);
+                        const turns = getDaySeatCounter(room, turnsKey);
+                        const elapsed = Date.now() - since;
+                        if (elapsed >= DAY_PUBLIC_SPEECH_MAX_MS || turns >= AI_DAY_PUBLIC_MAX_TURNS_PER_SEAT) {
+                            // 若完全沉默且时间到，则兜底发一条，保证流程可持续
+                            if (turns === 0) {
+                                // 最后一击：忽略冷却再给 AI 一次必须开口的机会，仍失败才兜底
+                                const tempNow = room.aiPlayerTemperatureBySeat.get(seatIndex) ?? 0.5;
+                                const { roomView, yourCharacterId, yourRole, yourAlignment, chatLog, allChatLog, playerMemory, nightInfo, promptStyle, voiceProfile } = buildAiSeatContext(room, seatIndex);
+                                let dialogueTraceId = null;
+                                const act = await decideAiPlayerConstrainedAction(room, seatIndex, {
+                                    roomView,
+                                    yourSeatIndex: seatIndex,
+                                    yourRole,
+                                    yourCharacterId,
+                                    voiceProfile,
+                                    yourAlignment,
+                                    demonBluffs: yourAlignment === 'evil' ? (room.demonBluffs ?? null) : null,
+                                    chatLog,
+                                    allChatLog,
+                                    playerMemory,
+                                    nightInfo,
+                                    voteSnapshot: buildVoteSnapshot(room),
+                                    recentVoteEvents: buildRecentVoteEvents(room),
+                                    nightPrompt: null,
+                                    currentNomination: room.currentNomination,
+                                    promptStyle,
+                                }, tempNow, {
+                                    allowedActions: ['noop', 'chat_public'],
+                                    stageHint: 'public_speech',
+                                    instruction: '这是公开发言阶段的最后机会：请务必说一句简短可被回应的话（一个问题/一个疑点/一个建议），禁止输出 noop。',
+                                    outputSchema: {
+                                        chat_public: { type: 'chat_public', text: 'string' },
+                                        noop: { type: 'noop' },
+                                    },
+                                }, (event) => {
+                                    if (event.kind === 'request') {
+                                        const rec = createInvocation(room, {
+                                            actor: 'player',
+                                            stage: 'day_dialogue',
+                                            roomId: rid,
+                                            seatIndex,
+                                            phase: room.phase,
+                                            stepId: 'public_speech',
+                                            model: process.env.OPENAI_MODEL ?? 'qwen3.5-plus',
+                                            status: 'started',
+                                            request: toTraceText(toFullPromptDebugText(event)),
+                                        });
+                                        dialogueTraceId = rec.id;
+                                        sendAiTrace(rid, seatIndex, rec);
+                                    }
+                                    else if (event.kind === 'response') {
+                                        if (!dialogueTraceId)
+                                            return;
+                                        const rec = updateInvocation(room, dialogueTraceId, {
+                                            status: 'responded',
+                                            elapsedMs: event.elapsedMs,
+                                            response: toTraceText(event.rawResponse ?? ''),
+                                        });
+                                        if (rec)
+                                            sendAiTrace(rid, seatIndex, rec);
+                                    }
+                                    else if (event.kind === 'error') {
+                                        if (!dialogueTraceId)
+                                            return;
+                                        const rec = updateInvocation(room, dialogueTraceId, {
+                                            status: 'error',
+                                            error: event.error ?? 'unknown_error',
+                                        });
+                                        if (rec)
+                                            sendAiTrace(rid, seatIndex, rec);
+                                    }
+                                });
+                                const text = act.type === 'chat_public' ? String(act.text ?? '').trim().slice(0, 500) : '';
+                                if (text) {
+                                    const entry = pushChat(room, { at: Date.now(), scope: 'public', phase: room.phase, dayNumber: room.dayNumber, fromSeat: seatIndex, text });
+                                    pushPublic(room, `公开发言：${seatLabel(room, seatIndex)}：${text.slice(0, 500)}`);
+                                    broadcastChat(rid, entry);
+                                    broadcast(rid, { type: 'room', room: getRoomView(room) });
+                                    appendBehavior(rid, room, seatIndex, traceId, 'public_speech:last_chance_spoken');
+                                    if (dialogueTraceId) {
+                                        const rec = updateInvocation(room, dialogueTraceId, { status: 'applied', behavior: `chat_public text="${text.slice(0, 80)}"` });
+                                        if (rec)
+                                            sendAiTrace(rid, seatIndex, rec);
+                                    }
+                                }
+                                else {
+                                    const fallbackText = buildForcedActiveDayPlan(room, seatIndex).public.text;
+                                    const entry = pushChat(room, { at: Date.now(), scope: 'public', phase: room.phase, dayNumber: room.dayNumber, fromSeat: seatIndex, text: fallbackText.slice(0, 500) });
+                                    pushPublic(room, `公开发言（超时兜底）：${seatLabel(room, seatIndex)}：${fallbackText.slice(0, 500)}`);
+                                    broadcastChat(rid, entry);
+                                    broadcast(rid, { type: 'room', room: getRoomView(room) });
+                                    appendBehavior(rid, room, seatIndex, traceId, 'public_speech:fallback_due_to_silence');
+                                    if (dialogueTraceId) {
+                                        const rec = updateInvocation(room, dialogueTraceId, { status: 'applied', behavior: `noop_then_fallback` });
+                                        if (rec)
+                                            sendAiTrace(rid, seatIndex, rec);
+                                    }
+                                }
+                            }
+                            room.storytellerDecisions.set(pubMarkKey, true);
+                            appendBehavior(rid, room, seatIndex, traceId, `public_speech:done(turns=${turns}; elapsedMs=${elapsed})`);
+                        }
+                        else {
+                            const cdKey = `ai_day_chat_cd_${room.dayNumber}_pub_${seatIndex}`;
+                            if (cooldownOk(room, cdKey, AI_DAY_CHAT_COOLDOWN_MS)) {
+                                const tempNow = room.aiPlayerTemperatureBySeat.get(seatIndex) ?? 0.5;
+                                const { roomView, yourCharacterId, yourRole, yourAlignment, chatLog, allChatLog, playerMemory, nightInfo, promptStyle, voiceProfile } = buildAiSeatContext(room, seatIndex);
+                                let dialogueTraceId = null;
+                                const act = await decideAiPlayerConstrainedAction(room, seatIndex, {
+                                    roomView,
+                                    yourSeatIndex: seatIndex,
+                                    yourRole,
+                                    yourCharacterId,
+                                    voiceProfile,
+                                    yourAlignment,
+                                    demonBluffs: yourAlignment === 'evil' ? (room.demonBluffs ?? null) : null,
+                                    chatLog,
+                                    allChatLog,
+                                    playerMemory,
+                                    nightInfo,
+                                    voteSnapshot: buildVoteSnapshot(room),
+                                    recentVoteEvents: buildRecentVoteEvents(room),
+                                    nightPrompt: null,
+                                    currentNomination: room.currentNomination,
+                                    promptStyle,
+                                }, tempNow, {
+                                    allowedActions: ['noop', 'chat_public'],
+                                    stageHint: 'public_speech',
+                                    instruction: '你现在处于公开发言阶段：可以说一句简短、可被回应的话（提出一个疑点/一个问题/一个建议），或输出 noop。',
+                                    outputSchema: {
+                                        chat_public: { type: 'chat_public', text: 'string' },
+                                        noop: { type: 'noop' },
+                                    },
+                                }, (event) => {
+                                    if (event.kind === 'request') {
+                                        const rec = createInvocation(room, {
+                                            actor: 'player',
+                                            stage: 'day_dialogue',
+                                            roomId: rid,
+                                            seatIndex,
+                                            phase: room.phase,
+                                            stepId: 'public_speech',
+                                            model: process.env.OPENAI_MODEL ?? 'qwen3.5-plus',
+                                            status: 'started',
+                                            request: toTraceText(toFullPromptDebugText(event)),
+                                        });
+                                        dialogueTraceId = rec.id;
+                                        sendAiTrace(rid, seatIndex, rec);
+                                    }
+                                    else if (event.kind === 'response') {
+                                        if (!dialogueTraceId)
+                                            return;
+                                        const rec = updateInvocation(room, dialogueTraceId, {
+                                            status: 'responded',
+                                            elapsedMs: event.elapsedMs,
+                                            response: toTraceText(event.rawResponse ?? ''),
+                                        });
+                                        if (rec)
+                                            sendAiTrace(rid, seatIndex, rec);
+                                    }
+                                    else if (event.kind === 'error') {
+                                        if (!dialogueTraceId)
+                                            return;
+                                        const rec = updateInvocation(room, dialogueTraceId, {
+                                            status: 'error',
+                                            error: event.error ?? 'unknown_error',
+                                        });
+                                        if (rec)
+                                            sendAiTrace(rid, seatIndex, rec);
+                                    }
+                                });
+                                if (act.type === 'chat_public') {
+                                    const text = String(act.text ?? '').trim().slice(0, 500);
+                                    if (text) {
+                                        if (shouldRejectRoleClaimText(room, seatIndex, text)) {
+                                            appendBehavior(rid, room, seatIndex, traceId, 'public_speech:rejected_role_claim_text');
+                                            if (dialogueTraceId) {
+                                                const rec = updateInvocation(room, dialogueTraceId, { status: 'applied', behavior: 'rejected_role_claim_text' });
+                                                if (rec)
+                                                    sendAiTrace(rid, seatIndex, rec);
+                                            }
+                                            let dialogueRetryTraceId = null;
+                                            const retryAct = await decideAiPlayerConstrainedAction(room, seatIndex, {
+                                                roomView,
+                                                yourSeatIndex: seatIndex,
+                                                yourRole,
+                                                yourCharacterId,
+                                                voiceProfile,
+                                                yourAlignment,
+                                                demonBluffs: yourAlignment === 'evil' ? (room.demonBluffs ?? null) : null,
+                                                chatLog,
+                                                allChatLog,
+                                                playerMemory,
+                                                nightInfo,
+                                                voteSnapshot: buildVoteSnapshot(room),
+                                                recentVoteEvents: buildRecentVoteEvents(room),
+                                                nightPrompt: null,
+                                                currentNomination: room.currentNomination,
+                                                promptStyle,
+                                            }, tempNow, {
+                                                allowedActions: ['noop', 'chat_public'],
+                                                stageHint: 'public_speech',
+                                                instruction: '你刚才的表达因身份宣称不一致被拒绝。请重写为一句不涉及具体身份自曝的公开发言（一个问题/疑点/建议），或 noop。',
+                                                outputSchema: {
+                                                    chat_public: { type: 'chat_public', text: 'string' },
+                                                    noop: { type: 'noop' },
+                                                },
+                                            }, (event) => {
+                                                if (event.kind === 'request') {
+                                                    const rec = createInvocation(room, {
+                                                        actor: 'player',
+                                                        stage: 'day_dialogue',
+                                                        roomId: rid,
+                                                        seatIndex,
+                                                        phase: room.phase,
+                                                        stepId: 'public_speech_retry',
+                                                        model: process.env.OPENAI_MODEL ?? 'qwen3.5-plus',
+                                                        status: 'started',
+                                                        request: toTraceText(toFullPromptDebugText(event)),
+                                                    });
+                                                    dialogueRetryTraceId = rec.id;
+                                                    sendAiTrace(rid, seatIndex, rec);
+                                                }
+                                                else if (event.kind === 'response') {
+                                                    if (!dialogueRetryTraceId)
+                                                        return;
+                                                    const rec = updateInvocation(room, dialogueRetryTraceId, {
+                                                        status: 'responded',
+                                                        elapsedMs: event.elapsedMs,
+                                                        response: toTraceText(event.rawResponse ?? ''),
+                                                    });
+                                                    if (rec)
+                                                        sendAiTrace(rid, seatIndex, rec);
+                                                }
+                                                else if (event.kind === 'error') {
+                                                    if (!dialogueRetryTraceId)
+                                                        return;
+                                                    const rec = updateInvocation(room, dialogueRetryTraceId, {
+                                                        status: 'error',
+                                                        error: event.error ?? 'unknown_error',
+                                                    });
+                                                    if (rec)
+                                                        sendAiTrace(rid, seatIndex, rec);
+                                                }
+                                            });
+                                            if (retryAct.type === 'chat_public') {
+                                                const retryText = String(retryAct.text ?? '').trim().slice(0, 500);
+                                                if (retryText && !shouldRejectRoleClaimText(room, seatIndex, retryText)) {
+                                                    const entry = pushChat(room, { at: Date.now(), scope: 'public', phase: room.phase, dayNumber: room.dayNumber, fromSeat: seatIndex, text: retryText });
+                                                    pushPublic(room, `公开发言：${seatLabel(room, seatIndex)}：${retryText.slice(0, 500)}`);
+                                                    broadcastChat(rid, entry);
+                                                    broadcast(rid, { type: 'room', room: getRoomView(room) });
+                                                    const t2 = incDaySeatCounter(room, turnsKey);
+                                                    appendBehavior(rid, room, seatIndex, traceId, `public_speech:spoken_retry turns=${t2}`);
+                                                    if (dialogueRetryTraceId) {
+                                                        const rec = updateInvocation(room, dialogueRetryTraceId, {
+                                                            status: 'applied',
+                                                            behavior: `chat_public_retry text="${retryText.slice(0, 80)}"`,
+                                                        });
+                                                        if (rec)
+                                                            sendAiTrace(rid, seatIndex, rec);
+                                                    }
+                                                }
+                                                else if (dialogueRetryTraceId) {
+                                                    const rec = updateInvocation(room, dialogueRetryTraceId, { status: 'applied', behavior: 'retry_invalid_or_rejected' });
+                                                    if (rec)
+                                                        sendAiTrace(rid, seatIndex, rec);
+                                                }
+                                            }
+                                            else if (dialogueRetryTraceId) {
+                                                const rec = updateInvocation(room, dialogueRetryTraceId, { status: 'applied', behavior: 'noop' });
+                                                if (rec)
+                                                    sendAiTrace(rid, seatIndex, rec);
+                                            }
+                                        }
+                                        else {
+                                            const entry = pushChat(room, { at: Date.now(), scope: 'public', phase: room.phase, dayNumber: room.dayNumber, fromSeat: seatIndex, text });
+                                            pushPublic(room, `公开发言：${seatLabel(room, seatIndex)}：${text.slice(0, 500)}`);
+                                            broadcastChat(rid, entry);
+                                            broadcast(rid, { type: 'room', room: getRoomView(room) });
+                                            const t2 = incDaySeatCounter(room, turnsKey);
+                                            appendBehavior(rid, room, seatIndex, traceId, `public_speech:spoken="${text.slice(0, 80)}" turns=${t2}`);
+                                            if (dialogueTraceId) {
+                                                const rec = updateInvocation(room, dialogueTraceId, {
+                                                    status: 'applied',
+                                                    behavior: `chat_public text="${text.slice(0, 80)}"`,
+                                                });
+                                                if (rec)
+                                                    sendAiTrace(rid, seatIndex, rec);
+                                            }
+                                        }
+                                    }
+                                }
+                                else if (dialogueTraceId) {
+                                    const rec = updateInvocation(room, dialogueTraceId, {
+                                        status: 'applied',
+                                        behavior: `noop`,
+                                    });
+                                    if (rec)
+                                        sendAiTrace(rid, seatIndex, rec);
+                                }
+                            }
+                        }
                     }
                 }
                 catch (e) {
@@ -2665,7 +3685,26 @@ setInterval(async () => {
                 }
             }
             // 确定性兜底：避免 AI 沉默导致流程卡死
-            // 1) 夜晚等待确认：AI 玩家自动确认
+            // 1) 夜间信息确认：AI 玩家自动确认（仅对被要求确认的信息位）
+            if (room.awaitingNightInfoConfirm && (room.phase === 'night' || room.phase === 'first_night')) {
+                if (room.pendingNightInfoConfirmSeats.has(seatIndex) && !room.nightInfoConfirmations.has(seatIndex)) {
+                    room.nightInfoConfirmations.add(seatIndex);
+                    broadcastNightConfirm(rid, room);
+                    const done = Array.from(room.pendingNightInfoConfirmSeats.values()).every((s) => room.nightInfoConfirmations.has(s));
+                    if (done) {
+                        room.awaitingNightInfoConfirm = false;
+                        room.pendingNightInfoConfirmSeats = new Set();
+                        room.nightInfoConfirmations = new Set();
+                        const phaseBeforeLoop = room.phase;
+                        await runNightLoopExclusive(rid, room);
+                        sendNightPrompt(rid, room);
+                        broadcastAfterNight(rid, room, phaseBeforeLoop);
+                        broadcastNightConfirm(rid, room);
+                    }
+                }
+                continue;
+            }
+            // 2) 夜晚等待确认：AI 玩家自动确认
             if (room.awaitingNightConfirm && (room.phase === 'night' || room.phase === 'first_night')) {
                 if (!room.nightConfirmations.has(seatIndex)) {
                     room.nightConfirmations.add(seatIndex);
@@ -2688,7 +3727,7 @@ setInterval(async () => {
                 }
                 continue;
             }
-            // 2) 夜晚轮到该 AI 玩家行动：
+            // 3) 夜晚轮到该 AI 玩家行动：
             // - 若可用大模型：等待大模型决策（不要随机兜底跳过）
             // - 否则：随机兜底，避免永远卡死
             if (room.pendingNightAction && room.pendingNightAction.actorSeatIndex === seatIndex) {
@@ -2738,7 +3777,7 @@ setInterval(async () => {
                     continue;
                 }
             }
-            // 3) 白天提名阶段：若该 AI 玩家尚未做出“提名/不提名”，则自动进行一次操作，保证白天可结束
+            // 4) 白天提名阶段：若该 AI 玩家尚未做出“提名/不提名”，则自动进行一次操作，保证白天可结束
             if (room.phase === 'day' && room.daySubPhase === 'nomination' && room.currentNomination === null) {
                 const me = room.players[seatIndex];
                 const decided = room.nominationsToday.has(seatIndex) || room.skippedNominationsToday.has(seatIndex);
@@ -2756,7 +3795,7 @@ setInterval(async () => {
                             const { key, title } = dayReplayTitle(room);
                             pushReplay(room, key, title, `${seatLabel(room, seatIndex)}（AI）提名 ${seatLabel(room, planNom.targetSeat)}。`);
                             pushPublic(room, `${seatLabel(room, seatIndex)} 提名 ${seatLabel(room, planNom.targetSeat)}。`);
-                            appendBehavior(rid, room, seatIndex, traceId, `nomination_vote:nominate(target=${planNom.targetSeat})`);
+                            appendBehavior(rid, room, seatIndex, traceId, `nomination_vote:nominate(target=${planNom.targetSeat + 1})`);
                             broadcast(rid, { type: 'room', room: getRoomView(room) });
                         }
                     }
@@ -2771,7 +3810,7 @@ setInterval(async () => {
                                         const { key, title } = dayReplayTitle(room);
                                         pushReplay(room, key, title, `${seatLabel(room, seatIndex)}（AI）根据信息位策略主动提名 ${seatLabel(room, target)}。`);
                                         pushPublic(room, `${seatLabel(room, seatIndex)} 发起主动提名 ${seatLabel(room, target)}（信息位推进）。`);
-                                        appendBehavior(rid, room, seatIndex, traceId, `nomination_vote:nominate_good_info_push(target=${target})`);
+                                        appendBehavior(rid, room, seatIndex, traceId, `nomination_vote:nominate_good_info_push(target=${target + 1})`);
                                         broadcast(rid, { type: 'room', room: getRoomView(room) });
                                         continue;
                                     }
@@ -2802,7 +3841,7 @@ setInterval(async () => {
                                 const { key, title } = dayReplayTitle(room);
                                 pushReplay(room, key, title, `${seatLabel(room, seatIndex)}（AI）提名 ${seatLabel(room, target)}。`);
                                 pushPublic(room, `${seatLabel(room, seatIndex)} 提名 ${seatLabel(room, target)}。`);
-                                appendBehavior(rid, room, seatIndex, traceId, `nomination_vote:nominate_fallback(target=${target})`);
+                                appendBehavior(rid, room, seatIndex, traceId, `nomination_vote:nominate_fallback(target=${target + 1})`);
                                 broadcast(rid, { type: 'room', room: getRoomView(room) });
                                 continue;
                             }
@@ -2823,7 +3862,7 @@ setInterval(async () => {
                     continue;
                 }
             }
-            // 4) 白天投票：若当前有提名且该 AI 玩家可投票但尚未投，则自动投票
+            // 5) 白天投票：若当前有提名且该 AI 玩家可投票但尚未投，则自动投票
             if (room.phase === 'day' && room.currentNomination) {
                 const me = room.players[seatIndex];
                 const canVote = !!me && (me.isAlive || me.hasDeadVote);

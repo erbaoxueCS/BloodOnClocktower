@@ -336,6 +336,9 @@ export function advanceNight(room) {
     // 若正在等待玩家夜晚行动输入，则不推进
     if (room.pendingNightAction)
         return false;
+    // 若正在等待“夜间信息确认”，则不推进
+    if (room.awaitingNightInfoConfirm)
+        return false;
     const order = getCurrentNightOrder(room);
     if (room.nightStepIndex >= order.length) {
         // 夜序结束：改为等待全员确认天亮
@@ -459,8 +462,13 @@ export function submitNightAction(room, actorSeatIndex, targets) {
 function gotoDay(room) {
     room.phase = 'day';
     room.dayNumber++;
-    // 按需求：白天不需要“进入提名阶段”按钮，天亮后直接开始提名流转
-    room.daySubPhase = 'nomination';
+    // 白天先进入讨论编排（上帝问答->私聊->公开发言），再进入提名投票。
+    room.daySubPhase = 'discussion';
+    room.dayFlowStage = 'god_dialogue';
+    const aliveSeats = room.players.filter((p) => p.isAlive).map((p) => p.seatIndex);
+    room.dayFlowStartSeat = aliveSeats.length > 0
+        ? aliveSeats[Math.floor(Math.random() * aliveSeats.length)]
+        : null;
     room.currentNomination = null;
     room.nominationsToday = new Map();
     room.skippedNominationsToday = new Set();
@@ -471,6 +479,9 @@ function gotoDay(room) {
     room.pendingExecutionTied = false;
     room.awaitingNightConfirm = false;
     room.nightConfirmations = new Set();
+    room.awaitingNightInfoConfirm = false;
+    room.pendingNightInfoConfirmSeats = new Set();
+    room.nightInfoConfirmations = new Set();
     /** 胜负仅在「进入白天」时结算，便于夜间链式规则（刀自己、后续角色等）自由组合 */
     const win = checkWin(room);
     if (win) {
@@ -495,6 +506,9 @@ function gotoNight(room) {
     room.poisonedSeatIndex = null;
     room.nightStepIndex = 0;
     room.pendingNightAction = null;
+    room.awaitingNightInfoConfirm = false;
+    room.pendingNightInfoConfirmSeats = new Set();
+    room.nightInfoConfirmations = new Set();
     room.protectedSeatIndex = null;
     room.lastNightDeaths = [];
     room.lastNightRevivals = [];

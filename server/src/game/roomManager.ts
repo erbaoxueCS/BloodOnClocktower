@@ -53,6 +53,9 @@ export function createRoom(scriptId: string): Room {
     chatLog: [],
     awaitingNightConfirm: false,
     nightConfirmations: new Set(),
+    awaitingNightInfoConfirm: false,
+    pendingNightInfoConfirmSeats: new Set(),
+    nightInfoConfirmations: new Set(),
     aiPlayerEnabledBySeat: new Map(),
     aiPlayerLastActionAtBySeat: new Map(),
     aiPlayerBehaviorStyleBySeat: new Map(),
@@ -128,6 +131,9 @@ export function getRoomView(room: Room, _forSeatIndex?: number, includeGlobalLog
     publicLog: room.publicLog,
     awaitingNightConfirm: room.awaitingNightConfirm,
     nightConfirmedSeats: Array.from(room.nightConfirmations.values()),
+    awaitingNightInfoConfirm: room.awaitingNightInfoConfirm,
+    pendingNightInfoConfirmSeats: Array.from(room.pendingNightInfoConfirmSeats.values()),
+    nightInfoConfirmedSeats: Array.from(room.nightInfoConfirmations.values()),
     chatLog,
     aiPlayerEnabled: forSeatIndex === undefined ? undefined : (room.aiPlayerEnabledBySeat.get(forSeatIndex) ?? false),
     aiPlayerBehaviorStyle: forSeatIndex === undefined ? undefined : (room.aiPlayerBehaviorStyleBySeat.get(forSeatIndex) ?? undefined),
@@ -171,6 +177,9 @@ function resetRoomForNextGame(room: Room): void {
   room.chatLog = [];
   room.awaitingNightConfirm = false;
   room.nightConfirmations = new Set();
+  room.awaitingNightInfoConfirm = false;
+  room.pendingNightInfoConfirmSeats = new Set();
+  room.nightInfoConfirmations = new Set();
   room.aiPlayerEnabledBySeat = new Map();
   room.aiPlayerLastActionAtBySeat = new Map();
   room.aiPlayerBehaviorStyleBySeat = new Map();

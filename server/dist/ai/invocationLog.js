@@ -31,3 +31,7 @@ export function updateInvocation(room, id, patch) {
     store.set(id, next);
     return next;
 }
+export function listInvocations(room) {
+    const store = getStore(room);
+    return Array.from(store.values()).sort((a, b) => a.at - b.at);
+}

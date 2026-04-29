@@ -694,3 +694,34 @@ npm run dev
 - **中文 + 可手动更改**：前端改为中文展示并支持在托管开启时手动切换行为方式；后端新增 WS 指令 `set_ai_player_behavior_style` 并即时生效（清除当日 `day_plan` 以便重新规划）。
 - **降低同质化**：兜底公聊/私聊改为“多模板 + 可复现伪随机 + voiceProfile 引导”，即使模型输出趋同也能拉开表达差异。
 
+---
+
+## 14. 最近改动归档（2026-04-29）
+
+### 14.1 夜晚导演 God Agent（`god-agent`）
+
+- 新增 `server/src/ai/godAgent.ts`：`GodAgent` 负责按夜序推进、夜间信息下发、洗衣妇/图书管理员/调查员等需说书人裁量的步骤；每房间 `getOrCreateGodAgent(roomId)` 单例。
+- `server/src/night/runNightLoop.ts` 改为委托 `godAgent.tickNight(...)`，保持 `sendNightInfo` / `maxStepsPerRun` / `onStorytellerDebug` 接口不变，便于后续在单一落点扩展“确认/超时/可解释裁量”。
+
+### 14.2 夜间信息步骤确认（信息位与行动位对齐）
+
+- `Room` 扩展：`awaitingNightInfoConfirm`、`pendingNightInfoConfirmSeats`、`nightInfoConfirmations`（`types.ts` + `roomManager` 初始化/重置 + `getRoomView` 透出）。
+- `gameEngine.advanceNight`：若正在等待夜间信息确认则**不推进**夜序。
+- `sendNightInfo`（`index.ts`）：每次下发 `night_info` 后进入信息确认态，仅对应座位需确认；确认完成后继续 `runNightLoopExclusive` 并 `sendNightPrompt` / `broadcastAfterNight` / `broadcastNightConfirm`。
+- WebSocket `night_confirm`：若当前为信息确认态，仅 `pendingNightInfoConfirmSeats` 内座位可确认；全部确认后推进夜序；否则仍走原有「全员确认夜晚结束→天亮」逻辑。
+- 导演兜底：`enforceProgressFallback` 对 `awaitingNightInfoConfirm` 超时自动放行（与 `FALLBACK_NIGHT_CONFIRM_TIMEOUT_MS` 同源时钟键），避免卡死。
+- AI 托管：`maybeAiTakeoverNight` 中信息位自动确认；`runNightLoopExclusive` 在信息确认未完成时不重复跑圈。
+- 广播 `night_confirm_update` 扩展字段：`awaitingInfo`、`pendingInfoSeats`、`infoConfirmedSeats`（兼容旧客户端字段）。
+- 前端：`client/src/types.ts`、`Game.tsx`（区分「夜间信息确认」与「夜晚结束确认」文案与进度）、`AdminPanel.tsx`（观察信息确认计数）。
+
+### 14.3 上帝 ↔ 玩家对话纳入 AI 可观测（玩家侧 + 上帝侧）
+
+- 玩家 `chat_send` 且 `scope=god` 时，在推送聊天与上帝回复（含人工说书人占位文案）之外，追加一条 `ai_trace`：`stage=day_dialogue`、`stepId=god_chat`，`request` 为玩家原文、`response` 为上帝侧回复摘要。
+- `sendAiTrace`：对「上帝对话」类 `day_dialogue` trace，除发给对应座位外，**镜像给管理员连接**，使管理员「AI 调用记录」与玩家侧「AI 对话」都能看到同一段问答（在既有「玩家仅看自己 / 管理员原只看说书人 seat=null」策略上做的**例外**，仅限上帝聊天观测）。
+
+### 14.4 相关源码与构建产物
+
+- 本轮一并维护：`PlayerSeatAgent` / `llmLimiter` 等 AI 模块源码；`server/dist`、`client/dist` 随 `tsc` / `vite build` 更新（仓库若跟踪 dist，提交时保持与源码一致）。
+
+**验证建议**：开一局带信息位角色，确认收到夜间信息后必须先点确认夜序才继续；玩家在白天向上帝发消息后，玩家端与管理员端「AI 对话/调用记录」均出现 `god_chat` 成对记录。
+

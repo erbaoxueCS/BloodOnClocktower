@@ -25,7 +25,7 @@ type AiTraceEntry = {
   roomId: string;
   phase: string;
   dayNumber?: number;
-  stage: 'day_plan' | 'night_action' | 'storyteller_decision';
+  stage: 'day_plan' | 'day_dialogue' | 'night_action' | 'storyteller_decision';
   status: 'started' | 'responded' | 'applied' | 'fallback' | 'error';
   stepId?: string;
   model: string;
@@ -120,6 +120,7 @@ function phaseToText(phase: string, dayNumber?: number): string {
 
 function toStageText(stage: AiTraceEntry['stage']): string {
   if (stage === 'day_plan') return '白天计划';
+  if (stage === 'day_dialogue') return '白天对话';
   if (stage === 'night_action') return '夜晚行动';
   return '说书人裁量';
 }
@@ -229,6 +230,9 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
   const [chatSending, setChatSending] = useState(false);
   const [awaitingNightConfirm, setAwaitingNightConfirm] = useState(false);
   const [nightConfirmedSeats, setNightConfirmedSeats] = useState<number[]>([]);
+  const [awaitingNightInfoConfirm, setAwaitingNightInfoConfirm] = useState(false);
+  const [pendingNightInfoConfirmSeats, setPendingNightInfoConfirmSeats] = useState<number[]>([]);
+  const [nightInfoConfirmedSeats, setNightInfoConfirmedSeats] = useState<number[]>([]);
   const [endedReplay, setEndedReplay] = useState<ReplayBundle | null>(null);
   const [slayerTarget, setSlayerTarget] = useState<number | null>(null);
   const [myVoteChoice, setMyVoteChoice] = useState<boolean | null>(null);
@@ -477,6 +481,9 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
           setChatEntries(Array.isArray(msg.room.chatLog) ? msg.room.chatLog : []);
           setAwaitingNightConfirm(!!msg.room.awaitingNightConfirm);
           setNightConfirmedSeats(Array.isArray(msg.room.nightConfirmedSeats) ? msg.room.nightConfirmedSeats : []);
+          setAwaitingNightInfoConfirm(!!msg.room.awaitingNightInfoConfirm);
+          setPendingNightInfoConfirmSeats(Array.isArray(msg.room.pendingNightInfoConfirmSeats) ? msg.room.pendingNightInfoConfirmSeats : []);
+          setNightInfoConfirmedSeats(Array.isArray(msg.room.nightInfoConfirmedSeats) ? msg.room.nightInfoConfirmedSeats : []);
           // 每局重置：房间回到大厅时，清空本地夜间信息与对话输入状态（避免下一局残留）
           if (msg.room.status === 'lobby') {
             setNightLog([]);
@@ -486,6 +493,9 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
             setChatDmTarget(null);
             setAwaitingNightConfirm(false);
             setNightConfirmedSeats([]);
+            setAwaitingNightInfoConfirm(false);
+            setPendingNightInfoConfirmSeats([]);
+            setNightInfoConfirmedSeats([]);
             setEndedReplay(null);
             setAiTraceEntries([]);
             setPostGameGodQaList([]);
@@ -513,6 +523,9 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
         } else if (msg.type === 'night_confirm_update') {
           setAwaitingNightConfirm(!!msg.awaiting);
           setNightConfirmedSeats(Array.isArray(msg.confirmedSeats) ? msg.confirmedSeats : []);
+          setAwaitingNightInfoConfirm(!!msg.awaitingInfo);
+          setPendingNightInfoConfirmSeats(Array.isArray(msg.pendingInfoSeats) ? msg.pendingInfoSeats : []);
+          setNightInfoConfirmedSeats(Array.isArray(msg.infoConfirmedSeats) ? msg.infoConfirmedSeats : []);
         } else if (msg.type === 'phase') {
           setRoom((r) => ({ ...r, phase: msg.phase, dayNumber: msg.dayNumber ?? r.dayNumber }));
           if (msg.phase === 'day' || msg.phase === 'waiting') {
@@ -537,6 +550,9 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
           setChatEntries(Array.isArray(msg.room.chatLog) ? msg.room.chatLog : []);
           setAwaitingNightConfirm(!!msg.room.awaitingNightConfirm);
           setNightConfirmedSeats(Array.isArray(msg.room.nightConfirmedSeats) ? msg.room.nightConfirmedSeats : []);
+          setAwaitingNightInfoConfirm(!!msg.room.awaitingNightInfoConfirm);
+          setPendingNightInfoConfirmSeats(Array.isArray(msg.room.pendingNightInfoConfirmSeats) ? msg.room.pendingNightInfoConfirmSeats : []);
+          setNightInfoConfirmedSeats(Array.isArray(msg.room.nightInfoConfirmedSeats) ? msg.room.nightInfoConfirmedSeats : []);
         } else if (msg.type === 'error') {
           console.error(msg.message);
           const raw = String(msg.message ?? '未知错误');
@@ -753,6 +769,7 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
               >
                 <option value="all">全部</option>
                 <option value="day_plan">白天计划</option>
+                <option value="day_dialogue">白天对话</option>
                 <option value="night_action">夜晚行动</option>
                 <option value="storyteller_decision">说书人裁量</option>
               </select>
@@ -1276,15 +1293,21 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
             </section>
           )}
 
-          {inNight && awaitingNightConfirm && (
+          {inNight && (awaitingNightInfoConfirm || awaitingNightConfirm) && (
             <section className="card" style={{ marginTop: 16 }}>
-              <h3>夜晚结束确认</h3>
+              <h3>{awaitingNightInfoConfirm ? '夜间信息确认' : '夜晚结束确认'}</h3>
               <p className="muted" style={{ marginTop: 6 }}>
-                所有玩家都需要手动确认夜晚结束后，才会进入白天。当前已确认：{nightConfirmedSeats.length}/{room.players.length}
+                {awaitingNightInfoConfirm
+                  ? `收到夜间信息的玩家需先确认，才会继续夜晚流程。当前已确认：${nightInfoConfirmedSeats.length}/${pendingNightInfoConfirmSeats.length}`
+                  : `所有玩家都需要手动确认夜晚结束后，才会进入白天。当前已确认：${nightConfirmedSeats.length}/${room.players.length}`}
               </p>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                {room.players.map((p) => {
-                  const ok = nightConfirmedSeats.includes(p.seatIndex);
+                {(awaitingNightInfoConfirm
+                  ? room.players.filter((p) => pendingNightInfoConfirmSeats.includes(p.seatIndex))
+                  : room.players).map((p) => {
+                  const ok = awaitingNightInfoConfirm
+                    ? nightInfoConfirmedSeats.includes(p.seatIndex)
+                    : nightConfirmedSeats.includes(p.seatIndex);
                   return (
                     <span key={`confirm-seat-${p.id}`} className={`pill ${ok ? 'status-ok' : 'status-warn'}`}>
                       #{p.seatIndex + 1} {p.nickname} {ok ? '✓' : '…'}
@@ -1293,7 +1316,7 @@ export function Game({ roomId, room: initialRoom, yourSeatIndex, yourCharacterId
                 })}
               </div>
               <button type="button" style={{ marginTop: 10 }} onClick={() => send({ type: 'night_confirm' })} disabled={wsStatus !== 'open'}>
-                我已完成夜晚活动（确认）
+                {awaitingNightInfoConfirm ? '我已阅读夜间信息（确认）' : '我已完成夜晚活动（确认）'}
               </button>
             </section>
           )}

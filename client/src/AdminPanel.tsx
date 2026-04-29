@@ -19,7 +19,7 @@ type AiTraceEntry = {
   roomId: string;
   phase: string;
   dayNumber?: number;
-  stage: 'day_plan' | 'night_action' | 'storyteller_decision';
+  stage: 'day_plan' | 'day_dialogue' | 'night_action' | 'storyteller_decision';
   status: 'started' | 'responded' | 'applied' | 'fallback' | 'error';
   stepId?: string;
   model: string;
@@ -61,6 +61,7 @@ function daySubPhaseZh(sub?: string | null): string {
 
 function traceStageZh(stage: AiTraceEntry['stage']): string {
   if (stage === 'day_plan') return '白天计划';
+  if (stage === 'day_dialogue') return '白天对话';
   if (stage === 'night_action') return '夜晚行动';
   return '说书人裁量';
 }
@@ -131,6 +132,16 @@ export function AdminPanel({ roomId, hostSecret, onLeave }: AdminPanelProps) {
           setIsHost(!!msg.isHost);
         } else if (msg.type === 'game_over') {
           setRoom(msg.room);
+        } else if (msg.type === 'chat_event') {
+          const entry = msg.entry;
+          if (entry && typeof entry === 'object' && typeof entry.id === 'string') {
+            setRoom((prev) => {
+              if (!prev) return prev;
+              const list = Array.isArray(prev.chatLog) ? prev.chatLog : [];
+              if (list.some((x) => x.id === entry.id)) return prev;
+              return { ...prev, chatLog: [...list, entry].slice(-500) };
+            });
+          }
         } else if (msg.type === 'error') {
           setLastError(String(msg.message ?? '未知错误'));
         } else if (msg.type === 'ai_trace') {
@@ -383,7 +394,13 @@ export function AdminPanel({ roomId, hostSecret, onLeave }: AdminPanelProps) {
             awaitingNightConfirm：{room?.awaitingNightConfirm ? 'true' : 'false'}
           </p>
           <p className="muted" style={{ marginTop: 4 }}>
+            awaitingNightInfoConfirm：{room?.awaitingNightInfoConfirm ? 'true' : 'false'}
+          </p>
+          <p className="muted" style={{ marginTop: 4 }}>
             已确认：{room?.nightConfirmedSeats?.length ?? 0}/{room?.players?.length ?? 0}
+          </p>
+          <p className="muted" style={{ marginTop: 4 }}>
+            信息确认：{room?.nightInfoConfirmedSeats?.length ?? 0}/{room?.pendingNightInfoConfirmSeats?.length ?? 0}
           </p>
           <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
             {(room?.players ?? []).map((p) => {

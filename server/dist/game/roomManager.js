@@ -50,8 +50,12 @@ export function createRoom(scriptId) {
         chatLog: [],
         awaitingNightConfirm: false,
         nightConfirmations: new Set(),
+        awaitingNightInfoConfirm: false,
+        pendingNightInfoConfirmSeats: new Set(),
+        nightInfoConfirmations: new Set(),
         aiPlayerEnabledBySeat: new Map(),
         aiPlayerLastActionAtBySeat: new Map(),
+        aiPlayerBehaviorStyleBySeat: new Map(),
         aiPlayerTemperatureBySeat: new Map(),
     };
     rooms.set(room.id, room);
@@ -127,9 +131,12 @@ export function getRoomView(room, _forSeatIndex, includeGlobalLog = false) {
         publicLog: room.publicLog,
         awaitingNightConfirm: room.awaitingNightConfirm,
         nightConfirmedSeats: Array.from(room.nightConfirmations.values()),
+        awaitingNightInfoConfirm: room.awaitingNightInfoConfirm,
+        pendingNightInfoConfirmSeats: Array.from(room.pendingNightInfoConfirmSeats.values()),
+        nightInfoConfirmedSeats: Array.from(room.nightInfoConfirmations.values()),
         chatLog,
         aiPlayerEnabled: forSeatIndex === undefined ? undefined : (room.aiPlayerEnabledBySeat.get(forSeatIndex) ?? false),
-        aiPlayerTemperature: forSeatIndex === undefined ? undefined : (room.aiPlayerTemperatureBySeat.get(forSeatIndex) ?? 0.5),
+        aiPlayerBehaviorStyle: forSeatIndex === undefined ? undefined : (room.aiPlayerBehaviorStyleBySeat.get(forSeatIndex) ?? undefined),
         globalLog: includeGlobalLog ? room.replayLog : undefined,
         aiStorytellerEnabled: room.aiStorytellerEnabled,
         minPlayers: room.script.minPlayers,
@@ -169,8 +176,12 @@ function resetRoomForNextGame(room) {
     room.chatLog = [];
     room.awaitingNightConfirm = false;
     room.nightConfirmations = new Set();
+    room.awaitingNightInfoConfirm = false;
+    room.pendingNightInfoConfirmSeats = new Set();
+    room.nightInfoConfirmations = new Set();
     room.aiPlayerEnabledBySeat = new Map();
     room.aiPlayerLastActionAtBySeat = new Map();
+    room.aiPlayerBehaviorStyleBySeat = new Map();
     room.aiPlayerTemperatureBySeat = new Map();
     for (const p of room.players) {
         p.isReady = false;

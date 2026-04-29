@@ -353,6 +353,8 @@ function pickTwo(arr: number[]): [number, number] {
 export function advanceNight(room: Room): boolean {
   // 若正在等待玩家夜晚行动输入，则不推进
   if (room.pendingNightAction) return false;
+  // 若正在等待“夜间信息确认”，则不推进
+  if (room.awaitingNightInfoConfirm) return false;
   const order = getCurrentNightOrder(room);
   if (room.nightStepIndex >= order.length) {
     // 夜序结束：改为等待全员确认天亮
@@ -484,6 +486,9 @@ function gotoDay(room: Room): void {
   room.pendingExecutionTied = false;
   room.awaitingNightConfirm = false;
   room.nightConfirmations = new Set();
+  room.awaitingNightInfoConfirm = false;
+  room.pendingNightInfoConfirmSeats = new Set();
+  room.nightInfoConfirmations = new Set();
   /** 胜负仅在「进入白天」时结算，便于夜间链式规则（刀自己、后续角色等）自由组合 */
   const win = checkWin(room);
   if (win) {
@@ -507,6 +512,9 @@ function gotoNight(room: Room): void {
   room.poisonedSeatIndex = null;
   room.nightStepIndex = 0;
   room.pendingNightAction = null;
+  room.awaitingNightInfoConfirm = false;
+  room.pendingNightInfoConfirmSeats = new Set();
+  room.nightInfoConfirmations = new Set();
   room.protectedSeatIndex = null;
   room.lastNightDeaths = [];
   room.lastNightRevivals = [];

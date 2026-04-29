@@ -1,7 +1,7 @@
 import type { Room } from '../game/types.js';
 
 export type AiInvocationActor = 'player' | 'storyteller';
-export type AiInvocationStage = 'day_plan' | 'night_action' | 'storyteller_decision';
+export type AiInvocationStage = 'day_plan' | 'day_dialogue' | 'night_action' | 'storyteller_decision';
 export type AiInvocationStatus = 'started' | 'responded' | 'applied' | 'fallback' | 'error';
 
 export interface AiInvocationRecord {
@@ -63,4 +63,9 @@ export function updateInvocation(
   };
   store.set(id, next);
   return next;
+}
+
+export function listInvocations(room: Room): AiInvocationRecord[] {
+  const store = getStore(room);
+  return Array.from(store.values()).sort((a, b) => a.at - b.at);
 }
