@@ -66,6 +66,9 @@ export interface RoomView {
   publicLog?: Array<{ seq: number; at: number; line: string }>;
   awaitingNightConfirm?: boolean;
   nightConfirmedSeats?: number[];
+  awaitingNightInfoConfirm?: boolean;
+  pendingNightInfoConfirmSeats?: number[];
+  nightInfoConfirmedSeats?: number[];
   chatLog?: Array<{
     id: string;
     at: number;
@@ -77,7 +80,7 @@ export interface RoomView {
     text: string;
   }>;
   aiPlayerEnabled?: boolean;
-  aiPlayerTemperature?: number;
+  aiPlayerBehaviorStyle?: 'analytical' | 'skeptical' | 'cautious' | 'empathetic' | 'deceptive' | 'chaotic';
   globalLog?: ReplayLogEntry[];
   aiStorytellerEnabled?: boolean;
   minPlayers: number;

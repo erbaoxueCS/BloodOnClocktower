@@ -178,6 +178,41 @@ export function formatFortuneTellerResultForSeat(room: Room, fortuneSeatIndex: n
   return formatFortuneTellerResult(room, targets);
 }
 
+function getTroubleBrewingSeatDistribution(playerCount: number): {
+  townsfolk: number;
+  outsiders: number;
+  minions: number;
+  demons: number;
+} {
+  switch (playerCount) {
+    case 5:
+      return { townsfolk: 3, outsiders: 0, minions: 1, demons: 1 };
+    case 6:
+      return { townsfolk: 3, outsiders: 1, minions: 1, demons: 1 };
+    case 7:
+      return { townsfolk: 5, outsiders: 0, minions: 1, demons: 1 };
+    case 8:
+      return { townsfolk: 5, outsiders: 1, minions: 1, demons: 1 };
+    case 9:
+      return { townsfolk: 5, outsiders: 2, minions: 1, demons: 1 };
+    case 10:
+      return { townsfolk: 7, outsiders: 0, minions: 2, demons: 1 };
+    case 11:
+      return { townsfolk: 7, outsiders: 1, minions: 2, demons: 1 };
+    case 12:
+      return { townsfolk: 7, outsiders: 2, minions: 2, demons: 1 };
+    case 13:
+      return { townsfolk: 9, outsiders: 0, minions: 3, demons: 1 };
+    case 14:
+      return { townsfolk: 9, outsiders: 1, minions: 3, demons: 1 };
+    case 15:
+      return { townsfolk: 9, outsiders: 2, minions: 3, demons: 1 };
+    default:
+      // 兜底仅用于异常人数，常规流程应始终落在 5~15。
+      return { townsfolk: 3, outsiders: 0, minions: 1, demons: 1 };
+  }
+}
+
 /** 根据人数生成本局角色池（暗流涌动简化：固定比例） */
 export function assignRoles(room: Room): void {
   const n = room.players.length;
@@ -186,28 +221,21 @@ export function assignRoles(room: Room): void {
   const outsiders = script.characters.filter((c) => c.type === 'outsider');
   const minions = script.characters.filter((c) => c.type === 'minion');
   const demons = script.characters.filter((c) => c.type === 'demon');
-
-  let numOutsiders = 0;
-  if (n <= 6) numOutsiders = 0;
-  else if (n <= 9) numOutsiders = 1;
-  else if (n <= 12) numOutsiders = 2;
-  else numOutsiders = 3;
-
-  const numEvil = n <= 6 ? 1 : 2;
-  const numMinions = numEvil - 1;
-  const numTownsfolk = n - numOutsiders - numEvil;
+  const distribution = getTroubleBrewingSeatDistribution(n);
 
   const pool: string[] = [];
-  for (let i = 0; i < numTownsfolk; i++) {
+  for (let i = 0; i < distribution.townsfolk; i++) {
     pool.push(townsfolk[i % townsfolk.length].id);
   }
-  for (let i = 0; i < numOutsiders; i++) {
+  for (let i = 0; i < distribution.outsiders; i++) {
     pool.push(outsiders[i % outsiders.length].id);
   }
-  for (let i = 0; i < numMinions; i++) {
+  for (let i = 0; i < distribution.minions; i++) {
     pool.push(minions[i % minions.length].id);
   }
-  pool.push(demons[0].id);
+  for (let i = 0; i < distribution.demons; i++) {
+    pool.push(demons[i % demons.length].id);
+  }
 
   shuffle(pool);
   room.players.forEach((p, i) => {
@@ -228,15 +256,13 @@ export function assignRoles(room: Room): void {
     p.drunkPretendCharacterId = pool2[Math.floor(Math.random() * pool2.length)] ?? 'washerwoman';
   }
 
-  if (n >= 7) {
-    const inGame = new Set(pool);
-    const goodChars = script.characters.filter((c) => c.alignment === 'good' && c.type !== 'demon');
-    const notInGame = goodChars.filter((c) => !inGame.has(c.id)).map((c) => c.id);
-    shuffle(notInGame);
-    room.demonBluffs = notInGame.slice(0, 3);
-  } else {
-    room.demonBluffs = null;
-  }
+  // 恶魔 3 张不在场“伪装身份”：无论人数多少都生成，便于邪恶阵营可持续伪装与编故事。
+  // 约束：必须是不在场的善良角色（排除恶魔）。
+  const inGame = new Set(pool);
+  const goodChars = script.characters.filter((c) => c.alignment === 'good' && c.type !== 'demon');
+  const notInGame = goodChars.filter((c) => !inGame.has(c.id)).map((c) => c.id);
+  shuffle(notInGame);
+  room.demonBluffs = notInGame.slice(0, 3);
 }
 
 function shuffle<T>(a: T[]): void {
@@ -327,6 +353,8 @@ function pickTwo(arr: number[]): [number, number] {
 export function advanceNight(room: Room): boolean {
   // 若正在等待玩家夜晚行动输入，则不推进
   if (room.pendingNightAction) return false;
+  // 若正在等待“夜间信息确认”，则不推进
+  if (room.awaitingNightInfoConfirm) return false;
   const order = getCurrentNightOrder(room);
   if (room.nightStepIndex >= order.length) {
     // 夜序结束：改为等待全员确认天亮
@@ -441,8 +469,13 @@ export function submitNightAction(room: Room, actorSeatIndex: number, targets: n
 function gotoDay(room: Room): void {
   room.phase = 'day';
   room.dayNumber++;
-  // 按需求：白天不需要“进入提名阶段”按钮，天亮后直接开始提名流转
-  room.daySubPhase = 'nomination';
+  // 白天先进入讨论编排（上帝问答->私聊->公开发言），再进入提名投票。
+  room.daySubPhase = 'discussion';
+  room.dayFlowStage = 'god_dialogue';
+  const aliveSeats = room.players.filter((p) => p.isAlive).map((p) => p.seatIndex);
+  room.dayFlowStartSeat = aliveSeats.length > 0
+    ? aliveSeats[Math.floor(Math.random() * aliveSeats.length)]
+    : null;
   room.currentNomination = null;
   room.nominationsToday = new Map();
   room.skippedNominationsToday = new Set();
@@ -453,6 +486,9 @@ function gotoDay(room: Room): void {
   room.pendingExecutionTied = false;
   room.awaitingNightConfirm = false;
   room.nightConfirmations = new Set();
+  room.awaitingNightInfoConfirm = false;
+  room.pendingNightInfoConfirmSeats = new Set();
+  room.nightInfoConfirmations = new Set();
   /** 胜负仅在「进入白天」时结算，便于夜间链式规则（刀自己、后续角色等）自由组合 */
   const win = checkWin(room);
   if (win) {
@@ -476,6 +512,9 @@ function gotoNight(room: Room): void {
   room.poisonedSeatIndex = null;
   room.nightStepIndex = 0;
   room.pendingNightAction = null;
+  room.awaitingNightInfoConfirm = false;
+  room.pendingNightInfoConfirmSeats = new Set();
+  room.nightInfoConfirmations = new Set();
   room.protectedSeatIndex = null;
   room.lastNightDeaths = [];
   room.lastNightRevivals = [];

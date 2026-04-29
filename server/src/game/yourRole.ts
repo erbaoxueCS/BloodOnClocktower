@@ -7,6 +7,8 @@ export interface YourRolePayload {
   characterName: string;
   characterNameZh: string;
   ability: string;
+  alignment: 'good' | 'evil';
+  roleType: 'townsfolk' | 'outsider' | 'minion' | 'demon';
 }
 
 export function buildYourRolePayload(room: Room, seatIndex: number): YourRolePayload | null {
@@ -19,5 +21,7 @@ export function buildYourRolePayload(room: Room, seatIndex: number): YourRolePay
     characterName: c?.name ?? cid,
     characterNameZh: c?.nameZh ?? cid,
     ability: c?.ability ?? '',
+    alignment: (c?.alignment ?? 'good') as 'good' | 'evil',
+    roleType: (c?.type ?? 'townsfolk') as 'townsfolk' | 'outsider' | 'minion' | 'demon',
   };
 }

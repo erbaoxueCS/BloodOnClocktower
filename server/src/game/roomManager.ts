@@ -21,6 +21,8 @@ export function createRoom(scriptId: string): Room {
     phase: 'waiting',
     dayNumber: 0,
     daySubPhase: null,
+    dayFlowStage: null,
+    dayFlowStartSeat: null,
     currentNomination: null,
     nominationsToday: new Map(),
     skippedNominationsToday: new Set(),
@@ -51,8 +53,12 @@ export function createRoom(scriptId: string): Room {
     chatLog: [],
     awaitingNightConfirm: false,
     nightConfirmations: new Set(),
+    awaitingNightInfoConfirm: false,
+    pendingNightInfoConfirmSeats: new Set(),
+    nightInfoConfirmations: new Set(),
     aiPlayerEnabledBySeat: new Map(),
     aiPlayerLastActionAtBySeat: new Map(),
+    aiPlayerBehaviorStyleBySeat: new Map(),
     aiPlayerTemperatureBySeat: new Map(),
   };
   rooms.set(room.id, room);
@@ -112,6 +118,8 @@ export function getRoomView(room: Room, _forSeatIndex?: number, includeGlobalLog
     phase: room.phase,
     dayNumber: room.dayNumber,
     daySubPhase: room.daySubPhase,
+    dayFlowStage: room.dayFlowStage,
+    dayFlowStartSeat: room.dayFlowStartSeat,
     currentNomination: room.currentNomination,
     pendingExecution: room.pendingExecution,
     nominationsToday: Array.from(room.nominationsToday.entries()).map(([nominator, nominated]) => ({ nominator, nominated })),
@@ -123,9 +131,12 @@ export function getRoomView(room: Room, _forSeatIndex?: number, includeGlobalLog
     publicLog: room.publicLog,
     awaitingNightConfirm: room.awaitingNightConfirm,
     nightConfirmedSeats: Array.from(room.nightConfirmations.values()),
+    awaitingNightInfoConfirm: room.awaitingNightInfoConfirm,
+    pendingNightInfoConfirmSeats: Array.from(room.pendingNightInfoConfirmSeats.values()),
+    nightInfoConfirmedSeats: Array.from(room.nightInfoConfirmations.values()),
     chatLog,
     aiPlayerEnabled: forSeatIndex === undefined ? undefined : (room.aiPlayerEnabledBySeat.get(forSeatIndex) ?? false),
-    aiPlayerTemperature: forSeatIndex === undefined ? undefined : (room.aiPlayerTemperatureBySeat.get(forSeatIndex) ?? 0.5),
+    aiPlayerBehaviorStyle: forSeatIndex === undefined ? undefined : (room.aiPlayerBehaviorStyleBySeat.get(forSeatIndex) ?? undefined),
     globalLog: includeGlobalLog ? room.replayLog : undefined,
     aiStorytellerEnabled: room.aiStorytellerEnabled,
     minPlayers: room.script.minPlayers,
@@ -138,6 +149,8 @@ function resetRoomForNextGame(room: Room): void {
   room.phase = 'waiting';
   room.dayNumber = 0;
   room.daySubPhase = null;
+  room.dayFlowStage = null;
+  room.dayFlowStartSeat = null;
   room.currentNomination = null;
   room.nominationsToday = new Map();
   room.skippedNominationsToday = new Set();
@@ -164,8 +177,12 @@ function resetRoomForNextGame(room: Room): void {
   room.chatLog = [];
   room.awaitingNightConfirm = false;
   room.nightConfirmations = new Set();
+  room.awaitingNightInfoConfirm = false;
+  room.pendingNightInfoConfirmSeats = new Set();
+  room.nightInfoConfirmations = new Set();
   room.aiPlayerEnabledBySeat = new Map();
   room.aiPlayerLastActionAtBySeat = new Map();
+  room.aiPlayerBehaviorStyleBySeat = new Map();
   room.aiPlayerTemperatureBySeat = new Map();
   for (const p of room.players) {
     p.isReady = false;

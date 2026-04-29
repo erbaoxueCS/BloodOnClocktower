@@ -26,6 +26,10 @@ export function Lobby({ onEnterRoom, onEnterAdmin }: LobbyProps) {
   const [hostSecret, setHostSecret] = useState<string>('');
   const [error, setError] = useState('');
   const [copyTip, setCopyTip] = useState('');
+  const [quickTip, setQuickTip] = useState('');
+  const [quickJoinUrls, setQuickJoinUrls] = useState<string[]>([]);
+  const [quickAdminUrl, setQuickAdminUrl] = useState<string>('');
+  const [quickStarting, setQuickStarting] = useState(false);
 
   const copyRoomId = async () => {
     if (!roomId.trim()) return;
@@ -62,6 +66,66 @@ export function Lobby({ onEnterRoom, onEnterAdmin }: LobbyProps) {
     }
   };
 
+  const devQuickStart = async () => {
+    setError('');
+    setQuickTip('正在创建并开局（如无反应请看下方错误/链接）…');
+    setQuickJoinUrls([]);
+    setQuickAdminUrl('');
+    setQuickStarting(true);
+    const timeoutId = window.setTimeout(() => {
+      setQuickTip('请求超时：可能是后端未响应或代理失败（请看下方错误或手动打开链接）。');
+    }, 8000);
+    try {
+      const r = await fetch(`${API}/dev/quickstart`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerCount: 5, scriptId: 'trouble_brewing', start: true }),
+      });
+      if (!r.ok) {
+        const t = await r.text().catch(() => '');
+        setError(`快速开始失败：HTTP ${r.status} ${t.slice(0, 200)}`);
+        return;
+      }
+      const data = await r.json();
+      if (!data?.roomId) {
+        setError(data?.error || '快速开始失败');
+        return;
+      }
+      setRoomId(String(data.roomId));
+      if (typeof data.hostSecret === 'string') setHostSecret(data.hostSecret);
+
+      const joinUrls = Array.isArray(data.joinUrls) ? data.joinUrls.filter((x: unknown) => typeof x === 'string') as string[] : [];
+      const adminUrl = typeof data.adminUrl === 'string' ? data.adminUrl : '';
+      setQuickJoinUrls(joinUrls);
+      setQuickAdminUrl(adminUrl);
+
+      let opened = 0;
+      if (Array.isArray(data.joinUrls)) {
+        // 打开 5 个玩家页（浏览器可能拦截弹窗，可先允许本地站点弹窗）
+        for (const u of data.joinUrls) {
+          if (typeof u === 'string') {
+            const w = window.open(u, '_blank', 'noopener,noreferrer');
+            if (w) opened++;
+          }
+        }
+      }
+      if (typeof data.adminUrl === 'string') {
+        const w = window.open(data.adminUrl, '_blank', 'noopener,noreferrer');
+        if (w) opened++;
+      }
+      setQuickTip(opened > 0
+        ? '已创建并开局：已尝试打开玩家页与管理员页（若被拦截，请允许弹窗）'
+        : '已创建并开局，但浏览器可能拦截了弹窗：请允许弹窗，或使用下方链接手动打开。');
+      setTimeout(() => setQuickTip(''), 4000);
+    } catch (e) {
+      setError((e as Error).message);
+      setQuickTip('请求失败：请看下方错误信息。');
+    } finally {
+      window.clearTimeout(timeoutId);
+      setQuickStarting(false);
+    }
+  };
+
   const joinRoom = async () => {
     if (!roomId.trim() || !nickname.trim()) { setError('请输入房间号和昵称'); return; }
     setError('');
@@ -88,7 +152,7 @@ export function Lobby({ onEnterRoom, onEnterAdmin }: LobbyProps) {
     <div className="page">
       <header className="header">
         <div>
-          <h1 className="title">血染钟楼</h1>
+          <h1 className="title">Blood on the Clocktower</h1>
           <p className="subtitle">在线推理对局 · 支持玩家视角与管理员控制台</p>
         </div>
       </header>
@@ -109,7 +173,35 @@ export function Lobby({ onEnterRoom, onEnterAdmin }: LobbyProps) {
           <h3>快速开始</h3>
           <div className="row">
             <button className="btn-primary" type="button" onClick={createRoom}>创建房间</button>
+            <button type="button" onClick={devQuickStart} disabled={quickStarting}>
+              {quickStarting ? '快速开始中…' : '一键快速开始测试（5 人）'}
+            </button>
           </div>
+          {quickTip && <p className="muted" style={{ marginTop: 8 }}>{quickTip}</p>}
+          {(quickJoinUrls.length > 0 || quickAdminUrl) && (
+            <div style={{ marginTop: 10 }}>
+              <p className="muted" style={{ marginBottom: 6 }}>若弹窗被拦截，可手动打开：</p>
+              {quickAdminUrl && (
+                <p style={{ margin: '6px 0' }}>
+                  管理员页：<a href={quickAdminUrl} target="_blank" rel="noreferrer">打开</a>
+                </p>
+              )}
+              {quickJoinUrls.length > 0 && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  {quickJoinUrls.map((u, i) => (
+                    <a key={u} href={u} target="_blank" rel="noreferrer">打开玩家 {i + 1}</a>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+          <p className="muted" style={{ marginTop: 10 }}>
+            后端连通性自检：
+            {' '}
+            <a href="/api/scripts" target="_blank" rel="noreferrer">打开 /api/scripts</a>
+            {' '}
+            <span className="muted">（应返回脚本 JSON）</span>
+          </p>
           {roomId && (
             <p style={{ marginTop: 10 }}>
               房间号：<code className="mono">{roomId}</code>

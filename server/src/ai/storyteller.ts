@@ -2,17 +2,127 @@ import type { Room } from '../game/types.js';
 import type { StorytellerRequest, StorytellerDecision, ChoiceTwoPlayersOneCharacter } from './types.js';
 import { buildStorytellerRequest } from './adapter.js';
 import { randomStorytellerDecision } from '../game/gameEngine.js';
+import { acquireLlmSlot } from './llmLimiter.js';
 
 /** 供 AI 使用的请求上下文中需包含可选善良角色 id 列表 */
 export interface StorytellerContext extends StorytellerRequest {
   goodCharacterIds: string[];
 }
 
+export interface StorytellerDebugEvent {
+  kind: 'request' | 'response' | 'error';
+  stepId: string;
+  model: string;
+  systemPrompt?: string;
+  userPrompt?: string;
+  rawResponse?: string;
+  elapsedMs?: number;
+  error?: string;
+}
+
 const USE_AI = process.env.USE_AI_STORYTELLER === 'true' || process.env.USE_AI_STORYTELLER === '1';
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? '';
-const OPENAI_MODEL = process.env.OPENAI_MODEL ?? 'gpt-4o-mini';
+const OPENAI_MODEL = process.env.OPENAI_MODEL ?? 'qwen3.5-plus';
 // 不要带 /v1，否则会与默认 path /v1/chat/completions 拼成 /v1/v1/...
+// DashScope 实测：coding 网关对部分 key 生效；兼容模式域名在部分场景会 401
 const OPENAI_BASE_URL = (process.env.OPENAI_BASE_URL ?? 'https://coding.dashscope.aliyuncs.com').replace(/\/+$/, '');
+const AI_STORYTELLER_LLM_LOG = process.env.AI_STORYTELLER_LLM_LOG === 'true' || process.env.AI_STORYTELLER_LLM_LOG === '1';
+
+function fastResponseOptions() {
+  return {
+    // 关闭流式输出，减少首包等待和处理开销
+    stream: false,
+    // 对支持该参数的兼容模型，关闭“思考过程”以缩短响应时间
+    enable_thinking: false,
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status === 429 || status === 408 || status === 409 || status === 425 || (status >= 500 && status <= 599);
+}
+
+function computeBackoffMs(attemptIndex: number): number {
+  const base = 450;
+  const cap = 5000;
+  const exp = Math.min(cap, base * 2 ** Math.max(0, attemptIndex));
+  const jitter = Math.floor(Math.random() * 220);
+  return Math.min(cap, exp + jitter);
+}
+
+function formatNotOk(status: number, body: string, attempt: number, maxAttempts: number, queueWaitMs: number): string {
+  const b = String(body ?? '').replace(/\s+/g, ' ').trim();
+  const bodyPart = b ? ` body="${b.slice(0, 600)}"` : '';
+  return `http_${status}${bodyPart} attempt=${attempt}/${maxAttempts} queueWaitMs=${queueWaitMs}`;
+}
+
+function getApiKey(): string {
+  return (process.env.OPENAI_API_KEY ?? process.env.DASHSCOPE_API_KEY ?? '').trim();
+}
+
+export interface LlmKeyInfo {
+  present: boolean;
+  source: 'OPENAI_API_KEY' | 'DASHSCOPE_API_KEY' | 'none';
+  length: number;
+  last4: string;
+}
+
+export function getStorytellerLlmKeyInfo(): LlmKeyInfo {
+  const k1 = (process.env.OPENAI_API_KEY ?? '').trim();
+  const k2 = (process.env.DASHSCOPE_API_KEY ?? '').trim();
+  const key = k1 || k2 || '';
+  const source = k1 ? 'OPENAI_API_KEY' : k2 ? 'DASHSCOPE_API_KEY' : 'none';
+  return {
+    present: !!key,
+    source,
+    length: key.length,
+    last4: key.length >= 4 ? key.slice(-4) : '',
+  };
+}
+
+export async function storytellerLlmSelfTest(params?: {
+  prompt?: string;
+  timeoutMs?: number;
+}): Promise<{ ok: boolean; ms: number; baseUrl: string; model: string; key: LlmKeyInfo; raw?: unknown; error?: string }> {
+  const startedAt = Date.now();
+  const key = getStorytellerLlmKeyInfo();
+  if (!key.present) return { ok: false, ms: Date.now() - startedAt, baseUrl: OPENAI_BASE_URL, model: OPENAI_MODEL, key, error: 'missing_api_key' };
+  const apiKey = (process.env.OPENAI_API_KEY ?? process.env.DASHSCOPE_API_KEY ?? '').trim();
+  const prompt = (params?.prompt ?? '请只输出 JSON：{"ok":true,"who":"storyteller"}').slice(0, 500);
+  const timeoutMs = Math.max(1000, Math.min(30_000, params?.timeoutMs ?? 12_000));
+
+  try {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), timeoutMs);
+    const res = await fetch(`${OPENAI_BASE_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        messages: [
+          { role: 'system', content: '你是测试助手。只输出合法 JSON，不要解释。' },
+          { role: 'user', content: prompt },
+        ],
+        response_format: { type: 'json_object' },
+        temperature: 0,
+        ...fastResponseOptions(),
+      }),
+      signal: ac.signal,
+    });
+    clearTimeout(t);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      return { ok: false, ms: Date.now() - startedAt, baseUrl: OPENAI_BASE_URL, model: OPENAI_MODEL, key, error: `${res.status} ${body}` };
+    }
+    const data = (await res.json()) as unknown;
+    return { ok: true, ms: Date.now() - startedAt, baseUrl: OPENAI_BASE_URL, model: OPENAI_MODEL, key, raw: data };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { ok: false, ms: Date.now() - startedAt, baseUrl: OPENAI_BASE_URL, model: OPENAI_MODEL, key, error: msg };
+  }
+}
 
 /**
  * 校验决策：玩家座位合法、角色在剧本中
@@ -48,24 +158,52 @@ export function validateDecision(room: Room, stepId: string, decision: unknown):
  * 将引擎使用的 decision 格式转为 storytellerDecisions 写入格式
  */
 export function toEngineDecision(room: Room, stepId: string, validated: StorytellerDecision): unknown {
-  if (validated.type === 'imp_kill') return validated.targetSeatIndex;
-  return { type: validated.type, players: validated.players, characterId: validated.characterId };
+  void room;
+  void stepId;
+  switch (validated.type) {
+    case 'imp_kill':
+      return validated.targetSeatIndex;
+    case 'librarian_result':
+      if ('noOutsider' in validated && validated.noOutsider) {
+        return { type: 'librarian_result', noOutsider: true };
+      }
+      if ('players' in validated && 'characterId' in validated) {
+        return { type: validated.type, players: validated.players, characterId: validated.characterId };
+      }
+      return { type: 'librarian_result', noOutsider: true };
+    case 'washerwoman_result':
+    case 'investigator_result':
+      return { type: validated.type, players: validated.players, characterId: validated.characterId };
+    default: {
+      const _exhaustive: never = validated;
+      return _exhaustive;
+    }
+  }
 }
 
 /**
  * 调用 AI 获取说书人决策；失败或未配置时回退到随机
  */
-export async function getStorytellerDecision(room: Room, stepId: string, stepNameZh: string, forceAi = false): Promise<unknown> {
+export async function getStorytellerDecision(
+  room: Room,
+  stepId: string,
+  stepNameZh: string,
+  forceAi = false,
+  onDebug?: (event: StorytellerDebugEvent) => void,
+): Promise<unknown> {
   const req = buildStorytellerRequest(room, stepId, stepNameZh);
   const goodCharacterIds = room.script.characters.filter((c) => c.alignment === 'good').map((c) => c.id);
   const ctx: StorytellerContext = { ...req, goodCharacterIds };
   let raw: unknown = null;
 
-  if ((USE_AI || forceAi) && OPENAI_API_KEY) {
+  const apiKey = getApiKey();
+  if ((USE_AI || forceAi) && apiKey) {
     try {
-      raw = await callOpenAI(ctx, stepId);
+      raw = await callOpenAI(ctx, stepId, apiKey, onDebug);
     } catch (e) {
-      console.warn('AI storyteller request failed, using random:', (e as Error).message);
+      const message = e instanceof Error ? e.message : String(e);
+      onDebug?.({ kind: 'error', stepId, model: OPENAI_MODEL, error: message });
+      console.warn('AI storyteller request failed, using random:', message);
     }
   }
 
@@ -89,7 +227,12 @@ function getStepNameZh(stepId: string): string {
 /**
  * 调用 OpenAI Chat Completions（JSON mode）
  */
-async function callOpenAI(req: StorytellerContext, stepId: string): Promise<unknown> {
+async function callOpenAI(
+  req: StorytellerContext,
+  stepId: string,
+  apiKey: string,
+  onDebug?: (event: StorytellerDebugEvent) => void,
+): Promise<unknown> {
   const isTwoPlayersOneChar = ['washerwoman', 'librarian', 'investigator'].includes(stepId);
   const schema = isTwoPlayersOneChar
     ? { type: 'object', properties: { players: { type: 'array', items: { type: 'integer' }, minItems: 2, maxItems: 2 }, characterId: { type: 'string' } }, required: ['players', 'characterId'] }
@@ -102,26 +245,196 @@ async function callOpenAI(req: StorytellerContext, stepId: string): Promise<unkn
   const userPrompt = isTwoPlayersOneChar
     ? `剧本：${req.scriptNameZh}。当前为第${req.dayNumber}天夜晚，步骤：${getStepNameZh(stepId)}。需要选择两名存活玩家（座位号）和其中一个善良方角色 identity（characterId）。存活座位号：${req.aliveSeatIndices.join(',')}。${goodIdList}${poisonHint}回复格式：{"players":[座位1,座位2],"characterId":"角色id"}`
     : `剧本：${req.scriptNameZh}。恶魔选择一名存活玩家杀害（可选择自己自杀以传位爪牙）。存活座位号：${req.aliveSeatIndices.join(',')}。${poisonHint}回复格式：{"targetSeatIndex":座位号}`;
-
-  const res = await fetch(`${OPENAI_BASE_URL}/v1/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
-      response_format: { type: 'json_object' },
-      temperature: 0.7,
-    }),
+  onDebug?.({
+    kind: 'request',
+    stepId,
+    model: OPENAI_MODEL,
+    systemPrompt,
+    userPrompt,
   });
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`${res.status} ${t}`);
+
+  const timeoutMs = Number(process.env.AI_STORYTELLER_TIMEOUT_MS ?? '') || 180_000;
+  const startedAt = Date.now();
+  if (AI_STORYTELLER_LLM_LOG) {
+    const keyLast4 = apiKey.length >= 4 ? apiKey.slice(-4) : '';
+    console.log('[ai_storyteller] llm input', {
+      stepId,
+      dayNumber: req.dayNumber,
+      baseUrl: OPENAI_BASE_URL,
+      model: OPENAI_MODEL,
+      timeoutMs,
+      keyLast4,
+      aliveCount: req.aliveSeatIndices.length,
+      poisonedSeatIndex: req.poisonedSeatIndex ?? null,
+    });
+    console.log('[ai_storyteller] llm input_prompt', userPrompt.slice(0, 2400));
   }
-  const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+  const maxAttempts = Math.max(1, Math.min(4, Number(process.env.AI_LLM_MAX_RETRIES ?? '') || 3));
+  let lastErr: { status: number; body: string; attempt: number; queueWaitMs: number } | null = null;
+  let data: { choices?: Array<{ message?: { content?: string } }> } | null = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const slot = await acquireLlmSlot();
+    const queueWaitMs = slot.waitMs;
+    const ac2 = new AbortController();
+    const t2 = setTimeout(() => ac2.abort(), timeoutMs);
+    try {
+      const res = await fetch(`${OPENAI_BASE_URL}/v1/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: OPENAI_MODEL,
+          messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
+          response_format: { type: 'json_object' },
+          temperature: 0.3,
+          ...fastResponseOptions(),
+        }),
+        signal: ac2.signal,
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        lastErr = { status: res.status, body, attempt, queueWaitMs };
+        if (AI_STORYTELLER_LLM_LOG) {
+          console.log('[ai_storyteller] llm not ok', { stepId, status: res.status, attempt: `${attempt}/${maxAttempts}`, queueWaitMs, ms: Date.now() - startedAt, body: body.slice(0, 600) });
+        }
+        if (attempt < maxAttempts && isRetryableStatus(res.status)) {
+          await sleep(computeBackoffMs(attempt - 1));
+          continue;
+        }
+        throw new Error(formatNotOk(res.status, body, attempt, maxAttempts, queueWaitMs));
+      }
+      data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+      break;
+    } finally {
+      clearTimeout(t2);
+      slot.release();
+    }
+  }
+
+  if (!data) {
+    const msg = lastErr
+      ? formatNotOk(lastErr.status, lastErr.body, lastErr.attempt, maxAttempts, lastErr.queueWaitMs)
+      : `llm_no_response attempt=0/${maxAttempts}`;
+    throw new Error(msg);
+  }
+
   const content = data.choices?.[0]?.message?.content;
   if (!content) throw new Error('Empty AI response');
+  onDebug?.({
+    kind: 'response',
+    stepId,
+    model: OPENAI_MODEL,
+    rawResponse: content,
+    elapsedMs: Date.now() - startedAt,
+  });
+  if (AI_STORYTELLER_LLM_LOG) {
+    console.log('[ai_storyteller] llm output', { stepId, ms: Date.now() - startedAt, content: content.slice(0, 2400) });
+  }
   return JSON.parse(content) as unknown;
+}
+
+export async function answerPostGameQuestion(
+  room: Room,
+  askerSeatIndex: number,
+  question: string,
+): Promise<string> {
+  const q = String(question ?? '').trim();
+  if (!q) return '上帝：你的问题是空的，请具体一点。';
+
+  const asker = room.players[askerSeatIndex];
+  if (!asker) return '上帝：提问玩家不存在。';
+
+  const apiKey = getApiKey();
+  if (!apiKey) return '上帝：当前未配置大模型密钥，无法生成复盘解释。';
+
+  const systemPrompt = [
+    '你是血染钟楼对局结束后的上帝复盘助手。',
+    '请基于真实对局记录回答玩家问题，解释关键决策和信息流。',
+    '不要编造不存在的事件；如果记录不足就明确说明不确定。',
+    '回答风格清晰、简洁，输出纯文本，不要 markdown。',
+  ].join('\n');
+
+  const userPrompt = JSON.stringify({
+    question: q,
+    askerSeatIndex,
+    scriptNameZh: room.script.nameZh,
+    finalState: {
+      status: room.status,
+      phase: room.phase,
+      dayNumber: room.dayNumber,
+    },
+    players: room.players.map((p) => ({
+      seatIndex: p.seatIndex,
+      nickname: p.nickname,
+      isAlive: p.isAlive,
+      characterId: p.characterId ?? null,
+    })),
+    chatTail: room.chatLog.slice(-300),
+  });
+
+  const timeoutMs = Number(process.env.AI_STORYTELLER_TIMEOUT_MS ?? '') || 180_000;
+  try {
+    const maxAttempts = Math.max(1, Math.min(3, Number(process.env.AI_LLM_MAX_RETRIES ?? '') || 2));
+    let lastNotOk: { status: number; body: string; attempt: number; queueWaitMs: number } | null = null;
+    let data: { choices?: Array<{ message?: { content?: string } }> } | null = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const slot = await acquireLlmSlot();
+      const queueWaitMs = slot.waitMs;
+      const ac2 = new AbortController();
+      const t2 = setTimeout(() => ac2.abort(), timeoutMs);
+      try {
+        const res = await fetch(`${OPENAI_BASE_URL}/v1/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            model: OPENAI_MODEL,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userPrompt },
+            ],
+            temperature: 0.3,
+            ...fastResponseOptions(),
+          }),
+          signal: ac2.signal,
+        });
+
+        if (!res.ok) {
+          const body = await res.text().catch(() => '');
+          lastNotOk = { status: res.status, body, attempt, queueWaitMs };
+          if (attempt < maxAttempts && isRetryableStatus(res.status)) {
+            await sleep(computeBackoffMs(attempt - 1));
+            continue;
+          }
+          return `上帝：复盘回答失败（${res.status}）。${body.slice(0, 120)}`;
+        }
+
+        data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+        break;
+      } finally {
+        clearTimeout(t2);
+        slot.release();
+      }
+    }
+
+    if (!data) {
+      const msg = lastNotOk
+        ? formatNotOk(lastNotOk.status, lastNotOk.body, lastNotOk.attempt, maxAttempts, lastNotOk.queueWaitMs)
+        : `llm_no_response attempt=0/${maxAttempts}`;
+      return `上帝：复盘回答失败（${msg}）。`;
+    }
+
+    const content = data.choices?.[0]?.message?.content?.trim();
+    if (!content) return '上帝：我这次没能组织出有效复盘答案。';
+    return content.slice(0, 3000);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return `上帝：复盘回答异常（${msg}）。`;
+  }
 }

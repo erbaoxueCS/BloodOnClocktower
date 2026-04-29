@@ -37,6 +37,9 @@ export type GamePhase =
 
 /** 白天子阶段 */
 export type DaySubPhase = 'discussion' | 'nomination' | 'voting' | 'execution';
+export type DayFlowStage = 'god_dialogue' | 'private_dialogue' | 'public_speech' | 'nomination_vote';
+
+export type AiBehaviorStyle = 'analytical' | 'skeptical' | 'cautious' | 'empathetic' | 'deceptive' | 'chaotic';
 
 /** 玩家座位信息（公开） */
 export interface PlayerSeat {
@@ -96,6 +99,10 @@ export interface Room {
   phase: GamePhase;
   dayNumber: number;
   daySubPhase: DaySubPhase | null;
+  /** 白天固定流程阶段（导演编排） */
+  dayFlowStage: DayFlowStage | null;
+  /** 当前白天阶段的随机起始座位 */
+  dayFlowStartSeat: number | null;
   /** 当前提名：提名者 seatIndex，被提名者 seatIndex */
   currentNomination: { nominator: number; nominated: number } | null;
   /** 今日已提名记录：nominator -> nominated */
@@ -160,12 +167,20 @@ export interface Room {
   awaitingNightConfirm: boolean;
   /** 已确认“夜晚结束”的座位集合 */
   nightConfirmations: Set<number>;
+  /** 夜间信息是否在等待确认（信息位确认后才继续推进夜序） */
+  awaitingNightInfoConfirm: boolean;
+  /** 本轮夜间信息需要确认的座位 */
+  pendingNightInfoConfirmSeats: Set<number>;
+  /** 本轮夜间信息已确认的座位 */
+  nightInfoConfirmations: Set<number>;
 
   /** AI 玩家托管开关：seatIndex -> enabled */
   aiPlayerEnabledBySeat: Map<number, boolean>;
   /** AI 玩家最近一次动作时间（节流）：seatIndex -> at(ms) */
   aiPlayerLastActionAtBySeat: Map<number, number>;
-  /** AI 玩家积极程度/温度（0~1）：seatIndex -> temperature */
+  /** AI 玩家行为方式：seatIndex -> style（每局随机分配，可影响话术与策略倾向） */
+  aiPlayerBehaviorStyleBySeat: Map<number, AiBehaviorStyle>;
+  /** AI 玩家内部温度（0~1）：seatIndex -> temperature（由 behaviorStyle 映射，仅内部使用） */
   aiPlayerTemperatureBySeat: Map<number, number>;
 }
 
@@ -180,6 +195,8 @@ export interface RoomView {
   phase: GamePhase;
   dayNumber: number;
   daySubPhase: DaySubPhase | null;
+  dayFlowStage?: DayFlowStage | null;
+  dayFlowStartSeat?: number | null;
   currentNomination: Room['currentNomination'];
   pendingExecution: number | null;
   /** 今日提名记录（用于前端展示/判断） */
@@ -196,12 +213,18 @@ export interface RoomView {
   awaitingNightConfirm?: boolean;
   /** 已确认夜晚结束的座位 */
   nightConfirmedSeats?: number[];
+  /** 夜间信息是否正在等待确认 */
+  awaitingNightInfoConfirm?: boolean;
+  /** 需要确认夜间信息的座位 */
+  pendingNightInfoConfirmSeats?: number[];
+  /** 已确认夜间信息的座位 */
+  nightInfoConfirmedSeats?: number[];
   /** 当前玩家可见的聊天记录（管理员可见全量） */
   chatLog?: ChatEntry[];
   /** 当前座位是否开启 AI 托管（仅对本人显示） */
   aiPlayerEnabled?: boolean;
-  /** 当前座位 AI 积极程度/温度（仅对本人显示） */
-  aiPlayerTemperature?: number;
+  /** 当前座位 AI 行为方式（仅对本人显示） */
+  aiPlayerBehaviorStyle?: AiBehaviorStyle;
   /** 仅管理员可见：全局记录（含私密与裁定信息） */
   globalLog?: ReplayLogEntry[];
   /** 是否开启 AI 说书人接管 */
