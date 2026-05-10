@@ -1,102 +1,110 @@
 import { v4 as uuidv4 } from 'uuid';
-import type { ChatEntry, Room, PlayerSeat, RoomView } from './types.js';
-import { troubleBrewing } from '../script/troubleBrewing.js';
+import type { Room, GameState, PlayerState, RoomView, PublicPlayerView, ChatEntry, AiBehaviorStyle } from '../engine/types.js';
+import { troubleBrewing } from '../scripts/troubleBrewing.js';
+import type { ScriptDef } from '../engine/types.js';
 
-const rooms = new Map<string, Room>();
+export const rooms = new Map<string, Room>();
 
-function getScript(scriptId: string) {
-  if (scriptId === troubleBrewing.id) return troubleBrewing;
+function getScript(scriptId: string): ScriptDef {
   return troubleBrewing;
 }
 
-/** 创建房间 */
+function makeEmptyGame(script: ScriptDef, players: PlayerState[]): GameState {
+  return {
+    scriptId: script.id, script, players,
+    phase: 'waiting', dayNumber: 0, daySubPhase: null,
+    dayFlowStage: null, dayFlowStartSeat: null,
+    nightStepIndex: 0, pendingNightAction: null,
+    protectedSeatIndex: null, poisonedSeatIndex: null,
+    lastNightDeaths: [], lastNightRevivals: [],
+    nightKillAttackerByVictim: new Map(),
+    currentNomination: null,
+    nominationsToday: new Map(), skippedNominationsToday: new Set(), nominatedToday: new Set(),
+    votes: new Map(), pendingExecution: null, pendingExecutionVotesFor: 0, pendingExecutionTied: false,
+    lastExecutedSeatIndex: null, lastExecutedCharacterId: null,
+    awaitingNightConfirm: false, nightConfirmations: new Set(),
+    awaitingNightInfoConfirm: false, pendingNightInfoConfirmSeats: new Set(), nightInfoConfirmations: new Set(),
+    usedDayActionsBySeat: new Map(), demonBluffs: [],
+    storytellerDecisions: new Map(),
+    chatLog: [], publicLog: [], replayLog: [],
+  };
+}
+
 export function createRoom(scriptId: string): Room {
   const script = getScript(scriptId);
+  const game = makeEmptyGame(script, []);
   const room: Room = {
-    id: uuidv4(),
-    scriptId,
-    script,
-    players: [],
-    status: 'lobby',
-    phase: 'waiting',
-    dayNumber: 0,
-    daySubPhase: null,
-    dayFlowStage: null,
-    dayFlowStartSeat: null,
-    currentNomination: null,
-    nominationsToday: new Map(),
-    skippedNominationsToday: new Set(),
-    nominatedToday: new Set(),
-    votes: new Map(),
-    pendingExecution: null,
-    pendingExecutionVotesFor: 0,
-    pendingExecutionTied: false,
-    nightStepIndex: 0,
-    pendingNightAction: null,
-    protectedSeatIndex: null,
-    poisonedSeatIndex: null,
-    lastExecutedSeatIndex: null,
-    lastExecutedCharacterId: null,
-    lastNightDeaths: [],
-    lastNightRevivals: [],
-    demonBluffs: null,
-    storytellerDecisions: new Map(),
+    id: uuidv4().slice(0, 6).toUpperCase(),
+    hostSecret: uuidv4().slice(0, 8),
     connections: new Map(),
-    createdAt: Date.now(),
-    replayLog: [],
-    publicLog: [],
-    hostSecret: uuidv4(),
-    usedDayActionsBySeat: new Map(),
-    nightKillAttackerByVictim: new Map(),
+    game,
+    status: 'lobby',
     aiStorytellerEnabled: false,
-    aiLastActionAt: 0,
-    chatLog: [],
-    awaitingNightConfirm: false,
-    nightConfirmations: new Set(),
     aiPlayerEnabledBySeat: new Map(),
-    aiPlayerLastActionAtBySeat: new Map(),
-    aiPlayerTemperatureBySeat: new Map(),
+    aiPlayerBehaviorStyleBySeat: new Map(),
+    createdAt: Date.now(),
   };
   rooms.set(room.id, room);
   return room;
 }
 
-/** 加入房间 */
 export function joinRoom(roomId: string, nickname: string): { room: Room; seatIndex: number } | null {
   const room = rooms.get(roomId);
   if (!room || room.status !== 'lobby') return null;
-  if (room.players.length >= room.script.maxPlayers) return null;
-  const seatIndex = room.players.length;
-  const player: PlayerSeat = {
-    id: uuidv4(),
-    seatIndex,
-    nickname,
-    isReady: false,
-    isAlive: true,
-    hasDeadVote: true,
-    drunkPretendCharacterId: null,
-    usedDayActions: [],
+  if (room.game.players.length >= room.game.script.maxPlayers) return null;
+  const seatIndex = room.game.players.length;
+  const player: PlayerState = {
+    id: uuidv4(), seatIndex, nickname,
+    isReady: false, isAlive: true, hasGhostVote: true, usedDayActions: [],
   };
-  room.players.push(player);
+  room.game.players.push(player);
   return { room, seatIndex };
 }
 
-/** 获取房间 */
 export function getRoom(roomId: string): Room | null {
   return rooms.get(roomId) ?? null;
 }
 
-/** 获取房间视图（脱敏，供前端） */
-export function getRoomView(room: Room, _forSeatIndex?: number, includeGlobalLog = false): RoomView {
-  const players = room.players.map((p) => {
-    const { characterId, drunkPretendCharacterId, usedDayActions, ...rest } = p;
-    return rest;
-  });
-  const forSeatIndex = typeof _forSeatIndex === 'number' ? _forSeatIndex : undefined;
+export function setReady(room: Room, seatIndex: number, ready: boolean): boolean {
+  const p = room.game.players[seatIndex];
+  if (!p) return false;
+  if (room.status === 'ended') resetRoom(room);
+  p.isReady = ready;
+  return true;
+}
+
+function resetRoom(room: Room): void {
+  const script = room.game.script;
+  const players = room.game.players.map(p => ({
+    id: p.id, seatIndex: p.seatIndex, nickname: p.nickname,
+    isReady: false, isAlive: true, hasGhostVote: true, usedDayActions: [],
+  }));
+  room.game = makeEmptyGame(script, players);
+  room.status = 'lobby';
+  room.aiStorytellerEnabled = false;
+  room.aiPlayerEnabledBySeat = new Map();
+  room.aiPlayerBehaviorStyleBySeat = new Map();
+}
+
+export function bindConnection(room: Room, connectionId: string, seatIndex: number): void {
+  room.connections.set(connectionId, seatIndex);
+}
+
+export function unbindConnection(room: Room, connectionId: string): void {
+  room.connections.delete(connectionId);
+}
+
+export function getRoomView(room: Room, forSeatIndex?: number, includeGlobalLog?: boolean): RoomView {
+  const game = room.game;
+  const players: PublicPlayerView[] = game.players.map(p => ({
+    id: p.id, seatIndex: p.seatIndex, nickname: p.nickname,
+    isReady: p.isReady, isAlive: p.isAlive, hasGhostVote: p.hasGhostVote,
+  }));
+
   const chatLog: ChatEntry[] | undefined = (() => {
-    if (includeGlobalLog) return room.chatLog;
+    if (includeGlobalLog) return game.chatLog;
     if (forSeatIndex === undefined) return undefined;
-    return room.chatLog.filter((e) => {
+    return game.chatLog.filter(e => {
       if (e.scope === 'public') return true;
       if (e.scope === 'god') return e.fromSeat === forSeatIndex;
       if (e.scope === 'dm') return e.fromSeat === forSeatIndex || e.toSeat === forSeatIndex;
@@ -105,102 +113,29 @@ export function getRoomView(room: Room, _forSeatIndex?: number, includeGlobalLog
   })();
 
   return {
-    id: room.id,
-    scriptId: room.scriptId,
-    scriptName: room.script.name,
-    scriptNameZh: room.script.nameZh,
-    players,
-    status: room.status,
-    phase: room.phase,
-    dayNumber: room.dayNumber,
-    daySubPhase: room.daySubPhase,
-    dayFlowStage: room.dayFlowStage,
-    dayFlowStartSeat: room.dayFlowStartSeat,
-    currentNomination: room.currentNomination,
-    pendingExecution: room.pendingExecution,
-    nominationsToday: Array.from(room.nominationsToday.entries()).map(([nominator, nominated]) => ({ nominator, nominated })),
-    skippedNominationsToday: Array.from(room.skippedNominationsToday.values()),
-    pendingExecutionVotesFor: room.pendingExecutionVotesFor,
-    pendingExecutionTied: room.pendingExecutionTied,
-    lastNightDeaths: room.lastNightDeaths,
-    lastNightRevivals: room.lastNightRevivals,
-    publicLog: room.publicLog,
-    awaitingNightConfirm: room.awaitingNightConfirm,
-    nightConfirmedSeats: Array.from(room.nightConfirmations.values()),
+    id: room.id, scriptId: game.scriptId,
+    scriptName: game.script.name, scriptNameZh: game.script.nameZh,
+    players, status: room.status, phase: game.phase,
+    dayNumber: game.dayNumber, daySubPhase: game.daySubPhase,
+    dayFlowStage: game.dayFlowStage, dayFlowStartSeat: game.dayFlowStartSeat,
+    currentNomination: game.currentNomination,
+    pendingExecution: game.pendingExecution,
+    pendingExecutionVotesFor: game.pendingExecutionVotesFor,
+    pendingExecutionTied: game.pendingExecutionTied,
+    nominationsToday: Array.from(game.nominationsToday.entries()).map(([n, d]) => ({ nominator: n, nominated: d })),
+    skippedNominationsToday: Array.from(game.skippedNominationsToday),
+    lastNightDeaths: game.lastNightDeaths, lastNightRevivals: game.lastNightRevivals,
+    publicLog: game.publicLog,
+    awaitingNightConfirm: game.awaitingNightConfirm,
+    nightConfirmedSeats: Array.from(game.nightConfirmations),
+    awaitingNightInfoConfirm: game.awaitingNightInfoConfirm,
+    pendingNightInfoConfirmSeats: Array.from(game.pendingNightInfoConfirmSeats),
+    nightInfoConfirmedSeats: Array.from(game.nightInfoConfirmations),
     chatLog,
-    aiPlayerEnabled: forSeatIndex === undefined ? undefined : (room.aiPlayerEnabledBySeat.get(forSeatIndex) ?? false),
-    aiPlayerTemperature: forSeatIndex === undefined ? undefined : (room.aiPlayerTemperatureBySeat.get(forSeatIndex) ?? 0.5),
-    globalLog: includeGlobalLog ? room.replayLog : undefined,
+    aiPlayerEnabled: forSeatIndex !== undefined ? (room.aiPlayerEnabledBySeat.get(forSeatIndex) ?? false) : undefined,
+    aiPlayerBehaviorStyle: forSeatIndex !== undefined ? (room.aiPlayerBehaviorStyleBySeat.get(forSeatIndex) ?? undefined) : undefined,
     aiStorytellerEnabled: room.aiStorytellerEnabled,
-    minPlayers: room.script.minPlayers,
-    maxPlayers: room.script.maxPlayers,
+    globalLog: includeGlobalLog ? game.replayLog : undefined,
+    minPlayers: game.script.minPlayers, maxPlayers: game.script.maxPlayers,
   };
 }
-
-function resetRoomForNextGame(room: Room): void {
-  room.status = 'lobby';
-  room.phase = 'waiting';
-  room.dayNumber = 0;
-  room.daySubPhase = null;
-  room.dayFlowStage = null;
-  room.dayFlowStartSeat = null;
-  room.currentNomination = null;
-  room.nominationsToday = new Map();
-  room.skippedNominationsToday = new Set();
-  room.nominatedToday = new Set();
-  room.votes = new Map();
-  room.pendingExecution = null;
-  room.pendingExecutionVotesFor = 0;
-  room.pendingExecutionTied = false;
-  room.nightStepIndex = 0;
-  room.pendingNightAction = null;
-  room.protectedSeatIndex = null;
-  room.poisonedSeatIndex = null;
-  room.lastExecutedSeatIndex = null;
-  room.lastExecutedCharacterId = null;
-  room.lastNightDeaths = [];
-  room.lastNightRevivals = [];
-  room.demonBluffs = null;
-  room.storytellerDecisions = new Map();
-  room.replayLog = [];
-  room.publicLog = [];
-  room.usedDayActionsBySeat = new Map();
-  room.nightKillAttackerByVictim = new Map();
-  room.aiLastActionAt = 0;
-  room.chatLog = [];
-  room.awaitingNightConfirm = false;
-  room.nightConfirmations = new Set();
-  room.aiPlayerEnabledBySeat = new Map();
-  room.aiPlayerLastActionAtBySeat = new Map();
-  room.aiPlayerTemperatureBySeat = new Map();
-  for (const p of room.players) {
-    p.isReady = false;
-    p.isAlive = true;
-    p.hasDeadVote = true;
-    p.characterId = undefined;
-    p.drunkPretendCharacterId = null;
-    p.usedDayActions = [];
-  }
-}
-
-/** 准备/取消准备 */
-export function setReady(room: Room, seatIndex: number, ready: boolean): boolean {
-  const p = room.players[seatIndex];
-  if (!p) return false;
-  // 对局结束后，首次准备会把房间重置回大厅，支持原房间直接开下一局
-  if (room.status === 'ended') resetRoomForNextGame(room);
-  p.isReady = ready;
-  return true;
-}
-
-/** 绑定连接与座位 */
-export function bindConnection(room: Room, connectionId: string, seatIndex: number): void {
-  room.connections.set(connectionId, seatIndex);
-}
-
-/** 解绑连接 */
-export function unbindConnection(room: Room, connectionId: string): void {
-  room.connections.delete(connectionId);
-}
-
-export { rooms };
