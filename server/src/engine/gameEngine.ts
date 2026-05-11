@@ -46,8 +46,8 @@ function getDistribution(playerCount: number): RoleDistribution {
 }
 
 /** 男爵强制 +2 外来者 */
-function applyBaronModifier(dist: RoleDistribution, inPlayCharacterIds: string[]): RoleDistribution {
-  if (!inPlayCharacterIds.includes('baron')) return dist;
+function applyBaronModifier(dist: RoleDistribution, hasBaron: boolean): RoleDistribution {
+  if (!hasBaron) return dist;
   return {
     ...dist,
     outsiders: Math.min(dist.outsiders + 2, dist.townsfolk + dist.outsiders - 1),
@@ -59,19 +59,29 @@ function applyBaronModifier(dist: RoleDistribution, inPlayCharacterIds: string[]
 export function assignCharacters(game: GameState): void {
   const script = game.script;
   const dist = getDistribution(game.players.length);
-  const modDist = applyBaronModifier(dist, []);  // 男爵在角色池阶段处理
 
   const townsfolkPool = script.characters.filter(c => c.type === 'townsfolk');
   const outsiderPool = script.characters.filter(c => c.type === 'outsider');
   const minionPool = script.characters.filter(c => c.type === 'minion');
   const demonPool = script.characters.filter(c => c.type === 'demon');
 
-  // 构建角色池
+  // 先以基础配比构建角色池，检查是否有男爵
+  const basePool: string[] = [];
+  for (let i = 0; i < dist.townsfolk; i++) basePool.push(townsfolkPool[i % townsfolkPool.length].id);
+  for (let i = 0; i < dist.outsiders; i++) basePool.push(outsiderPool[i % outsiderPool.length].id);
+  for (let i = 0; i < dist.minions; i++) basePool.push(minionPool[i % minionPool.length].id);
+  for (let i = 0; i < dist.demons; i++) basePool.push(demonPool[i % demonPool.length].id);
+
+  // 检查男爵是否在池中，应用配比修正
+  const hasBaron = basePool.includes('baron');
+  const modDist = applyBaronModifier(dist, hasBaron);
+
+  // 按修正后配比重建角色池
   const pool: string[] = [];
   for (let i = 0; i < modDist.townsfolk; i++) pool.push(townsfolkPool[i % townsfolkPool.length].id);
   for (let i = 0; i < modDist.outsiders; i++) pool.push(outsiderPool[i % outsiderPool.length].id);
   for (let i = 0; i < modDist.minions; i++) pool.push(minionPool[i % minionPool.length].id);
-  for (let i = 0; i < modDist.demons; i++) pool.push(demonPool[i % demonPool.length].id);
+  for (let i = 0; i < dist.demons; i++) pool.push(demonPool[i % demonPool.length].id);
 
   const shuffled = shuffle(pool);
 
@@ -316,8 +326,6 @@ function promoteMinionToDemon(game: GameState): void {
 
 /** 猩红女巫：恶魔死后自动继位 */
 export function checkScarletWoman(game: GameState): boolean {
-  const aliveCount = game.players.filter(p => p.isAlive).length;
-  if (aliveCount < 5) return false;
   const demonAlive = game.players.some(p => p.isAlive && p.characterId === 'imp');
   if (demonAlive) return false;
   const sw = game.players.find(p =>
@@ -539,6 +547,7 @@ export function executePending(game: GameState): number | null {
   p.hasGhostVote = true;
   game.lastExecutedSeatIndex = seat;
   game.lastExecutedCharacterId = p.characterId ?? null;
+  game.storytellerDecisions.set('last_execution_day', game.dayNumber);
   game.pendingExecution = null;
   game.pendingExecutionVotesFor = 0;
   game.pendingExecutionTied = false;
@@ -577,17 +586,21 @@ export function checkWin(game: GameState): WinResult {
       p.characterId === 'scarlet_woman' &&
       !isPoisonedOrDrunk(game, p.seatIndex)
     );
-    if (swAlive && alive.length >= 5) return null;  // 女巫即将继位
-    if (!swAlive) return 'good';  // 恶魔死亡且无继位 → 善良获胜
+    // 女巫即将继位（或已继位但 checkWin 在 checkScarletWoman 前调用）
+    if (swAlive) return null;
+    return 'good';  // 恶魔死亡且无继位 → 善良获胜
   }
 
   // 市长胜利条件：仅3人存活且今日无人被处决
-  if (alive.length === 3 && game.pendingExecution == null && game.pendingExecutionTied) {
-    const mayorAlive = alive.some(p =>
-      getEffectiveCharacterId(p) === 'mayor' &&
-      !isPoisonedOrDrunk(game, p.seatIndex)
-    );
-    if (mayorAlive) return 'good';
+  if (alive.length === 3) {
+    const executionDay = (game.storytellerDecisions.get('last_execution_day') as number) ?? -1;
+    if (executionDay !== game.dayNumber) {
+      const mayorAlive = alive.some(p =>
+        getEffectiveCharacterId(p) === 'mayor' &&
+        !isPoisonedOrDrunk(game, p.seatIndex)
+      );
+      if (mayorAlive) return 'good';
+    }
   }
 
   // 仅剩2人存活 → 邪恶获胜

@@ -105,6 +105,50 @@ export function AdminPanel({ roomId, hostSecret, onLeave }: AdminPanelProps) {
   const [observerCursor, setObserverCursor] = useState(0);
   const wsRef = useRef<WebSocket | null>(null);
 
+  // 模拟状态
+  const [simStatus, setSimStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
+  const [simProgress, setSimProgress] = useState(0);
+  const [simTotal, setSimTotal] = useState(0);
+  const [simResults, setSimResults] = useState<any>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  const startSimulation = async () => {
+    const playerCount = parseInt((document.getElementById('sim-player-count') as HTMLSelectElement)?.value ?? '5', 10);
+    const count = parseInt((document.getElementById('sim-game-count') as HTMLSelectElement)?.value ?? '3', 10);
+    setSimStatus('running');
+    setSimProgress(0);
+    setSimTotal(count);
+    setSimResults(null);
+    const ac = new AbortController();
+    abortRef.current = ac;
+
+    try {
+      const res = await fetch(`/api/dev/autoplay/batch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ count, playerCount }),
+        signal: ac.signal,
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setSimResults(data);
+      setSimStatus('done');
+    } catch (e: any) {
+      if (e.name !== 'AbortError') {
+        setSimStatus('error');
+        setLastError(`模拟失败：${e.message}`);
+      }
+    } finally {
+      abortRef.current = null;
+    }
+  };
+
+  const cancelSimulation = () => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setSimStatus('idle');
+  };
+
   const copyRoomId = async () => {
     try {
       await navigator.clipboard.writeText(roomId);
@@ -476,6 +520,51 @@ export function AdminPanel({ roomId, hostSecret, onLeave }: AdminPanelProps) {
           </div>
         </section>
 
+        <section className="card col-12">
+          <h3>AI 自动模拟测试（离线批量对局）</h3>
+          <p className="muted">
+            全 AI 对局，不依赖 WebSocket。模拟完成后展示统计结果。
+          </p>
+          <div className="row" style={{ gap: 12, flexWrap: 'wrap', marginTop: 8 }}>
+            <label>
+              玩家人数：
+              <select id="sim-player-count" defaultValue="5" style={{ marginLeft: 4 }}>
+                <option value="5">5 人</option>
+                <option value="6">6 人</option>
+                <option value="7">7 人</option>
+                <option value="8">8 人</option>
+                <option value="9">9 人</option>
+                <option value="10">10 人</option>
+              </select>
+            </label>
+            <label>
+              模拟局数：
+              <select id="sim-game-count" defaultValue="3" style={{ marginLeft: 4 }}>
+                <option value="1">1 局</option>
+                <option value="3">3 局</option>
+                <option value="5">5 局</option>
+                <option value="10">10 局</option>
+                <option value="20">20 局</option>
+              </select>
+            </label>
+            <button type="button" className="btn-primary" id="sim-start-btn" onClick={startSimulation} style={{ display: simStatus === 'running' ? 'none' : 'inline-block' }}>
+              开始模拟
+            </button>
+            <button type="button" className="btn-danger" id="sim-cancel-btn" onClick={cancelSimulation} style={{ display: simStatus === 'running' ? 'inline-block' : 'none' }}>
+              取消
+            </button>
+          </div>
+          {simStatus === 'running' && (
+            <div style={{ marginTop: 12 }}>
+              <p>模拟中... {simProgress}/{simTotal} 局完成</p>
+              <div style={{ background: '#1f2937', borderRadius: 8, height: 8, width: '100%', marginTop: 4 }}>
+                <div style={{ background: '#3b82f6', borderRadius: 8, height: 8, width: `${(simProgress / simTotal) * 100}%`, transition: 'width 0.5s' }} />
+              </div>
+            </div>
+          )}
+          <SimulationResults data={simResults} status={simStatus} />
+        </section>
+
         <section className="card col-6">
           <h3>实时公开大屏</h3>
           <p className="muted">
@@ -518,6 +607,69 @@ export function AdminPanel({ roomId, hostSecret, onLeave }: AdminPanelProps) {
           100% { transform: scale(1); opacity: 0.7; }
         }
       `}</style>
+    </div>
+  );
+}
+
+function SimulationResults({ data, status }: { data: any; status: string }) {
+  if (status === 'idle' || !data) return null;
+  if (status === 'error') return <p style={{ color: '#ff9fa8', marginTop: 12 }}>模拟执行出错。</p>;
+
+  const stats = data;
+  const gc = (pct: number) => pct > 0.5 ? '#22c55e' : pct > 0.3 ? '#eab308' : '#ef4444';
+  return (
+    <div style={{ marginTop: 16, borderTop: '1px solid #333', paddingTop: 12 }}>
+      <h4>模拟结果汇总</h4>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12, marginTop: 8 }}>
+        <div className="card" style={{ padding: 12, textAlign: 'center' }}>
+          <div style={{ fontSize: 28, fontWeight: 700, color: '#22c55e' }}>{stats.goodWins}</div>
+          <div className="muted">善良获胜</div>
+          <div style={{ marginTop: 4, background: '#1f2937', borderRadius: 8, height: 24 }}>
+            <div style={{ background: gc(stats.goodWinRate), borderRadius: 8, height: 24, width: `${Math.max(stats.goodWinRate * 100, 4)}%`, minWidth: 40, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 12, fontWeight: 700 }}>{Math.round(stats.goodWinRate * 100)}%</div>
+          </div>
+        </div>
+        <div className="card" style={{ padding: 12, textAlign: 'center' }}>
+          <div style={{ fontSize: 28, fontWeight: 700, color: '#ef4444' }}>{stats.evilWins}</div>
+          <div className="muted">邪恶获胜</div>
+          <div style={{ marginTop: 4, background: '#1f2937', borderRadius: 8, height: 24 }}>
+            <div style={{ background: gc(stats.evilWinRate), borderRadius: 8, height: 24, width: `${Math.max(stats.evilWinRate * 100, 4)}%`, minWidth: 40, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 12, fontWeight: 700 }}>{Math.round(stats.evilWinRate * 100)}%</div>
+          </div>
+        </div>
+        <div className="card" style={{ padding: 12, textAlign: 'center' }}>
+          <div style={{ fontSize: 28, fontWeight: 700, color: '#eab308' }}>{stats.totalGames}</div>
+          <div className="muted">总局数</div>
+          <p className="muted" style={{ marginTop: 4 }}>平均 {stats.avgDays?.toFixed(1) ?? '?'} 天</p>
+          <p className="muted">平均 {(stats.avgDurationMs / 1000)?.toFixed(0) ?? '?'} 秒</p>
+        </div>
+      </div>
+      {stats.results?.length > 0 && (
+        <details style={{ marginTop: 12 }}>
+          <summary style={{ cursor: 'pointer', color: '#a78bfa' }}>查看每局详情 ({stats.results.length} 局)</summary>
+          <div style={{ maxHeight: 400, overflow: 'auto', marginTop: 8 }}>
+            {stats.results.map((r: any, i: number) => (
+              <article key={r.gameId ?? i} style={{ marginBottom: 12, padding: 10, border: '1px solid #2f2f2f', borderRadius: 8, background: '#161616' }}>
+                <div className="row" style={{ gap: 8 }}>
+                  <span className="pill" style={{ background: '#2f2f2f', color: '#fff' }}>第{i + 1}局</span>
+                  <span className="pill" style={{ background: r.winner === 'good' ? '#065f46' : '#7f1d1d', color: '#fff' }}>{r.winner === 'good' ? '善良胜' : '邪恶胜'}</span>
+                  <span className="pill">{(r.durationMs / 1000).toFixed(0)}秒</span>
+                  <span className="pill">{r.daysElapsed}天</span>
+                </div>
+                <div style={{ marginTop: 6, fontSize: 12 }}>
+                  {r.roles?.map((ro: any) => (
+                    <span key={ro.seatIndex} style={{ marginRight: 8, color: ro.alignment === 'evil' ? '#f87171' : '#4ade80' }}>#{ro.seatIndex + 1} {ro.characterNameZh}{ro.survived ? '' : '(死)'}</span>
+                  ))}
+                </div>
+                {r.narrative?.length > 0 && (
+                  <details style={{ marginTop: 4 }}>
+                    <summary style={{ cursor: 'pointer', fontSize: 12, color: '#6b7280' }}>记录</summary>
+                    <pre style={{ fontSize: 11, maxHeight: 200, overflow: 'auto', marginTop: 4, background: '#111', padding: 8, borderRadius: 4 }}>{r.narrative.join('\n')}</pre>
+                  </details>
+                )}
+              </article>
+            ))}
+          </div>
+        </details>
+      )}
     </div>
   );
 }

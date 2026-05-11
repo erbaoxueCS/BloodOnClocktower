@@ -32,6 +32,7 @@ import type {
 } from './engine/types.js';
 import { troubleBrewing } from './scripts/troubleBrewing.js';
 import { buildGameRecord, writeGameRecord } from './engine/gameRecord.js';
+import { runSingleSimulation, runBatchSimulation } from './autoplay/simulationRunner.js';
 
 // ============================================================
 // 配置
@@ -336,6 +337,35 @@ app.post('/api/dev/take-seat', (req, res) => {
   if (seatIndex == null) return res.status(404).json({ error: 'Seat not found' });
   const view = getRoomView(room);
   res.json({ roomId: rid, seatIndex, room: view });
+});
+
+// ============================================================
+// 自动模拟 API（AI vs AI）
+// ============================================================
+
+// 单局模拟
+app.post('/api/dev/autoplay/one', async (req, res) => {
+  if (process.env.NODE_ENV === 'production') return res.status(404).json({ error: 'Not found' });
+  const playerCount = Number.isInteger(req.body?.playerCount) ? (req.body.playerCount as number) : 5;
+  try {
+    const result = await runSingleSimulation(playerCount);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+// 批量模拟（流式进度可选）
+app.post('/api/dev/autoplay/batch', async (req, res) => {
+  if (process.env.NODE_ENV === 'production') return res.status(404).json({ error: 'Not found' });
+  const count = Number.isInteger(req.body?.count) ? (req.body.count as number) : 5;
+  const playerCount = Number.isInteger(req.body?.playerCount) ? (req.body.playerCount as number) : 5;
+  try {
+    const stats = await runBatchSimulation(count, playerCount);
+    res.json(stats);
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
 });
 
 // ============================================================
@@ -716,8 +746,20 @@ async function handleAiNightAction(room: Room, seatIndex: number): Promise<void>
   const validTargets = targets.filter(t =>
     typeof t === 'number' && Number.isFinite(t) && aliveChoices.includes(t));
   if (validTargets.length !== pending.pick) {
-    console.warn(`[AI] night targets invalid (got ${JSON.stringify(targets)}, expected ${pending.pick} from ${JSON.stringify(aliveChoices)}), fallback to random`);
-    targets = randomPick(aliveChoices, pending.pick);
+    console.warn(`[AI][FALLBACK] night targets invalid for seat ${seatIndex} (got ${JSON.stringify(targets)}, expected ${pending.pick} from ${JSON.stringify(aliveChoices)}), using strategic fallback`);
+    // 尝试用阵营感知策略选择目标
+    const align = game.script.characters.find(c => c.id === game.players[seatIndex]?.characterId)?.alignment;
+    if (pending.stepId === 'imp' && align === 'evil') {
+      // 恶魔：不刀疑似爪牙的玩家（用公共日志简单判断）
+      const minionIds = new Set(findAliveMinions(game).map(m => m.seatIndex));
+      const goodTargets = aliveChoices.filter(s => !minionIds.has(s));
+      targets = randomPick(goodTargets.length > 0 ? goodTargets : aliveChoices, pending.pick);
+    } else {
+      targets = randomPick(aliveChoices, pending.pick);
+    }
+    logAiDecision(game, seatIndex, 'night_action',
+      { stepId: pending.stepId, targets, fallback: 'targets_invalid' },
+      'AI returns invalid targets, strategic fallback');
   } else {
     targets = validTargets;
   }
@@ -1620,7 +1662,14 @@ async function handleAiDayAction(room: Room, rid: string, seatIndex: number): Pr
         broadcast(rid, { type: 'room', room: getRoomView(room) });
       } catch (e) {
         console.error(`[AI] decideVote error seat ${seatIndex}:`, (e as Error).message);
-        vote(game, seatIndex, Math.random() < 0.5);
+        // 降级：根据阵营倾向投票
+        const isEvil = game.script.characters.find(c => c.id === p.characterId)?.alignment === 'evil';
+        if (isEvil && game.currentNomination) {
+          const nominatedBelief = null; // 无信念系统可用，保持基础策略
+          vote(game, seatIndex, false); // 邪恶阵营默认投反对（保护同伴）
+        } else if (game.currentNomination) {
+          vote(game, seatIndex, true); // 善良阵营默认投赞成（推动处决）
+        }
       }
     }
   }
