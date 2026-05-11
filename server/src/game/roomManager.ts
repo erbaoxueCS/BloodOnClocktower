@@ -26,7 +26,7 @@ function makeEmptyGame(script: ScriptDef, players: PlayerState[]): GameState {
     awaitingNightInfoConfirm: false, pendingNightInfoConfirmSeats: new Set(), nightInfoConfirmations: new Set(),
     usedDayActionsBySeat: new Map(), demonBluffs: [],
     storytellerDecisions: new Map(),
-    chatLog: [], publicLog: [], replayLog: [],
+    chatLog: [], publicLog: [], replayLog: [], aiDecisionLog: [],
   };
 }
 

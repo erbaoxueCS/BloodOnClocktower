@@ -509,32 +509,51 @@ function buildNominationPrompt(
   wv: WorldView,
   memory: PlayerMemory,
 ): { systemPrompt: string; userPrompt: string } {
+  const recentLogs = wv.publicLog.slice(-10).map(l => l.line).join('\n');
+  const recentDeaths = wv.lastNightDeaths.length > 0
+    ? `昨夜死亡：${wv.lastNightDeaths.map(s => `#${s + 1}`).join('、')}`
+    : '昨夜无人死亡';
+  const aliveList = wv.players.filter(p => p.isAlive).map(p => `#${p.seatIndex + 1}`).join(', ');
+
   const systemPrompt = `你是血染钟楼玩家 #${seatIndex + 1}。
 ${getStyleGuidance(style, alignment)}
-你的角色：${role.characterNameZh}
+你的角色：${role.characterNameZh}（${role.characterName}）
 
-你需要决定是否提名某人，或跳过本轮提名。
+重要：血染钟楼中，白天必须有人被处决！如果没有提名，邪恶阵营会自动占据优势。
+你应该基于已有信息积极提名可疑玩家，哪怕信息不完全。善良阵营不提名就等于放弃胜利机会。
+
+需要考虑的因素：
+- 角色信息（你的角色能力给出的线索）
+- 公开发言（谁在撒谎？谁的信息矛盾？）
+- 投票记录（谁反对处决可能是同伙）
+- 死者身份（被恶魔杀死的通常是善良阵营）
+- 存活玩家中必须有恶魔和爪牙
 
 输出格式（严格 JSON）：
 {
   "shouldSkip": true/false,
-  "nominatedSeat": 目标 seatIndex（shouldSkip 为 false 时必填）,
+  "nominatedSeat": 目标 seatIndex（优先选择最可疑的存活玩家，必须给出）,
   "reasoning": "你的决策理由"
 }`;
 
-  const alreadyNominated = wv.nominationsToday.map(n => `#${n.nominator + 1}`).join(', ');
-  const notYetNominated = wv.players
+  const alreadyNominated = wv.nominationsToday.map(n => `#${n.nominator + 1}→#${n.nominated + 1}`).join(', ');
+  const notYetDecided = wv.players
     .filter(p => p.isAlive && !wv.nominationsToday.some(n => n.nominator === p.seatIndex) && !wv.skippedNominationsToday.includes(p.seatIndex))
     .map(p => `#${p.seatIndex + 1}`)
     .join(', ');
 
-  const userPrompt = `提名阶段。
-已提名者：${alreadyNominated || '暂无'}
-尚未提名/跳过的存活玩家：${notYetNominated || '全部已处理'}
-当前提名：${wv.currentNomination ? `#${wv.currentNomination.nominator + 1} → #${wv.currentNomination.nominated + 1}` : '无'}
+  const userPrompt = `=== 提名阶段 ===
+${recentDeaths}
+存活玩家：${aliveList}
+已提名：${alreadyNominated || '暂无'}
+尚未提名/跳过：${notYetDecided || '全部已处理'}
+${wv.currentNomination ? `当前提名：#${wv.currentNomination.nominator + 1} → #${wv.currentNomination.nominated + 1}` : '当前无提名'}
 ${wv.pendingExecution != null ? `待处决：#${wv.pendingExecution + 1}` : ''}
 
-请决定：跳过本轮（shouldSkip: true），还是提名某人？`;
+最近公开发言：
+${recentLogs || '(暂时无发言)'}
+
+基于以上信息，你最怀疑哪个存活玩家？请提名一个人（或跳过）。不要永远跳过——如果你怀疑有人，就应该提名！`;
 
   return { systemPrompt, userPrompt };
 }
@@ -550,9 +569,12 @@ function buildVotePrompt(
 ): { systemPrompt: string; userPrompt: string } {
   const systemPrompt = `你是血染钟楼玩家 #${seatIndex + 1}。
 ${getStyleGuidance(style, alignment)}
-你的角色：${role.characterNameZh}
+你的角色：${role.characterNameZh}（${role.characterName}）
 
-你需要对当前提名投票。
+你需要对当前提名投票。记住：
+- 善良阵营：如果你认为被提名者可能是恶魔或爪牙，投赞成处决
+- 邪恶阵营：如果被提名者是同伴，投反对；如果是善良阵营，投赞成
+- 如果完全不确定，可以随机投票
 
 输出格式（严格 JSON）：
 {
@@ -560,8 +582,10 @@ ${getStyleGuidance(style, alignment)}
   "reasoning": "你的投票理由"
 }`;
 
-  const userPrompt = `投票：#${nomination.nominator + 1} 提名 #${nomination.nominated + 1}
-你投赞成（处决被提名者）还是反对？`;
+  const aliveCount = wv.players.filter(p => p.isAlive).length;
+  const userPrompt = `投票决定：#${nomination.nominator + 1} 提名处决 #${nomination.nominated + 1}
+存活人数：${aliveCount}
+你投赞成（处决 #${nomination.nominated + 1}）还是反对（放过）？`;
 
   return { systemPrompt, userPrompt };
 }

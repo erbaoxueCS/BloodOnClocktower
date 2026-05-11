@@ -134,6 +134,7 @@ export function initGame(game: GameState): void {
   game.chatLog = [];
   game.publicLog = [];
   game.replayLog = [];
+  game.aiDecisionLog = [];
   game.demonBluffs = [];
 
   assignCharacters(game);

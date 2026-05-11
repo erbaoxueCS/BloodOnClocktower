@@ -7,6 +7,46 @@ let BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode';
 let MODEL = 'qwen-plus';
 let ENABLED = true;
 
+// 配置 fetch 代理（Node.js 原生 fetch 需要显式设置）
+let _undiciFetch: any = undefined;
+let _dispatcher: any = undefined;
+
+function getProxyUrl(): string | undefined {
+  return process.env.https_proxy || process.env.HTTPS_PROXY
+    || process.env.http_proxy || process.env.HTTP_PROXY
+    || undefined;
+}
+
+async function setupUndiciFetch(): Promise<any | null> {
+  if (_undiciFetch !== undefined) return _undiciFetch;
+  const proxyUrl = getProxyUrl();
+  if (!proxyUrl) {
+    _undiciFetch = null;
+    console.log('[LLM] no proxy configured, using global fetch');
+    return null;
+  }
+  try {
+    const undici = await import('undici');
+    _dispatcher = new undici.ProxyAgent({ uri: proxyUrl });
+    _undiciFetch = undici.fetch;
+    console.log(`[LLM] undici ProxyAgent + fetch loaded for ${proxyUrl}`);
+    return _undiciFetch;
+  } catch {
+    console.log('[LLM] undici not available, using global fetch');
+    _undiciFetch = null;
+    _dispatcher = null;
+    return null;
+  }
+}
+
+async function fetchWithProxy(url: string, init: RequestInit): Promise<Response> {
+  const f = await setupUndiciFetch();
+  if (f && _dispatcher) {
+    return f(url, { ...init, dispatcher: _dispatcher });
+  }
+  return fetch(url, init);
+}
+
 export function configureLlm(options: {
   apiKey?: string;
   baseUrl?: string;
@@ -17,6 +57,8 @@ export function configureLlm(options: {
   if (options.baseUrl !== undefined) BASE_URL = options.baseUrl.replace(/\/+$/, '');
   if (options.model !== undefined) MODEL = options.model;
   if (options.enabled !== undefined) ENABLED = options.enabled;
+  const proxy = getProxyUrl();
+  console.log(`[LLM] configured: enabled=${ENABLED}, model=${MODEL}, baseUrl=${BASE_URL}, proxy=${proxy ?? '(none)'}`);
 }
 
 export function getLlmConfig() {
@@ -93,6 +135,8 @@ export async function callLlm(
   const timeoutMs = options?.timeoutMs ?? 30000;
   const jsonMode = options?.jsonMode ?? true;
 
+  console.log(`[LLM] request starting (jsonMode=${jsonMode}, timeout=${timeoutMs}ms, attempts=${maxAttempts})`);
+
   await acquireSlot();
 
   let lastError: string = '';
@@ -114,7 +158,7 @@ export async function callLlm(
           body.response_format = { type: 'json_object' };
         }
 
-        const res = await fetch(`${BASE_URL}/v1/chat/completions`, {
+        const res = await fetchWithProxy(`${BASE_URL}/v1/chat/completions`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -142,6 +186,8 @@ export async function callLlm(
 
         const rawContent = data.choices?.[0]?.message?.content ?? '';
         let json: Record<string, unknown> | null = null;
+
+        console.log(`[LLM] success: ${rawContent.slice(0, 80)}... (${Date.now() - startedAt}ms)`);
 
         if (jsonMode) {
           try {
@@ -177,12 +223,15 @@ export async function callLlm(
         };
       } catch (e) {
         lastError = e instanceof Error ? e.message : String(e);
+        const isTimeout = lastError.includes('aborted') || lastError.includes('timeout');
+        console.error(`[LLM] attempt ${attempt + 1}/${maxAttempts} failed${isTimeout ? ' (timeout)' : ''}: ${lastError.slice(0, 200)}`);
         if (attempt < maxAttempts - 1) {
           await sleep(computeBackoffMs(attempt));
         }
       }
     }
 
+    console.error(`[LLM] ALL ${maxAttempts} attempts failed. Last error: ${lastError}`);
     throw new Error(`LLM call failed after ${maxAttempts} attempts: ${lastError}`);
   } finally {
     releaseSlot();

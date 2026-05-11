@@ -129,12 +129,25 @@ export interface GameState {
   // --- 说书人裁量存储（由 StorytellerAgent 写入，引擎不主动修改） ---
   storytellerDecisions: Map<string, unknown>;
 
+  // --- AI 玩家决策记录（用于复盘） ---
+  aiDecisionLog: AiDecisionEntry[];
+
   // 聊天
   chatLog: ChatEntry[];
 
   // 日志
   publicLog: PublicLogEntry[];
   replayLog: ReplayLogEntry[];
+}
+
+export interface AiDecisionEntry {
+  at: number;
+  dayNumber: number;
+  phase: string;
+  seatIndex: number;
+  type: 'speech' | 'nominate' | 'vote' | 'night_action';
+  decision: unknown;
+  reasoning: string;
 }
 
 // ----- 提名 -----
