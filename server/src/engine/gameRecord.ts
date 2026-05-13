@@ -2,8 +2,8 @@
 // 对局复盘生成器：输出完整 JSON 记录
 // ============================================================
 
-import type { GameState, Room } from './types.js';
-import { getEffectiveCharacterId } from './gameEngine.js';
+import type { Room } from '../game/types.js';
+import { getEffectiveCharacterId } from '../game/gameEngine.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
@@ -69,14 +69,13 @@ function parseSeat(s: string): number {
 }
 
 export function buildGameRecord(room: Room, winner: 'good' | 'evil'): GameRecord {
-  const game = room.game;
   const now = Date.now();
 
   // ----- 玩家身份 -----
-  const players = game.players.map(p => {
-    const realChar = game.script.characters.find(c => c.id === p.characterId);
+  const players = room.players.map(p => {
+    const realChar = room.script.characters.find(c => c.id === p.characterId);
     const shownId = getEffectiveCharacterId(p) ?? p.characterId ?? 'unknown';
-    const shownChar = game.script.characters.find(c => c.id === shownId);
+    const shownChar = room.script.characters.find(c => c.id === shownId);
     return {
       seatIndex: p.seatIndex,
       nickname: p.nickname,
@@ -85,16 +84,16 @@ export function buildGameRecord(room: Room, winner: 'good' | 'evil'): GameRecord
       alignment: (realChar?.alignment ?? 'good') as 'good' | 'evil',
       shownCharacterId: shownId,
       shownCharacterZh: shownChar?.nameZh ?? shownId,
-      abilityZh: realChar?.abilityZh ?? '',
+      abilityZh: realChar?.ability ?? '',
       survived: p.isAlive,
-      isDrunkOrPoisoned: p.characterId === 'drunk' || game.poisonedSeatIndex === p.seatIndex,
+      isDrunkOrPoisoned: p.characterId === 'drunk' || room.poisonedSeatIndex === p.seatIndex,
     };
   });
 
   // ----- 夜晚日志 -----
   const nightLog: GameRecord['nightLog'] = [];
-  const nightGroups = new Map<string, typeof game.replayLog>();
-  for (const entry of game.replayLog) {
+  const nightGroups = new Map<string, typeof room.replayLog>();
+  for (const entry of room.replayLog) {
     if (entry.groupKey.startsWith('night_') || entry.groupKey === 'first_night') {
       const arr = nightGroups.get(entry.groupKey) ?? [];
       arr.push(entry);
@@ -156,7 +155,7 @@ export function buildGameRecord(room: Room, winner: 'good' | 'evil'): GameRecord
   }
 
   // 从 replayLog 中搜索 day_N 组的 "天亮公布：昨夜死亡 ..." 行来填充 death
-  for (const entry of game.replayLog) {
+  for (const entry of room.replayLog) {
     if (!entry.groupKey.startsWith('day_')) continue;
     const m = entry.line.match(/天亮公布：昨夜死亡 (.+)/);
     if (m) {
@@ -174,7 +173,7 @@ export function buildGameRecord(room: Room, winner: 'good' | 'evil'): GameRecord
   const daySpeeches = new Map<number, Array<{ seat: number; text: string }>>();
   const dayNoms = new Map<number, Array<{ nominator: number; nominated: number }>>();
 
-  for (const log of game.publicLog) {
+  for (const log of room.publicLog) {
     const line = log.line;
 
     if (line.includes('进入白天阶段')) {
@@ -201,7 +200,7 @@ export function buildGameRecord(room: Room, winner: 'good' | 'evil'): GameRecord
   const dayVoteGroups = new Map<number, Array<{ votes: Array<{ seat: number; inFavor: boolean }>; passed: boolean; votesFor: number }>>();
   const dayExecMap = new Map<number, { seat: number; characterZh: string }>();
 
-  for (const entry of game.replayLog) {
+  for (const entry of room.replayLog) {
     if (!entry.groupKey.startsWith('day_')) continue;
     const dayNum = parseInt(entry.groupKey.replace('day_', ''), 10);
     const line = entry.line;
@@ -267,20 +266,13 @@ export function buildGameRecord(room: Room, winner: 'good' | 'evil'): GameRecord
   }
 
   // ----- AI 决策 -----
-  const aiDecisions = game.aiDecisionLog.map(d => ({
-    dayNumber: d.dayNumber,
-    phase: d.phase,
-    seatIndex: d.seatIndex,
-    type: d.type,
-    decision: d.decision,
-    reasoning: d.reasoning,
-  }));
+  const aiDecisions: GameRecord['aiDecisions'] = [];
 
   // ----- 公开日志 -----
-  const publicLog = game.publicLog.map(l => l.line);
+  const publicLog = room.publicLog.map(l => l.line);
 
   // ----- 聊天日志 -----
-  const chatLog = game.chatLog.map(c => ({
+  const chatLog = room.chatLog.map(c => ({
     scope: c.scope,
     seat: c.fromSeat,
     text: c.text,
@@ -289,12 +281,12 @@ export function buildGameRecord(room: Room, winner: 'good' | 'evil'): GameRecord
   return {
     meta: {
       roomId: room.id,
-      script: game.scriptId,
-      scriptZh: game.script.nameZh,
+      script: room.scriptId,
+      scriptZh: room.script.nameZh,
       winner,
       winnerZh: winner === 'good' ? '善良阵营' : '邪恶阵营',
-      totalDays: game.dayNumber,
-      startedAt: game.publicLog[0]?.at ?? 0,
+      totalDays: room.dayNumber,
+      startedAt: room.publicLog[0]?.at ?? 0,
       endedAt: now,
     },
     players,

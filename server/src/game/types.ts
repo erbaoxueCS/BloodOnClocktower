@@ -12,8 +12,12 @@ export interface Character {
   alignment: Alignment;
   type: CharacterType;
   ability: string;
+  abilityZh?: string;
   firstNightOnly?: boolean;
   requiresStorytellerChoice?: boolean;
+  requiresPlayerChoice?: boolean;
+  infoSource?: string;
+  pickCount?: number;
 }
 
 /** 剧本：id、名称、角色列表、夜晚顺序(首夜/普通夜)、人数区间 */
@@ -87,12 +91,71 @@ export interface ChatEntry {
   text: string;
 }
 
+/** 游戏对局状态（由 roomManager 管理，作为 room.game 存在） */
+export interface GameState {
+  scriptId: string;
+  script: Script;
+  players: PlayerSeat[];
+  phase: GamePhase;
+  dayNumber: number;
+  daySubPhase: DaySubPhase | null;
+  dayFlowStage: DayFlowStage | null;
+  dayFlowStartSeat: number | null;
+  nightStepIndex: number;
+  pendingNightAction: null | {
+    stepId: string;
+    actorSeatIndex: number;
+    pick: 1 | 2;
+  };
+  protectedSeatIndex: number | null;
+  poisonedSeatIndex: number | null;
+  lastNightDeaths: number[];
+  lastNightRevivals: number[];
+  nightKillAttackerByVictim: Map<number, number>;
+  currentNomination: { nominator: number; nominated: number } | null;
+  nominationsToday: Map<number, number>;
+  skippedNominationsToday: Set<number>;
+  nominatedToday: Set<number>;
+  votes: Map<number, boolean>;
+  pendingExecution: number | null;
+  pendingExecutionVotesFor: number;
+  pendingExecutionTied: boolean;
+  lastExecutedSeatIndex: number | null;
+  lastExecutedCharacterId: string | null;
+  awaitingNightConfirm: boolean;
+  nightConfirmations: Set<number>;
+  awaitingNightInfoConfirm: boolean;
+  pendingNightInfoConfirmSeats: Set<number>;
+  nightInfoConfirmations: Set<number>;
+  usedDayActionsBySeat: Map<number, Set<string>>;
+  demonBluffs: string[] | null;
+  storytellerDecisions: Map<string, unknown>;
+  chatLog: ChatEntry[];
+  publicLog: PublicLogEntry[];
+  replayLog: ReplayLogEntry[];
+  aiDecisionLog: Array<{
+    at: number;
+    dayNumber: number;
+    phase: string;
+    type?: string;
+    seatIndex: number;
+    decision?: unknown;
+    decisionType?: string;
+    input?: Record<string, unknown>;
+    output?: Record<string, unknown>;
+    reasoning?: string;
+    timestamp?: number;
+  }>;
+}
+
 /** 房间（含对局状态） */
 export interface Room {
   id: string;
   scriptId: string;
   script: Script;
   players: PlayerSeat[];
+  /** 嵌套对局状态（由 roomManager 创建和管理，为对局数据的主来源） */
+  game: GameState;
   status: RoomStatus;
   phase: GamePhase;
   dayNumber: number;
@@ -105,7 +168,7 @@ export interface Room {
   currentNomination: { nominator: number; nominated: number } | null;
   /** 今日已提名记录：nominator -> nominated */
   nominationsToday: Map<number, number>;
-  /** 今日声明“不提名”的存活玩家 seatIndex 集合 */
+  /** 今日声明”不提名”的存活玩家 seatIndex 集合 */
   skippedNominationsToday: Set<number>;
   /** 今日被提名记录 */
   nominatedToday: Set<number>;
@@ -172,6 +235,18 @@ export interface Room {
   aiPlayerLastActionAtBySeat: Map<number, number>;
   /** AI 玩家积极程度/温度（0~1）：seatIndex -> temperature */
   aiPlayerTemperatureBySeat: Map<number, number>;
+  /** AI 玩家行为风格（9 维概率模型）：seatIndex -> style */
+  aiPlayerBehaviorStyleBySeat: Map<number, {
+    initiative: number;
+    leadership: number;
+    privacy: number;
+    logicWeight: number;
+    detailRetention: number;
+    conspiracyWeight: number;
+    aggressiveness: number;
+    defaultTrust: number;
+    hesitation: number;
+  }>;
 }
 
 /** 发给客户端的房间摘要（不含身份） */
@@ -180,7 +255,15 @@ export interface RoomView {
   scriptId: string;
   scriptName: string;
   scriptNameZh: string;
-  players: Omit<PlayerSeat, 'characterId'>[];
+  players: Array<{
+    id?: string;
+    seatIndex: number;
+    nickname: string;
+    isReady?: boolean;
+    isAlive: boolean;
+    hasDeadVote?: boolean;
+    hasGhostVote?: boolean;
+  }>;
   status: RoomStatus;
   phase: GamePhase;
   dayNumber: number;
@@ -191,9 +274,9 @@ export interface RoomView {
   pendingExecution: number | null;
   /** 今日提名记录（用于前端展示/判断） */
   nominationsToday: Array<{ nominator: number; nominated: number }>;
-  /** 今日声明“不提名”的玩家 seatIndex 列表 */
+  /** 今日声明”不提名”的玩家 seatIndex 列表 */
   skippedNominationsToday: number[];
-  /** 当前“最高票待处决”信息（仅用于提示，不代表会立即处决） */
+  /** 当前”最高票待处决”信息（仅用于提示，不代表会立即处决） */
   pendingExecutionVotesFor: number;
   pendingExecutionTied: boolean;
   lastNightDeaths: number[];
@@ -203,10 +286,22 @@ export interface RoomView {
   awaitingNightConfirm?: boolean;
   /** 已确认夜晚结束的座位 */
   nightConfirmedSeats?: number[];
+  /** 等待夜间信息确认 */
+  awaitingNightInfoConfirm?: boolean;
+  /** 待确认夜间信息的座位 */
+  pendingNightInfoConfirmSeats?: number[];
+  /** 已确认夜间信息的座位 */
+  nightInfoConfirmedSeats?: number[];
   /** 当前玩家可见的聊天记录（管理员可见全量） */
   chatLog?: ChatEntry[];
   /** 当前座位是否开启 AI 托管（仅对本人显示） */
   aiPlayerEnabled?: boolean;
+  /** 当前座位 AI 行为风格（9 维） */
+  aiPlayerBehaviorStyle?: {
+    initiative: number; leadership: number; privacy: number;
+    logicWeight: number; detailRetention: number; conspiracyWeight: number;
+    aggressiveness: number; defaultTrust: number; hesitation: number;
+  };
   /** 当前座位 AI 积极程度/温度（仅对本人显示） */
   aiPlayerTemperature?: number;
   /** 仅管理员可见：全局记录（含私密与裁定信息） */
@@ -215,4 +310,12 @@ export interface RoomView {
   aiStorytellerEnabled?: boolean;
   minPlayers: number;
   maxPlayers: number;
+}
+
+/** 说书人信息角色结果 */
+export interface InfoRoleResult {
+  type: string;
+  players: [number, number];
+  characterId: string;
+  noOutsider?: boolean;
 }

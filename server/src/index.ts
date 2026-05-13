@@ -121,17 +121,17 @@ function makeGodReply(game: GameState, seatIndex: number, queryRaw: string): str
   }
   if (shown === 'undertaker') {
     const info = resolveUndertakerInfo(game);
-    if (!info) return '掘墓人：无信息';
+    const seatIndex = info.players[0];
+    if (!info.characterId) return '掘墓人：无信息';
     const char = game.script.characters.find(c => c.id === info.characterId);
-    return `掘墓人：今日被处决的是 #${info.seatIndex + 1}，其身份为「${char?.nameZh ?? info.characterId}」。`;
+    return `掘墓人：今日被处决的是 #${seatIndex + 1}，其身份为「${char?.nameZh ?? info.characterId}」。`;
   }
   if (shown === 'ravenkeeper') {
-    const attacker = resolveRavenkeeperInfo(game, seatIndex);
-    if (attacker == null) return '守鸦人：无信息';
-    const ap = game.players[attacker];
-    const aCharId = getShownCharacterId(ap);
-    const aChar = aCharId ? game.script.characters.find(c => c.id === aCharId) : undefined;
-    return `守鸦人：杀害你的是 #${attacker + 1}，其身份为「${aChar?.nameZh ?? aCharId ?? '未知'}」。`;
+    const info = resolveRavenkeeperInfo(game, seatIndex);
+    const attackerSeat = info.players[0];
+    if (!info.characterId) return '守鸦人：无信息';
+    const aChar = game.script.characters.find(c => c.id === info.characterId);
+    return `守鸦人：杀害你的是 #${attackerSeat + 1}，其身份为「${aChar?.nameZh ?? info.characterId ?? '未知'}」。`;
   }
   if (shown === 'washerwoman' || shown === 'librarian' || shown === 'investigator') {
     const decision = game.storytellerDecisions.get(shown) as InfoRoleResult | undefined;
@@ -204,13 +204,11 @@ function buildYourRole(game: GameState, seatIndex: number): YourRoleInfo | null 
   if (!char) return null;
   return {
     characterId: shownId,
-    characterName: char.name,
-    characterNameZh: char.nameZh,
+    name: char.name,
+    nameZh: char.nameZh,
     ability: char.ability,
     abilityZh: char.abilityZh,
     alignment: char.alignment,
-    type: char.type,
-    infoSource: char.infoSource,
   };
 }
 
@@ -477,26 +475,26 @@ async function runNightLoop(room: Room): Promise<void> {
 
     // ----- 恶魔/爪牙信息（首夜） -----
     if (stepId === 'demon_info') {
-      const demon = findDemon(game);
-      if (demon) {
+      const demonSeat = findDemon(game);
+      if (demonSeat !== null) {
         const minions = findAliveMinions(game);
         const minionList = minions.map(m => `#${m.seatIndex + 1}`).join('、') || '无';
-        const bluffs = game.demonBluffs.join('、');
+        const bluffs = (game.demonBluffs ?? []).join('、');
         const msg = `你是恶魔。爪牙：${minionList}。不在场善良身份：${bluffs}`;
         pushReplay(game, nightReplayTitle(game).key, nightReplayTitle(game).title,
-          `[夜间信息] ${seatLabel(game, demon.seatIndex)}：恶魔获知同伴与bluff`);
-        sendToSeat(room.id, demon.seatIndex, { type: 'night_info', message: msg });
+          `[夜间信息] ${seatLabel(game, demonSeat)}：恶魔获知同伴与bluff`);
+        sendToSeat(room.id, demonSeat, { type: 'night_info', message: msg });
       }
       game.nightStepIndex++;
       continue;
     }
 
     if (stepId === 'minion_info') {
-      const demon = findDemon(game);
-      if (demon) {
+      const demonSeat = findDemon(game);
+      if (demonSeat !== null) {
         const minions = findAliveMinions(game);
         for (const m of minions) {
-          const msg = `你是爪牙。恶魔：#${demon.seatIndex + 1}。`;
+          const msg = `你是爪牙。恶魔：#${demonSeat + 1}。`;
           sendToSeat(room.id, m.seatIndex, { type: 'night_info', message: msg });
         }
       }
@@ -590,7 +588,7 @@ async function storytellerDecision(
     const { buildStorytellerPrompts } = await import('./agents/storyteller/prompts.js');
     const { callLlm } = await import('./llm/llmClient.js');
 
-    const { systemPrompt, userPrompt } = buildStorytellerPrompts(game, stepId, charDef as any);
+    const { systemPrompt, userPrompt } = buildStorytellerPrompts(room, stepId, charDef as any);
 
     const result = await callLlm(
       [
@@ -717,8 +715,8 @@ async function handleAiNightAction(room: Room, seatIndex: number): Promise<void>
 
       const yourRole: YourRoleInfo = {
         characterId: shownId ?? 'unknown',
-        characterName: char?.name ?? 'unknown',
-        characterNameZh: char?.nameZh ?? '未知',
+        name: char?.name ?? 'unknown',
+        nameZh: char?.nameZh ?? '未知',
         ability: char?.ability ?? '',
         abilityZh: char?.abilityZh ?? '',
         alignment,
@@ -1153,7 +1151,7 @@ wss.on('connection', (ws: any, req) => {
 
         // 自动结算
         if (game.currentNomination) {
-          const eligible = game.players.filter(p => p.isAlive || p.hasGhostVote).map(p => p.seatIndex);
+          const eligible = game.players.filter(p => p.isAlive || p.hasDeadVote).map(p => p.seatIndex);
           const allVoted = eligible.every(s => game.votes.has(s));
           if (allVoted) {
             const { passed, votesFor, votes } = tallyVotes(game);
@@ -1451,7 +1449,7 @@ setInterval(async () => {
     if (game.phase === 'day') {
       if (game.currentNomination) {
         // 有活跃提名：检查是否所有人都投了票
-        const eligible = game.players.filter(p => p.isAlive || p.hasGhostVote).map(p => p.seatIndex);
+        const eligible = game.players.filter(p => p.isAlive || p.hasDeadVote).map(p => p.seatIndex);
         if (eligible.every(s => game.votes.has(s))) {
           const { passed, votesFor, votes } = tallyVotes(game);
           broadcast(rid, { type: 'vote_result', passed, votesFor, votes });
@@ -1516,8 +1514,8 @@ async function handleAiDayAction(room: Room, rid: string, seatIndex: number): Pr
 
       const yourRole: YourRoleInfo = {
         characterId: shownId ?? 'unknown',
-        characterName: char?.name ?? 'unknown',
-        characterNameZh: char?.nameZh ?? '未知',
+        name: char?.name ?? 'unknown',
+        nameZh: char?.nameZh ?? '未知',
         ability: char?.ability ?? '',
         abilityZh: char?.abilityZh ?? '',
         alignment,
@@ -1571,13 +1569,11 @@ async function handleAiDayAction(room: Room, rid: string, seatIndex: number): Pr
         const alignment = char?.alignment ?? 'good';
         const yourRole: YourRoleInfo = {
           characterId: shownId ?? 'unknown',
-          characterName: char?.name ?? 'unknown',
-          characterNameZh: char?.nameZh ?? '未知',
+          name: char?.name ?? 'unknown',
+          nameZh: char?.nameZh ?? '未知',
           ability: char?.ability ?? '',
           abilityZh: char?.abilityZh ?? '',
           alignment,
-          type: char?.type ?? 'townsfolk',
-          infoSource: char?.infoSource ?? 'none',
         };
 
         const { getOrCreatePlayerAgent } = await import('./agents/player/playerAgent.js');
@@ -1631,7 +1627,7 @@ async function handleAiDayAction(room: Room, rid: string, seatIndex: number): Pr
 
   // 投票（存活玩家 + 幽灵票）
   if (game.currentNomination && !game.votes.has(seatIndex)) {
-    const canVote = p.isAlive || p.hasGhostVote;
+    const canVote = p.isAlive || p.hasDeadVote;
     if (canVote) {
       try {
         const wv = buildWorldView(game, seatIndex);
@@ -1640,13 +1636,11 @@ async function handleAiDayAction(room: Room, rid: string, seatIndex: number): Pr
         const alignment = char?.alignment ?? 'good';
         const yourRole: YourRoleInfo = {
           characterId: shownId ?? 'unknown',
-          characterName: char?.name ?? 'unknown',
-          characterNameZh: char?.nameZh ?? '未知',
+          name: char?.name ?? 'unknown',
+          nameZh: char?.nameZh ?? '未知',
           ability: char?.ability ?? '',
           abilityZh: char?.abilityZh ?? '',
           alignment,
-          type: char?.type ?? 'townsfolk',
-          infoSource: char?.infoSource ?? 'none',
         };
 
         const { getOrCreatePlayerAgent } = await import('./agents/player/playerAgent.js');
@@ -1677,6 +1671,28 @@ async function handleAiDayAction(room: Room, rid: string, seatIndex: number): Pr
 }
 
 // ============================================================
+// 生产环境：提供前端构建产物
+// ============================================================
+
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+import { existsSync } from 'fs';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const clientDist = join(__dirname, '../../client/dist');
+
+if (existsSync(clientDist)) {
+  app.use(express.static(clientDist));
+  // SPA fallback: non-API routes serve index.html
+  app.get('*', (req, res) => {
+    if (!req.url.startsWith('/api') && !req.url.startsWith('/ws')) {
+      res.sendFile(join(clientDist, 'index.html'));
+    }
+  });
+}
+
+// ============================================================
 // 启动
 // ============================================================
 
@@ -1685,4 +1701,9 @@ server.listen(HTTP_PORT, () => {
   console.log(`[BOTC] LLM: ${getLlmConfig().enabled ? 'enabled' : 'disabled'}, model: ${getLlmConfig().model}`);
   console.log(`[BOTC] AI Storyteller: ${AI_STORYTELLER_ENABLED ? 'enabled' : 'disabled'}`);
   console.log(`[BOTC] AI Players: ${AI_PLAYER_ENABLED ? 'enabled' : 'disabled'}`);
+  if (existsSync(clientDist)) {
+    console.log(`[BOTC] Frontend: serving from ${clientDist}`);
+  } else {
+    console.log(`[BOTC] Frontend: dev mode (use Vite dev server)`);
+  }
 });
